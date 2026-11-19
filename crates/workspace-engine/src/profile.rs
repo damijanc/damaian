@@ -427,6 +427,7 @@ pub fn split_profile_keys(overlay: ConfigOverlay) -> (ConfigOverlay, Vec<Rejecte
         mcp_tools,
         hooks,
         hook_reviews_by_repository,
+        project_checks_by_repository,
         language_servers,
     } = overlay;
 
@@ -551,6 +552,12 @@ pub fn split_profile_keys(overlay: ConfigOverlay) -> (ConfigOverlay, Vec<Rejecte
     for repository_id in permission_profile_by_repository.keys() {
         refuse(
             format!("permission_profile.{repository_id}"),
+            RepositoryKeyClass::UserOwned,
+        );
+    }
+    for repository_id in project_checks_by_repository.keys() {
+        refuse(
+            format!("project_checks.{repository_id}"),
             RepositoryKeyClass::UserOwned,
         );
     }

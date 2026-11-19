@@ -33,8 +33,8 @@ use crate::plan::{Evidence, PlanStep, StepStatus, TaskPlan};
 use crate::repository_map::load_stored_map;
 use crate::session::{Session, SessionStore, Task, TaskStatus};
 use crate::verification::{
-    CheckBaseline, CheckId, CheckOutcome, CheckRun, FailureProvenance, SkipReason,
-    VerificationState, floor_checks, fold_verification,
+    CheckBaseline, CheckId, CheckOutcome, CheckRun, DeclaredFloor, FailureProvenance, SkipReason,
+    VerificationState, floor_checks_with_declared, fold_verification,
 };
 
 /// A plan step whose id starts with this is the verification loop's own step,
@@ -187,6 +187,11 @@ pub enum CompletionSettlement {
 pub struct CompletionSettlementMarker {
     root: PathBuf,
     settlement: CompletionSettlement,
+    /// The user's `project_checks` the gate read (spec 109 D9), so recovery
+    /// recomputes the report with the same floor without the user's config.
+    /// Absent in markers written before it existed, which had none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    project_checks: Vec<CheckId>,
 }
 
 impl CompletionSettlementMarker {
@@ -194,6 +199,7 @@ impl CompletionSettlementMarker {
         Self {
             root: root.into(),
             settlement,
+            project_checks: Vec::new(),
         }
     }
 
@@ -834,10 +840,13 @@ fn blocked_steps_explanation(blocked: &[&PlanStep]) -> String {
 /// so a report cannot describe repository A's work while the user is looking at
 /// repository B. Check currentness is decided here from the checkout's actual
 /// content, never by an adapter.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct CompletionGateService<'a> {
     session_store: &'a SessionStore,
     repository_root: &'a Path,
+    /// The user's `project_checks` for this repository (spec 109 D9), part of
+    /// the floor. Empty unless the caller passes them.
+    project_checks: Vec<CheckId>,
 }
 
 impl<'a> CompletionGateService<'a> {
@@ -845,7 +854,16 @@ impl<'a> CompletionGateService<'a> {
         Self {
             session_store,
             repository_root,
+            project_checks: Vec::new(),
         }
+    }
+
+    /// Adds the user's `project_checks` for this repository to the floor
+    /// (spec 109 D9). Every caller with the repository's config passes them,
+    /// so the gate, the completion run and recovery read one floor.
+    pub fn with_project_checks(mut self, checks: &[crate::config::ProjectCheck]) -> Self {
+        self.project_checks = DeclaredFloor::project_check_ids(checks);
+        self
     }
 
     /// The gate's verdict for one task.
@@ -892,7 +910,10 @@ impl<'a> CompletionGateService<'a> {
         }))
     }
 
-    /// The discovered checks of the roots this task's files touched.
+    /// The discovered checks of the roots this task's files touched, plus the
+    /// user's `project_checks` whose directory the task touched (spec 109 D9).
+    /// The approved plan's checks are not added here: the gate already
+    /// requires every one of them as the plan's own.
     ///
     /// The persisted repository map is read, never rebuilt: a gate report must
     /// not write a map or store command proposals. A repository with no map has
@@ -906,7 +927,16 @@ impl<'a> CompletionGateService<'a> {
         let touched = self
             .session_store
             .task_touched_paths(&session.id, task_id)?;
-        Ok(floor_checks(self.repository_root, &map, &touched))
+        let declared = DeclaredFloor {
+            plan_checks: Vec::new(),
+            project_checks: self.project_checks.clone(),
+        };
+        Ok(floor_checks_with_declared(
+            self.repository_root,
+            &map,
+            &touched,
+            &declared,
+        ))
     }
 
     /// The plan-declared required checks the engine must rerun itself.
@@ -1064,7 +1094,8 @@ impl<'a> CompletionGateService<'a> {
         // report computation is inside the answer-to-status window. The typed
         // marker is written first so recovery can recognize that window and
         // recompute the same verdict.
-        let marker = CompletionSettlementMarker::new(self.repository_root, settlement);
+        let mut marker = CompletionSettlementMarker::new(self.repository_root, settlement);
+        marker.project_checks = self.project_checks.clone();
         let marker = self.session_store.start_action(
             task,
             COMPLETION_SETTLEMENT_ACTION,
@@ -1116,7 +1147,8 @@ pub(crate) fn settle_recovered(
             marker_data.root.display()
         )));
     }
-    let service = CompletionGateService::new(session_store, &marker_data.root);
+    let mut service = CompletionGateService::new(session_store, &marker_data.root);
+    service.project_checks = marker_data.project_checks.clone();
     let report = service.report(&task.session_id, &task.id)?;
     let settled = service.write_settlement(task, marker_data.settlement, report)?;
     session_store.finish_recorded_action(

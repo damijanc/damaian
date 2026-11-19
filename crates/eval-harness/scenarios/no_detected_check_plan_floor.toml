@@ -1,0 +1,81 @@
+name = "no_detected_check_plan_floor"
+fixture = "makefile-project"
+tier = "deterministic"
+prompt = "Make the greeter say hello to the world, and keep the project's tests passing."
+plan_decision = "approve"
+verify_after_apply = true
+# The harness is the user here: `make test` runs without a command card, so
+# the scenario measures selection, not approvals.
+config_overlay = "command_allowlist=make test"
+check_decisions = [
+  { command = "make test", approved = true },
+]
+
+# Specification 109 D9 and Task 8: a repository whose only build file is a
+# `Makefile` detects no check, which used to leave its verification saying
+# nothing about what verifies it. Here the approved plan names the README's
+# `make test` as its first step's required check. The patch lands in the
+# second step, so per change nothing runs (`nothing_verified`, never
+# `no_checks_available`) and the report names `make test` as the floor left to
+# task completion; the step closes, the check runs again on the changed tree
+# and the task completes, verified by the plan's check. (The harness keeps the
+# patch's own report; the completion run is covered by the engine tests.)
+
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "propose_plan", arguments = { steps = [
+    { title = "Run the project's tests", check = { command = "make test", workingDirectory = "", purpose = "the Makefile's test target, named in README.md", required = true } },
+    { title = "Change the greeting" },
+  ] } },
+]
+
+# The deferred mutating action that raises the plan-review gate; the gate drops
+# it without dispatching.
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "propose_patch", arguments = { summary = "Greet the world", files = [
+    { path = "src/greet.sh", status = "modified", content = "#!/bin/sh\necho \"hello, world\"\n" },
+  ] } },
+]
+
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "run_command", arguments = { command = "make test", reason = "Run the required check" } },
+]
+
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "complete_step", arguments = {} },
+]
+
+[[turn]]
+content = "I changed the greeting."
+tool_calls = [
+  { name = "propose_patch", arguments = { summary = "Greet the world", files = [
+    { path = "src/greet.sh", status = "modified", content = "#!/bin/sh\necho \"hello, world\"\n" },
+  ] } },
+]
+
+# The continuation after the patch's verification closes the last step; the
+# stale `make test` then runs again before the task completes.
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "complete_step", arguments = {} },
+]
+
+[[turn]]
+content = "The greeter says hello to the world and make test passes."
+
+[assert]
+verification_outcome = "nothing_verified"
+verification_summary_excludes = "No checks were available"
+verification_left_to_completion = ["make test"]
+final_task_status = "complete"
+patch_touches = ["src/greet.sh"]
+files_changed_outside_patch = 0
+verification_baselines = []

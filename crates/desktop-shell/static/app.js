@@ -2638,12 +2638,57 @@ function applyRepositoryMap(payload) {
 /// Fetches the selected repository's map and refreshes everything that names
 /// a root. A missing repository clears both.
 async function refreshRepositoryRoots(repoPath = repo()) {
+  void refreshProjectChecks(repoPath).catch(() => {});
   if (!repoPath) {
     applyRepositoryMap(null);
     return null;
   }
   const payload = await api(`/api/repository-map?repo=${encodeURIComponent(repoPath)}`);
   applyRepositoryMap(payload);
+  return payload;
+}
+
+// Spec 109 D9: the checks the user added to this repository's completion
+// floor, one entry per line (`<command>` or `<directory>::<command>`). They
+// live in user config, keyed by repository, so the repository cannot add one.
+async function refreshProjectChecks(repoPath = repo()) {
+  const editor = $("project-checks-editor");
+  const status = $("project-checks-status");
+  if (!editor || !status) return null;
+  if (!repoPath) {
+    editor.value = "";
+    editor.disabled = true;
+    status.textContent = "No repository selected.";
+    return null;
+  }
+  const payload = await api(`/api/project-checks?repo=${encodeURIComponent(repoPath)}`);
+  renderProjectChecks(payload);
+  return payload;
+}
+
+function renderProjectChecks(payload) {
+  const editor = $("project-checks-editor");
+  const status = $("project-checks-status");
+  if (!editor || !status) return;
+  editor.disabled = false;
+  editor.value = (payload.checks || []).map((check) => check.entry).join("\n");
+  const own = (payload.checks || []).length;
+  const effective = (payload.effective || []).length;
+  let text = own === 1 ? "1 check" : `${own} checks`;
+  if (effective < own) {
+    text += ` · ${effective} in effect: this repository's config narrows the list`;
+  }
+  status.textContent = `${text} · saved in ${payload.configPath}`;
+}
+
+async function saveProjectChecks() {
+  const repoPath = requireRepo();
+  const payload = await api(
+    "/api/project-checks",
+    form({ repo: repoPath, checks: $("project-checks-editor").value }),
+  );
+  renderProjectChecks(payload);
+  toast("Project checks saved");
   return payload;
 }
 
@@ -17170,6 +17215,14 @@ $("roots-add-btn").addEventListener("click", async () => {
     const trimmed = String(path || "").trim();
     if (!trimmed) return;
     await writeRootOverride("add", trimmed);
+  } catch (error) {
+    toast(error.message);
+  }
+});
+
+$("project-checks-save-btn").addEventListener("click", async () => {
+  try {
+    await saveProjectChecks();
   } catch (error) {
     toast(error.message);
   }

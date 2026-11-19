@@ -98,11 +98,11 @@ use crate::validation::{
 };
 use crate::vector_index::VectorIndexCache;
 use crate::verification::{
-    BuildErrors, BuildRecord, CheckId, CheckOutcome, CheckReuse, CheckTermination,
+    BuildErrors, BuildRecord, CheckId, CheckOutcome, CheckReuse, CheckTermination, DeclaredFloor,
     FailureProvenance, FindingEvidence, Selection, SkipReason, VerificationEvent,
     VerificationOutcome, VerificationReport, build_checks_for_change, detected_checks_of_roots,
-    environment_termination, fold_verification, propose_checks_exactly, propose_completion_checks,
-    propose_scoped_checks, scoped_selection, with_plan_checks,
+    environment_termination, fold_verification, plan_floor_of_roots, propose_checks_exactly,
+    propose_completion_checks, propose_scoped_checks, scoped_selection, with_plan_checks,
 };
 use crate::web_diagnostics::{
     WEB_SCENARIO_ACTIONS, WebDiagnosticCall, WebDiagnosticKind, WebDiagnosticRecord,

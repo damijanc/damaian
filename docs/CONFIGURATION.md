@@ -171,6 +171,7 @@ Five of these keys are **planned to be replaced (spec 111)** by one list of comm
 | `command_allowlist.<repository_id>` | None | Commands, separated by `\|` | The commands you allowed with *Always allow in this project* for one repository ([Allow Always](USER_GUIDE.md#allow-always)). Damaian writes these lines. Planned to be replaced (spec 111) | No |
 | `command_blocklist` | Empty | Commands, separated by `\|` | Commands that are always blocked: any command that starts with an entry. Planned to be replaced (spec 111) | Adds to yours |
 | `command_access` | `all` | `none`, `read_only`, `local`, `all` | Which commands may run at all ([Permission Profiles](USER_GUIDE.md#permission-profiles)). Planned to be replaced (spec 111) | Lower only (toward `none`) |
+| `project_checks.<repository_id>` | None | Entries separated by `\|`: `<command>` runs at the repository root, `<directory>::<command>` in a repository-relative directory | Checks that must pass before a task in this repository completes, beside the ones Damaian detects (spec 109). For a project whose checks Damaian does not detect, such as one built by a `Makefile`. A check applies when the task changed a file inside its directory; it runs at task completion through the ordinary approval policy. Edited in **Settings → Project checks** | Remove entries only |
 
 ## Files and paths
 
@@ -299,7 +300,7 @@ See [Reading an external page](USER_GUIDE.md#reading-an-external-page). `allow_b
 
 ## Per-repository keys
 
-Four key families above are keyed by a repository id, such as `repo_3f9a…`: `command_allowlist.<repository_id>`, `web_domain_allowlist.<repository_id>`, `permission_profile.<repository_id>` and `hook_review.<repository_id>.<hook_id>`. They hold your own decisions about one repository, so they belong in your `user.conf`, and Damaian writes them when you make the decision. A repository's config can never set them.
+Five key families above are keyed by a repository id, such as `repo_3f9a…`: `command_allowlist.<repository_id>`, `web_domain_allowlist.<repository_id>`, `permission_profile.<repository_id>`, `hook_review.<repository_id>.<hook_id>` and `project_checks.<repository_id>`. They hold your own decisions about one repository, so they belong in your `user.conf`, and Damaian writes them when you make the decision. A repository's config can never set them, except that it may remove entries from `project_checks.<repository_id>` (never add one); a permission profile carries none of them.
 
 ## Example
 

@@ -534,6 +534,8 @@ fn dispatch(
         Route::RejectCommand => handle_reject_command(stream, request),
         Route::RepositoryMap => handle_repository_map(stream, request),
         Route::RepositoryRoots => handle_repository_roots(stream, request),
+        Route::ProjectChecks => handle_project_checks(stream, request),
+        Route::ProjectChecksSet => handle_project_checks_set(stream, request),
         // Spec 25 Task 10: symbol search, on-demand references, and the state
         // of each configured language server. Each is its own function for the
         // reason the findings routes are (spec 22 Task 10).

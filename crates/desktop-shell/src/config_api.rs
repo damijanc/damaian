@@ -962,3 +962,99 @@ fn apply_model_form_options(
     }
     Ok(())
 }
+
+/// `GET /api/project-checks?repo=`: the checks the user added to this
+/// repository's task-completion floor (spec 109 D9). `checks` is the user's
+/// own list, which Settings edits; `effective` is what applies after the
+/// repository's config narrowed it, if it did.
+pub(crate) fn handle_project_checks(
+    stream: &mut TcpStream,
+    request: &Request,
+) -> Result<(), String> {
+    let repo = required_param(request, "repo")?;
+    validate_working_folder(&repo)?;
+    let body = project_checks_json(&repo)?;
+    write_response(stream, request, 200, "application/json", &body)
+}
+
+/// `POST /api/project-checks` with `repo` and `checks`, one entry per line
+/// (`<command>` or `<directory>::<command>`): replaces the user's list for this
+/// repository in user config. An empty list removes the key. Each entry is one
+/// command; a `|` would split it into two, so it is refused rather than
+/// silently changing what was typed.
+pub(crate) fn handle_project_checks_set(
+    stream: &mut TcpStream,
+    request: &Request,
+) -> Result<(), String> {
+    let form = parse_form(&request.body);
+    let repo = required_form(&form, "repo")?;
+    validate_working_folder(&repo)?;
+    let mut checks = Vec::new();
+    for line in form
+        .get("checks")
+        .map(String::as_str)
+        .unwrap_or_default()
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        if line.contains('|') {
+            return Err(format!(
+                "A project check is one command, without `|`: {line}"
+            ));
+        }
+        let check =
+            workspace_engine::ProjectCheck::parse(line).map_err(|error| error.to_string())?;
+        if !checks.contains(&check) {
+            checks.push(check);
+        }
+    }
+    let path = desktop_settings_config_path(None)?;
+    let mut overlay = workspace_engine::ConfigOverlay::load_or_default(&path)
+        .map_err(|error| error.to_string())?;
+    let repository_id = workspace_engine::repository_id_for_root(Path::new(&repo));
+    if checks.is_empty() {
+        overlay.project_checks_by_repository.remove(&repository_id);
+    } else {
+        overlay
+            .project_checks_by_repository
+            .insert(repository_id, checks);
+    }
+    overlay.save(&path).map_err(|error| error.to_string())?;
+    let body = project_checks_json(&repo)?;
+    write_response(stream, request, 200, "application/json", &body)
+}
+
+fn project_checks_json(repo: &str) -> Result<String, String> {
+    let path = desktop_settings_config_path(None)?;
+    let overlay = workspace_engine::ConfigOverlay::load_or_default(&path)
+        .map_err(|error| error.to_string())?;
+    let repository_id = workspace_engine::repository_id_for_root(Path::new(repo));
+    let own = overlay
+        .project_checks_by_repository
+        .get(&repository_id)
+        .cloned()
+        .unwrap_or_default();
+    let effective = config_for_repo(repo)?.project_checks_for(Path::new(repo));
+    let list = |checks: &[workspace_engine::ProjectCheck]| {
+        checks
+            .iter()
+            .map(|check| {
+                format!(
+                    "{{\"workingDirectory\":\"{}\",\"command\":\"{}\",\"entry\":\"{}\"}}",
+                    escape_json(&check.working_directory),
+                    escape_json(&check.command),
+                    escape_json(&check.to_entry())
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    Ok(format!(
+        "{{\"configPath\":\"{}\",\"repositoryId\":\"{}\",\"checks\":[{}],\"effective\":[{}]}}",
+        escape_json(&path.to_string_lossy()),
+        escape_json(&repository_id),
+        list(&own),
+        list(&effective)
+    ))
+}

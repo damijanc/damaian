@@ -8276,3 +8276,100 @@ fn the_verification_card_renders_engine_provenance_without_classifying() {
         );
     }
 }
+
+/// Spec 109 D9: Settings edits the user's `project_checks` for the selected
+/// repository through `/api/project-checks`. The list lands in user config
+/// keyed by the repository's id (never in the repository), reads back with its
+/// effective form, refuses an entry the parser refuses or one a `|` would
+/// split, and an empty list removes the key.
+#[test]
+fn project_checks_route_writes_user_config_and_reads_it_back() {
+    let repo = temp_shell_repo("project-checks");
+    let repo_str = repo.to_string_lossy().to_string();
+    let (port, token) = serve_for_test();
+    let repository_id = workspace_engine::repository_id_for_root(&repo);
+
+    let saved = post_fields_for_test(
+        port,
+        &token,
+        "/api/project-checks",
+        &[
+            ("repo", &repo_str),
+            ("checks", "make test\n\n tools::just lint \n"),
+        ],
+    );
+    assert!(saved.starts_with("HTTP/1.1 200"), "{saved}");
+    let payload = json_of(&saved);
+    assert_eq!(payload["repositoryId"], repository_id.as_str());
+    assert_eq!(payload["checks"][0]["command"], "make test");
+    assert_eq!(payload["checks"][1]["workingDirectory"], "tools");
+    assert_eq!(payload["checks"][1]["entry"], "tools::just lint");
+    assert_eq!(
+        payload["effective"].as_array().unwrap().len(),
+        2,
+        "{payload}"
+    );
+    let config_path = payload["configPath"].as_str().unwrap().to_string();
+    let written = fs::read_to_string(&config_path).unwrap();
+    assert!(
+        written.contains(&format!(
+            "project_checks.{repository_id}=make test|tools::just lint"
+        )),
+        "{written}"
+    );
+    assert!(
+        !repo.join(".damaian/config.conf").exists(),
+        "nothing is written into the repository"
+    );
+
+    let url = format!(
+        "/api/project-checks?repo={}",
+        percent_encode_for_test(&repo_str)
+    );
+    let reread = json_of(&get_for_test(port, &token, &url));
+    assert_eq!(reread["checks"], payload["checks"]);
+
+    for refused in ["make test | tee log", "../up::make test", "tools::"] {
+        let response = post_fields_for_test(
+            port,
+            &token,
+            "/api/project-checks",
+            &[("repo", &repo_str), ("checks", refused)],
+        );
+        assert!(
+            !response.starts_with("HTTP/1.1 200"),
+            "{refused}: {response}"
+        );
+    }
+    assert_eq!(
+        json_of(&get_for_test(port, &token, &url))["checks"],
+        payload["checks"],
+        "a refused save leaves the list as it was"
+    );
+
+    let cleared = post_fields_for_test(
+        port,
+        &token,
+        "/api/project-checks",
+        &[("repo", &repo_str), ("checks", "")],
+    );
+    assert!(json_of(&cleared)["checks"].as_array().unwrap().is_empty());
+    let written = fs::read_to_string(&config_path).unwrap();
+    assert!(!written.contains("project_checks."), "{written}");
+}
+
+/// Spec 109 D9: the Settings page has the Project checks editor, and app.js
+/// loads and saves it through the route.
+#[test]
+fn app_js_edits_project_checks_in_settings() {
+    for id in [
+        "project-checks-section",
+        "project-checks-editor",
+        "project-checks-save-btn",
+        "project-checks-status",
+    ] {
+        assert!(super::INDEX_HTML.contains(&format!("id=\"{id}\"")), "{id}");
+    }
+    assert!(super::APP_JS.contains("`/api/project-checks?repo=${encodeURIComponent(repoPath)}`"));
+    assert!(super::APP_JS.contains("\"/api/project-checks\",\n    form({ repo: repoPath, checks: $(\"project-checks-editor\").value }),"));
+}

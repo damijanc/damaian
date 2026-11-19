@@ -264,7 +264,16 @@ fn propose_plan_parses_a_build_check_that_is_never_required() {
     // The tool asks for one per step.
     let definition = propose_plan_tool_definition();
     assert!(definition.parameters_json.contains("\"build\""));
-    assert!(definition.description.contains("a `build` check"));
+    assert!(
+        definition
+            .description
+            .contains("give code-changing steps a `build`")
+    );
+    // Spec 109 D9: checks come from what the repository declares, as single
+    // commands, with their source named.
+    assert!(definition.description.contains(
+        "from the repository's CI files, Makefile/justfile or README as one command (no && chains) and say in `purpose` where"
+    ));
 }
 
 #[test]

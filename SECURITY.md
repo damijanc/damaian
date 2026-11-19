@@ -359,6 +359,8 @@ Limits on how much one tool call, command or turn may read, run or spend may be 
 
 `command_allowlist` is never taken from repository config. An `Allow Always` decision is the user's decision about a repository, so it is stored in user config as `command_allowlist.<repository_id>`, keyed per checkout. The repository's own file cannot grant its commands no-approval execution, and a `command_allowlist` already present in a repository file is offered once for itemised keep-or-discard rather than honoured. `web_domain_allowlist` follows the same rule for the same reason: *Allow always* on a fetch writes `web_domain_allowlist.<repository_id>` to user config, and a repository cannot pre-approve a host its own content names.
 
+`project_checks.<repository_id>` (spec 109 D9) — commands Damaian runs at task completion for one repository — is the user's too. A repository's config may only narrow it: it keeps the user's entries it also names, and an entry the user does not have is refused as `restrict_only` and audited by key, so a clone cannot make Damaian run a command of its choosing at the end of every task. A permission profile cannot carry it. Each check still runs through the ordinary command policy and asks where the policy asks.
+
 Admin config keeps its ability to both widen and narrow: it is a local file, not something a clone carries.
 
 ## Worker Sessions

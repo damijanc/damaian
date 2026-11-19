@@ -127,10 +127,10 @@ pub use config::{
     DEFAULT_CONTEXT_TOKEN_BUDGET, HookConfig, HookConfigOverlay, HookEvent, HookMode, HookReview,
     HookSource, LANGUAGE_SERVER_LANGUAGES, MAX_HOOK_TIMEOUT_MS, McpServerConfig,
     McpServerConfigOverlay, McpToolConfig, McpToolConfigOverlay, McpTransport, ModelProviderConfig,
-    ModelProviderConfigOverlay, OverlayOutcome, RejectedConfigKey, RepositoryConfigReport,
-    RepositoryKeyClass, builtin_context_window, builtin_token_defaults, normalize_mcp_server_id,
-    normalize_model_provider, normalize_model_reasoning_level, overlay_field_kinds,
-    parse_mcp_transport,
+    ModelProviderConfigOverlay, OverlayOutcome, ProjectCheck, RejectedConfigKey,
+    RepositoryConfigReport, RepositoryKeyClass, builtin_context_window, builtin_token_defaults,
+    normalize_mcp_server_id, normalize_model_provider, normalize_model_reasoning_level,
+    overlay_field_kinds, parse_mcp_transport,
 };
 pub use context_manager::{
     CategoryUsage, CollectionSource, ContextBudget, ContextCategory, ContextItem, ContextKind,
@@ -318,13 +318,14 @@ pub use validation::{
 pub use verification::{
     BROWSER_CHECK_PREFIX, BuildError, BuildErrors, BuildRecord, BuildReport, CARGO_BUILD_CHECK,
     CheckBaseline, CheckId, CheckOutcome, CheckProvenanceRecord, CheckReuse, CheckRun,
-    CheckTermination, DeferredCheck, FAILURE_FINGERPRINT_VERSION, FailedCheck, FailureFingerprint,
-    FailureProvenance, FindingEvidence, GENERIC_IDENTITY_TAIL_TRUNCATED,
-    MAX_GENERIC_IDENTITY_TAIL_BYTES, MAX_REPAIR_STATE_ENTRIES, RepairStateEntry, ScopedSelection,
-    Selection, SkipReason, SkippedCheck, VerificationDue, VerificationEvent, VerificationOutcome,
-    VerificationReport, VerificationState, build_checks_for_change, detected_checks_of_roots,
-    fold_verification, is_documentation, propose_checks, propose_scoped_checks, scoped_selection,
-    select_roots,
+    CheckTermination, DeclaredFloor, DeclaredSource, DeferredCheck, FAILURE_FINGERPRINT_VERSION,
+    FailedCheck, FailureFingerprint, FailureProvenance, FindingEvidence,
+    GENERIC_IDENTITY_TAIL_TRUNCATED, MAX_GENERIC_IDENTITY_TAIL_BYTES, MAX_REPAIR_STATE_ENTRIES,
+    RepairStateEntry, ScopedSelection, Selection, SkipReason, SkippedCheck, VerificationDue,
+    VerificationEvent, VerificationOutcome, VerificationReport, VerificationState,
+    build_checks_for_change, detected_checks_of_roots, floor_checks_with_declared,
+    fold_verification, is_documentation, plan_floor_of_roots, propose_checks,
+    propose_scoped_checks, scoped_selection, select_roots,
 };
 pub use web_diagnostics::{
     WEB_SCENARIO_ACTIONS, WebConsoleEntry, WebDiagnosticArtifact, WebDiagnosticCall,

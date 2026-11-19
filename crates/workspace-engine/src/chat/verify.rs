@@ -1,6 +1,17 @@
 use super::*;
 
 impl ChatOrchestrator {
+    /// The completion gate for `repository_root`, with the user's
+    /// `project_checks` in its floor (spec 109 D9). Every chat path that
+    /// settles or reads the gate goes through this, so they read one floor.
+    pub(super) fn completion_gate<'a>(
+        &'a self,
+        repository_root: &'a Path,
+    ) -> CompletionGateService<'a> {
+        CompletionGateService::new(&self.session_store, repository_root)
+            .with_project_checks(&self.config.project_checks_for(repository_root))
+    }
+
     /// Runs the verification that a settled Code-mode patch made due (spec 23).
     ///
     /// A continuation turn Damaian starts, not one the user typed. The apply
@@ -270,14 +281,35 @@ impl ChatOrchestrator {
                 repository_root,
                 &map,
                 &due.checks,
+                &DeclaredFloor::project_check_ids(&self.config.project_checks_for(repository_root)),
                 &mut reuse,
             )?
         } else if at_completion {
+            // Spec 109 D9: a floor root with no detected check takes the
+            // approved plan's required checks covering it, and the user's
+            // `project_checks` join the floor wherever the task touched them.
+            let plan_checks = match plan.as_ref() {
+                Some(plan)
+                    if self
+                        .session_store
+                        .read_plan_approved(session_id, &task.id)? =>
+                {
+                    plan_required_checks(repository_root, plan)
+                }
+                _ => Vec::new(),
+            };
+            let declared = DeclaredFloor {
+                plan_checks,
+                project_checks: DeclaredFloor::project_check_ids(
+                    &self.config.project_checks_for(repository_root),
+                ),
+            };
             propose_completion_checks(
                 &self.validation_orchestrator,
                 repository_root,
                 &map,
                 &changed,
+                &declared,
                 &mut reuse,
             )?
         } else {
@@ -315,6 +347,14 @@ impl ChatOrchestrator {
                 .cloned()
                 .collect();
             left_to_completion = detected_checks_of_roots(&map, &scoped.completion_roots);
+            // Spec 109 D9: a covered root Damaian detects no check for has the
+            // plan's covering checks as its floor, so those are what wait for
+            // completion, not nothing.
+            for check in plan_floor_of_roots(&map, &scoped.completion_roots, &plan_checks) {
+                if !left_to_completion.contains(&check) {
+                    left_to_completion.push(check);
+                }
+            }
             propose_scoped_checks(
                 &self.validation_orchestrator,
                 repository_root,
@@ -331,7 +371,7 @@ impl ChatOrchestrator {
         // (spec 109 D4): mid-plan the gate leaves it to completion, so
         // rerunning it after every later patch would only repeat it.
         let plan_reruns = if at_completion || !due.checks.is_empty() {
-            CompletionGateService::new(&self.session_store, repository_root)
+            self.completion_gate(repository_root)
                 .plan_checks_needing_rerun(session_id, &task.id)?
         } else {
             Vec::new()
@@ -2090,7 +2130,8 @@ impl ChatOrchestrator {
             | VerificationOutcome::RepairStalled
             | VerificationOutcome::NoRepairApplied => CompletionSettlement::VerificationFailed,
         };
-        let task = CompletionGateService::new(&self.session_store, repository_root)
+        let task = self
+            .completion_gate(repository_root)
             .settle(&task, settlement)?
             .task;
         self.verification_turn_result(session, task, response, None, Some(report), changed)

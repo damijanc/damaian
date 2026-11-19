@@ -2556,6 +2556,127 @@ pub fn floor_checks(
     checks.into_iter().collect()
 }
 
+/// The completion-floor checks Damaian does not detect itself (spec 109 D9):
+/// how a project in an ecosystem no manifest names is still verified, with no
+/// list of languages deciding anything.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DeclaredFloor {
+    /// The approved plan's required checks, directories in `CheckId` form. A
+    /// touched floor root with no detected check takes the ones covering it
+    /// (D4's rule: the check's directory is the root or encloses it) as its
+    /// floor. An unapproved plan contributes none.
+    pub plan_checks: Vec<CheckId>,
+    /// The user's `project_checks` for this repository. Each joins the floor
+    /// when the task touched a non-documentation file inside its directory,
+    /// whatever the manifests detect.
+    pub project_checks: Vec<CheckId>,
+}
+
+/// Where a [`DeclaredFloor`] check came from, for the proposal's reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeclaredSource {
+    Plan,
+    Project,
+}
+
+impl DeclaredFloor {
+    /// The user's configured checks, as [`CheckId`]s.
+    pub fn project_check_ids(checks: &[crate::config::ProjectCheck]) -> Vec<CheckId> {
+        let mut ids = Vec::new();
+        for check in checks {
+            let id = CheckId::new(check.working_directory.as_str(), check.command.as_str());
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+        ids
+    }
+
+    /// The declared checks `touched` brings into the floor, plan checks
+    /// first, de-duplicated by identity. Reads only the persisted map.
+    pub fn checks_for(
+        &self,
+        map: &RepositoryMap,
+        touched: &[String],
+    ) -> Vec<(CheckId, DeclaredSource)> {
+        let mut checks: Vec<(CheckId, DeclaredSource)> = Vec::new();
+        let mut push = |check: &CheckId, source| {
+            if !checks.iter().any(|(existing, _)| existing == check) {
+                checks.push((check.clone(), source));
+            }
+        };
+        for check in plan_floor_of_roots(map, &select_floor_roots(map, touched), &self.plan_checks)
+        {
+            push(&check, DeclaredSource::Plan);
+        }
+        for check in &self.project_checks {
+            let directory = check.working_directory.as_str();
+            let inside = |path: &String| {
+                directory.is_empty()
+                    || path
+                        .strip_prefix(directory)
+                        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+            };
+            if touched
+                .iter()
+                .any(|path| !is_documentation(path) && inside(path))
+            {
+                push(check, DeclaredSource::Project);
+            }
+        }
+        checks
+    }
+}
+
+/// The plan checks that are the completion floor of those `roots` Damaian
+/// detects no check for (spec 109 D9): each covering one (D4's rule: its
+/// directory is the root or a root enclosing it), in plan order,
+/// de-duplicated. A root with a detected check takes none.
+pub fn plan_floor_of_roots(
+    map: &RepositoryMap,
+    roots: &[String],
+    plan_checks: &[CheckId],
+) -> Vec<CheckId> {
+    let mut checks: Vec<CheckId> = Vec::new();
+    if plan_checks.is_empty() {
+        return checks;
+    }
+    for root in roots {
+        if !detected_checks_of_roots(map, std::slice::from_ref(root)).is_empty() {
+            continue;
+        }
+        let enclosing = map.enclosing_roots(root);
+        for check in plan_checks {
+            let covers = check.working_directory == *root
+                || enclosing.contains(&check.working_directory.as_str());
+            if covers && !checks.contains(check) {
+                checks.push(check.clone());
+            }
+        }
+    }
+    checks
+}
+
+/// [`floor_checks`] plus the [`DeclaredFloor`] checks `touched_paths` brings
+/// in (spec 109 D9), sorted by [`CheckId`] like the detected floor.
+pub fn floor_checks_with_declared(
+    repository_root: &Path,
+    map: &RepositoryMap,
+    touched_paths: &[String],
+    declared: &DeclaredFloor,
+) -> Vec<CheckId> {
+    let mut checks: BTreeSet<CheckId> = floor_checks(repository_root, map, touched_paths)
+        .into_iter()
+        .collect();
+    checks.extend(
+        declared
+            .checks_for(map, touched_paths)
+            .into_iter()
+            .map(|(check, _)| check),
+    );
+    checks.into_iter().collect()
+}
+
 /// What [`propose_checks`] found.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Selection {
@@ -2755,20 +2876,78 @@ pub fn propose_scoped_checks(
 /// completion run also refreshes checks the task already selected: a repair
 /// patch that changed a member after its per-change check passed would
 /// otherwise leave that check stale with nothing left to rerun it.
+///
+/// Spec 109 D9: the [`DeclaredFloor`] checks the change brings in are proposed
+/// after the detected ones, through the same policy path, so a root with no
+/// detected check is verified by its approved plan's checks and the user's
+/// `project_checks` instead of ending "no checks available".
 pub fn propose_completion_checks(
     orchestrator: &ValidationOrchestrator,
     repository_root: &Path,
     map: &RepositoryMap,
     changed: &[String],
+    declared: &DeclaredFloor,
     reuse: &mut CheckReuse,
 ) -> Result<Selection> {
-    propose_checks_for_roots(
+    let detected = propose_checks_for_roots(
         orchestrator,
         repository_root,
         map,
         &select_floor_roots(map, changed),
         false,
         reuse,
+    )?;
+    let declared = declared.checks_for(map, changed);
+    let (plan, project): (Vec<_>, Vec<_>) = declared
+        .into_iter()
+        .partition(|(_, source)| *source == DeclaredSource::Plan);
+    let plan: Vec<CheckId> = plan.into_iter().map(|(check, _)| check).collect();
+    let project: Vec<CheckId> = project.into_iter().map(|(check, _)| check).collect();
+    let selection = append_declared(
+        orchestrator,
+        repository_root,
+        detected,
+        &plan,
+        reuse,
+        PlanCheckReason::FloorForUndetectedRoot,
+    )?;
+    append_declared(
+        orchestrator,
+        repository_root,
+        selection,
+        &project,
+        reuse,
+        PlanCheckReason::ProjectCheck,
+    )
+}
+
+/// [`append_plan_checks`] for declared floor checks: when every one of them
+/// was reused, the selection is the reused results, not "no checks
+/// available" (spec 109 D6).
+fn append_declared(
+    orchestrator: &ValidationOrchestrator,
+    repository_root: &Path,
+    selection: Selection,
+    checks: &[CheckId],
+    reuse: &mut CheckReuse,
+    reason: PlanCheckReason,
+) -> Result<Selection> {
+    if checks.is_empty() {
+        return Ok(selection);
+    }
+    let selection = match selection {
+        Selection::OnlyDocumentation | Selection::NoChecksAvailable { .. } => {
+            Selection::Proposed(Vec::new())
+        }
+        proposed => proposed,
+    };
+    append_plan_checks(
+        orchestrator,
+        repository_root,
+        selection,
+        checks,
+        reuse,
+        reason,
     )
 }
 
@@ -2829,6 +3008,7 @@ pub fn propose_checks_exactly(
     repository_root: &Path,
     map: &RepositoryMap,
     checks: &[CheckId],
+    project_checks: &[CheckId],
     reuse: &mut CheckReuse,
 ) -> Result<Selection> {
     if checks.is_empty() {
@@ -2848,14 +3028,35 @@ pub fn propose_checks_exactly(
             })
         });
     }
+    // A requested check no root detects but the user configured for this
+    // project (spec 109 D9) is proposed through the same policy path rather
+    // than silently left out. Any other undetected one — a finished step's
+    // stale plan check — is the caller's to add with its own reason.
+    let undetected: Vec<CheckId> = checks
+        .iter()
+        .filter(|check| project_checks.contains(check))
+        .filter(|check| {
+            !restricted.roots.iter().any(|root| {
+                root.path == check.working_directory
+                    && root
+                        .commands
+                        .iter()
+                        .any(|command| command.command == check.command)
+            })
+        })
+        .cloned()
+        .collect();
     let reused_any = drop_reused(&mut restricted, reuse);
     let proposals = orchestrator.propose_detected_validations(repository_root, &restricted)?;
-    Ok(selection_from_proposals(
+    let detected = selection_from_proposals(repository_root, &roots, proposals, reused_any);
+    append_declared(
+        orchestrator,
         repository_root,
-        &roots,
-        proposals,
-        reused_any,
-    ))
+        detected,
+        &undetected,
+        reuse,
+        PlanCheckReason::ProjectCheck,
+    )
 }
 
 /// Adds the plan-declared checks the gate says must run again to a selection.
@@ -2889,6 +3090,11 @@ enum PlanCheckReason {
     StaleRerun,
     /// The plan's scoped check verifies a change (spec 109 D4).
     ScopedForChange,
+    /// The plan's check is the completion floor of a root Damaian detects no
+    /// check for (spec 109 D9).
+    FloorForUndetectedRoot,
+    /// A check the user configured for this repository (spec 109 D9).
+    ProjectCheck,
 }
 
 fn append_plan_checks(
@@ -2923,6 +3129,16 @@ fn append_plan_checks(
                 orchestrator.propose_plan_check(repository_root, &working_directory, &check.command)
             }
             PlanCheckReason::ScopedForChange => orchestrator.propose_scoped_plan_check(
+                repository_root,
+                &working_directory,
+                &check.command,
+            ),
+            PlanCheckReason::FloorForUndetectedRoot => orchestrator.propose_floor_plan_check(
+                repository_root,
+                &working_directory,
+                &check.command,
+            ),
+            PlanCheckReason::ProjectCheck => orchestrator.propose_project_check(
                 repository_root,
                 &working_directory,
                 &check.command,

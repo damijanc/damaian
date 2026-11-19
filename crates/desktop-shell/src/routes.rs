@@ -102,6 +102,8 @@ pub(crate) enum Route {
     RejectCommand,
     RepositoryMap,
     RepositoryRoots,
+    ProjectChecks,
+    ProjectChecksSet,
     Symbols,
     SymbolReferences,
     LanguageServers,
@@ -296,6 +298,8 @@ pub(crate) const ROUTES: &[(&str, &str, Route)] = &[
     ("POST", "/api/reject-command", Route::RejectCommand),
     ("GET", "/api/repository-map", Route::RepositoryMap),
     ("POST", "/api/repository-roots", Route::RepositoryRoots),
+    ("GET", "/api/project-checks", Route::ProjectChecks),
+    ("POST", "/api/project-checks", Route::ProjectChecksSet),
     ("GET", "/api/symbols", Route::Symbols),
     ("GET", "/api/symbol-references", Route::SymbolReferences),
     ("GET", "/api/language-servers", Route::LanguageServers),
@@ -470,6 +474,9 @@ impl Route {
             | Route::PlanWorkerPrompt
             | Route::RepositoryMap
             | Route::RepositoryRoots
+            // Spec 109 D9: the user's own config, like `/api/config-set`.
+            | Route::ProjectChecks
+            | Route::ProjectChecksSet
             | Route::Symbols
             | Route::SymbolReferences
             | Route::LanguageServers

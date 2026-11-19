@@ -298,6 +298,10 @@ pub struct Asserts {
     /// The exact commands the report lists as passed. The point is that none of
     /// them was merely skipped or stale.
     pub verification_passed_commands: Option<Vec<String>>,
+    /// The exact commands the report leaves to task completion (spec 109 D4,
+    /// D9): checks a per-change run did not run because the completion floor
+    /// owns them, such as the plan's check for a root with no detected check.
+    pub verification_left_to_completion: Option<Vec<String>>,
     /// How many plan reminders the run sent (spec 66 §5.5). A scenario that
     /// asserts this without a plan fails rather than comparing `None`.
     pub plan_reminders: Option<u64>,

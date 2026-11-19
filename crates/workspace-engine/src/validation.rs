@@ -323,6 +323,42 @@ impl ValidationOrchestrator {
         )
     }
 
+    /// Proposes the approved plan's required check as the completion floor of
+    /// a project root Damaian detects no check for (spec 109 D9).
+    pub fn propose_floor_plan_check(
+        &self,
+        repository_root: impl AsRef<Path>,
+        working_directory: impl AsRef<Path>,
+        command: &str,
+    ) -> Result<CommandProposal> {
+        self.store_proposal(
+            repository_root,
+            working_directory,
+            command,
+            "Required check from the plan, run at task completion because Damaian detects no check for this part of the project",
+            true,
+            Vec::new(),
+        )
+    }
+
+    /// Proposes a check the user configured for this repository
+    /// (`project_checks`, spec 109 D9), run at task completion.
+    pub fn propose_project_check(
+        &self,
+        repository_root: impl AsRef<Path>,
+        working_directory: impl AsRef<Path>,
+        command: &str,
+    ) -> Result<CommandProposal> {
+        self.store_proposal(
+            repository_root,
+            working_directory,
+            command,
+            "Check you configured for this project, run at task completion",
+            true,
+            Vec::new(),
+        )
+    }
+
     /// Proposes a build check — the plan step's compile or type-check command,
     /// or the Cargo fast path — that a per-change verification runs before
     /// anything else (spec 109 D10). The same policy path as every check; it

@@ -2550,7 +2550,8 @@ impl ChatOrchestrator {
                 response = stall_response;
                 final_run.content = response.clone();
                 terminal_verification_report = Some(report);
-                st.task = CompletionGateService::new(&self.session_store, st.repository_root)
+                st.task = self
+                    .completion_gate(st.repository_root)
                     .settle(&settlement.task, CompletionSettlement::VerificationFailed)?
                     .task;
                 terminal_settled = Some(st.task.clone());
@@ -2646,9 +2647,9 @@ impl ChatOrchestrator {
                     // `complete` cannot be asserted by the model or reached with
                     // open plan work, a due verification or pending evidence.
                     StopReason::Answered => {
-                        let settled =
-                            CompletionGateService::new(&self.session_store, st.repository_root)
-                                .settle(&st.task, CompletionSettlement::Gate)?;
+                        let settled = self
+                            .completion_gate(st.repository_root)
+                            .settle(&st.task, CompletionSettlement::Gate)?;
                         // Review follow-up to R16: the task-completion floor's
                         // enclosing roots are not run per change, and a plan
                         // that declares any required check must not suppress
@@ -2656,8 +2657,7 @@ impl ChatOrchestrator {
                         // are missing or stale and are not plan-declared; run
                         // exactly those through the ordinary check policy. A
                         // plan-declared check stays the model's job.
-                        let gate =
-                            CompletionGateService::new(&self.session_store, st.repository_root);
+                        let gate = self.completion_gate(st.repository_root);
                         let mut needed_floor_checks = gate
                             .floor_checks_needing_verification(&st.session.id, &settled.task.id)?;
                         // Spec 106 Task 6: once no plan work is open, a finished

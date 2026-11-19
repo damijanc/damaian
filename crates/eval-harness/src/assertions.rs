@@ -501,6 +501,29 @@ pub fn evaluate(
             );
         }
 
+        if let Some(expected) = &asserts.verification_left_to_completion {
+            let mut left: Vec<String> = run
+                .verification
+                .as_ref()
+                .map(|report| {
+                    report
+                        .deferred_to_completion
+                        .iter()
+                        .map(|check| check.command.clone())
+                        .collect()
+                })
+                .unwrap_or_default();
+            left.sort();
+            let mut wanted = expected.clone();
+            wanted.sort();
+            push(
+                "verification_left_to_completion",
+                wanted == left,
+                format!("{wanted:?}"),
+                format!("{left:?}"),
+            );
+        }
+
         // Spec 102 Task 6: the provenance groups and the repair targets come
         // from the durable report, so a scenario measures what the engine
         // classified rather than what the script expected.

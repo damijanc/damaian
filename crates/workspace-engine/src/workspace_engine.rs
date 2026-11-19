@@ -746,7 +746,9 @@ impl WorkspaceEngine {
         session_id: &str,
         task_id: &str,
     ) -> Result<crate::completion::CompletionGateReport> {
-        crate::completion::CompletionGateService::new(&self.session_store, repository_root.as_ref())
+        let repository_root = repository_root.as_ref();
+        crate::completion::CompletionGateService::new(&self.session_store, repository_root)
+            .with_project_checks(&self.config.project_checks_for(repository_root))
             .report(session_id, task_id)
     }
 

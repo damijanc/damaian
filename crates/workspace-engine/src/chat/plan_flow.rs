@@ -147,7 +147,7 @@ impl ChatOrchestrator {
         // goes through the shared completion gate (spec 101), so this ordinary
         // turn cannot write `complete` by a path that bypasses the verdict.
         let repository_root = PathBuf::from(&pending.repository_root);
-        CompletionGateService::new(&self.session_store, &repository_root)
+        self.completion_gate(&repository_root)
             .settle(&task, CompletionSettlement::Gate)?;
         Ok(())
     }

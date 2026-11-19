@@ -1,0 +1,6 @@
+version = "1"
+description = """
+A shell project whose only build file is a `Makefile` (spec 109 D9): no
+manifest Damaian detects, so no detected check. Its `make test` target is the
+check the README names; a plan that names it is what verifies the task.
+"""

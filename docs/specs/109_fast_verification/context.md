@@ -378,4 +378,42 @@ partly fixed by spec 107 D3), 86 (main-checkout test-process overhead) and 89
   asks the model to name the repository's declared checks as single commands,
   not `&&` chains, and to say where it found them. The manifest detection
   stays as a fast path.
+  - **As built (Task 8, 2026-11-19).** `DeclaredFloor { plan_checks,
+    project_checks }` (`verification.rs`) is what the floor takes beyond the
+    detected checks. (1) `plan_floor_of_roots`: a floor root with no detected
+    check takes the **approved** plan's required checks covering it by D4's
+    rule (the check's directory is the root or encloses it); a root with a
+    detected check takes none. `propose_completion_checks` proposes them after
+    the detected floor (`ValidationOrchestrator::propose_floor_plan_check`), so
+    a completion run of such a root is no longer "no checks available". The
+    gate needs no change for them: it already requires every plan check as
+    the plan's own. Per change, a covered root with no detected check and no
+    current-step check now reports the plan's covering checks as left to
+    completion (`verification_deferred_to_completion`) instead of nothing.
+    (2) `project_checks.<repository_id>=<entry>|<entry>`, an entry being
+    `<command>` (repository root) or `<directory>::<command>`
+    (`config::ProjectCheck`; only a first `::` with no whitespace before it
+    splits off a directory; absolute or `..` directories are refused). Keyed by
+    repository id like the other per-repository decisions (OBSERVATIONS 98's
+    naming survey applies). User and admin scope set it; repository scope may
+    only narrow it (a new entry is rejected `restrict_only`); a profile is
+    refused `user_owned`. A project check joins the floor when the task touched
+    a non-documentation file inside its directory, whatever the manifests
+    detect: in the gate (`CompletionGateService::with_project_checks`, used by
+    every chat path through `ChatOrchestrator::completion_gate` and by
+    `WorkspaceEngine::completion_report`; the settlement marker carries them so
+    crash recovery recomputes the same floor without the user's config), in
+    the completion run (`propose_project_check`), and in the answer-time floor
+    run (`propose_checks_exactly` proposes a requested check no root detects
+    only when it is a project check; a finished step's stale plan check is
+    still added by `with_plan_checks` with its own reason). It is not a
+    per-change check. Settings → **Project checks** edits the user's list
+    through `GET`/`POST /api/project-checks` (user config only; `|` refused).
+    (3) The `propose_plan` tool description asks for `check` and `build`
+    commands from the repository's CI files, `Makefile`/`justfile` or README as
+    one command each, naming the source in `purpose`. The schema's other
+    descriptions were shortened so the tool definition is no longer than
+    before: `bounded_worker_long_read_reread` sits a few tokens under its
+    context window (as Task 9 found), and a longer description flips it to
+    `task_compaction_cannot_fit`.
 

@@ -60,6 +60,64 @@ pub const DEFAULT_RESTRICTED_PATTERNS: &[&str] = &[
     "**/credentials/**",
 ];
 
+/// One check the user added to a repository's task-completion floor (spec 109
+/// D9): a single command and the repository-relative directory it runs in.
+///
+/// Written `<directory>::<command>`, or `<command>` alone for the repository
+/// root. Only a first `::` with no whitespace before it splits off a
+/// directory, so `cargo test -- tests::a` alone is a root command; `::<command>`
+/// names the root explicitly.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ProjectCheck {
+    /// `""` is the repository root.
+    pub working_directory: String,
+    pub command: String,
+}
+
+impl ProjectCheck {
+    pub fn parse(entry: &str) -> Result<Self> {
+        let entry = entry.trim();
+        let (directory, command) = match entry.split_once("::") {
+            Some((directory, command)) if !directory.contains(char::is_whitespace) => {
+                (directory, command.trim())
+            }
+            _ => ("", entry),
+        };
+        if command.is_empty() {
+            return Err(ClientError::InvalidInput(format!(
+                "A project check needs a command: {entry}"
+            )));
+        }
+        let directory = directory
+            .trim_start_matches("./")
+            .trim_end_matches('/')
+            .trim();
+        let directory = if directory == "." { "" } else { directory };
+        if directory.starts_with('/')
+            || directory
+                .split('/')
+                .any(|part| part == ".." || (part.is_empty() && !directory.is_empty()))
+        {
+            return Err(ClientError::InvalidInput(format!(
+                "A project check's directory must be relative to the repository: {entry}"
+            )));
+        }
+        Ok(Self {
+            working_directory: directory.to_string(),
+            command: command.to_string(),
+        })
+    }
+
+    /// The entry as `project_checks.<repository_id>` writes it.
+    pub fn to_entry(&self) -> String {
+        if self.working_directory.is_empty() && !self.command.contains("::") {
+            self.command.clone()
+        } else {
+            format!("{}::{}", self.working_directory, self.command)
+        }
+    }
+}
+
 /// Where a [`ConfigOverlay`] came from. [`ConfigScope::Repository`] is
 /// untrusted: that file arrives with a clone, so it may add restrictions but
 /// never remove one. See `docs/specs/34_repository_config_trust_boundary.md`.
@@ -530,6 +588,12 @@ pub struct Config {
     /// and then hook id. User-owned, like `Allow Always`: a repository cannot
     /// approve its own hook.
     pub hook_reviews_by_repository: BTreeMap<String, BTreeMap<String, HookReview>>,
+    /// Checks the user added to one repository's task-completion floor
+    /// (spec 109 D9), keyed by repository id: how a project whose files
+    /// Damaian detects no check for is still verified. The user's own
+    /// decision about one repository, like `Allow Always`: a repository may
+    /// narrow its list, never add to it.
+    pub project_checks_by_repository: BTreeMap<String, Vec<ProjectCheck>>,
     /// `language_server.<language>=<command line>` (spec 25 `context.md` §6),
     /// keyed by language. A program Damaian spawns, so it is set by user or
     /// admin config only, like `shell`.
@@ -1452,6 +1516,7 @@ impl Config {
             mcp_tools,
             hooks,
             hook_reviews_by_repository,
+            project_checks_by_repository,
             language_servers,
         } = overlay;
 
@@ -1986,6 +2051,54 @@ impl Config {
                         RepositoryKeyClass::UserOwned,
                     ));
                 }
+            }
+        }
+
+        // Spec 109 D9: the user's checks for one repository's completion floor.
+        // A trusted scope sets the list. Repository config only narrows it: it
+        // keeps the user's entries it also names, and an entry the user does
+        // not have is refused, since a clone that could add a check would make
+        // Damaian run a command of its choosing at every task's end. A profile
+        // carries no per-repository decision, like `permission_profile.<id>`.
+        for (repository_id, checks) in project_checks_by_repository {
+            let key = format!("project_checks.{repository_id}");
+            match scope {
+                ConfigScope::User | ConfigScope::Admin => {
+                    self.project_checks_by_repository
+                        .insert(repository_id, checks);
+                    continue;
+                }
+                ConfigScope::Profile => {
+                    rejected.push(RejectedConfigKey::new(key, RepositoryKeyClass::UserOwned));
+                    continue;
+                }
+                ConfigScope::Repository => {}
+            }
+            let current = self
+                .project_checks_by_repository
+                .get(&repository_id)
+                .cloned()
+                .unwrap_or_default();
+            if checks.iter().any(|check| !current.contains(check)) {
+                rejected.push(RejectedConfigKey::new(
+                    key.clone(),
+                    RepositoryKeyClass::RestrictOnly,
+                ));
+            }
+            let kept: Vec<ProjectCheck> = current
+                .into_iter()
+                .filter(|check| checks.contains(check))
+                .collect();
+            if let Some(entries) = self.project_checks_by_repository.get_mut(&repository_id) {
+                if *entries != kept {
+                    outcome.record(
+                        scope,
+                        key,
+                        Some(kept.iter().map(ProjectCheck::to_entry).collect()),
+                        false,
+                    );
+                }
+                *entries = kept;
             }
         }
 
@@ -3125,6 +3238,15 @@ impl Config {
     /// Returns the entries it added, which the effective policy attributes to
     /// this repository's `Allow Always`. An entry user config already listed
     /// is not added, so it stays attributed to user config.
+    /// The checks the user added to `repository_root`'s completion floor
+    /// (spec 109 D9), after any narrowing by repository or profile config.
+    pub fn project_checks_for(&self, repository_root: &Path) -> Vec<ProjectCheck> {
+        self.project_checks_by_repository
+            .get(&repository_id_for_root(repository_root))
+            .cloned()
+            .unwrap_or_default()
+    }
+
     pub fn apply_repository_allowlist(&mut self, repository_root: &Path) -> Vec<String> {
         let repository_id = repository_id_for_root(repository_root);
         let Some(entries) = self.command_allowlist_by_repository.get(&repository_id) else {
@@ -3761,6 +3883,7 @@ impl Default for Config {
             mcp_tools: BTreeMap::new(),
             hooks: Vec::new(),
             hook_reviews_by_repository: BTreeMap::new(),
+            project_checks_by_repository: BTreeMap::new(),
             // None: with nothing configured no server is ever spawned, and the
             // heuristic tier stands alone (proposal §5.4).
             language_servers: BTreeMap::new(),
@@ -3898,6 +4021,8 @@ pub struct ConfigOverlay {
     /// `hook_review.<repository_id>.<hook_id>` entries, from user or admin
     /// config.
     pub hook_reviews_by_repository: BTreeMap<String, BTreeMap<String, HookReview>>,
+    /// `project_checks.<repository_id>` entries (spec 109 D9).
+    pub project_checks_by_repository: BTreeMap<String, Vec<ProjectCheck>>,
     /// `language_server.<language>` entries, by language.
     pub language_servers: BTreeMap<String, String>,
 }
@@ -4125,6 +4250,9 @@ classify_overlay_fields! {
     // one repository (spec 32, context.md §7.1).
     hooks => Capability,
     hook_reviews_by_repository => Capability,
+    // Spec 109 D9: a check is a command Damaian runs at task completion, so
+    // adding one is a capability; a repository may only narrow the list.
+    project_checks_by_repository => Capability,
     // A program Damaian spawns in the background, like `shell` (spec 25,
     // context.md §6).
     language_servers => Capability,
@@ -4236,6 +4364,9 @@ impl ConfigOverlay {
         }
         if let Some(repository_id) = key.strip_prefix("command_allowlist.") {
             return self.set_repository_command_allowlist(repository_id, value);
+        }
+        if let Some(repository_id) = key.strip_prefix("project_checks.") {
+            return self.set_repository_project_checks(repository_id, value);
         }
         if let Some(repository_id) = key.strip_prefix("web_domain_allowlist.") {
             return self.set_repository_web_domain_allowlist(repository_id, value);
@@ -4542,6 +4673,29 @@ impl ConfigOverlay {
         }
         self.command_allowlist_by_repository
             .insert(repository_id.to_string(), split_list(value));
+        Ok(())
+    }
+
+    /// `project_checks.<repository_id>=dir::command|command` — checks added to
+    /// one repository's task-completion floor (spec 109 D9). Valid at every
+    /// scope as a key; a repository or profile value only narrows the user's
+    /// list when the overlay is applied.
+    fn set_repository_project_checks(&mut self, repository_id: &str, value: &str) -> Result<()> {
+        let repository_id = repository_id.trim();
+        if !repository_id.starts_with("repo_") {
+            return Err(ClientError::InvalidInput(format!(
+                "Invalid repository id in config key: project_checks.{repository_id}"
+            )));
+        }
+        let mut checks = Vec::new();
+        for entry in split_list(value) {
+            let check = ProjectCheck::parse(&entry)?;
+            if !checks.contains(&check) {
+                checks.push(check);
+            }
+        }
+        self.project_checks_by_repository
+            .insert(repository_id.to_string(), checks);
         Ok(())
     }
 
@@ -4980,6 +5134,7 @@ impl ConfigOverlay {
             mcp_tools,
             hooks,
             hook_reviews_by_repository,
+            project_checks_by_repository,
             language_servers,
         } = self;
         let mut output = String::new();
@@ -5373,6 +5528,14 @@ impl ConfigOverlay {
                     review.as_str(),
                 );
             }
+        }
+        for (repository_id, checks) in project_checks_by_repository {
+            let entries: Vec<String> = checks.iter().map(ProjectCheck::to_entry).collect();
+            push_line(
+                &mut output,
+                &format!("project_checks.{repository_id}"),
+                &join_list(&entries),
+            );
         }
         for (language, command) in language_servers {
             push_line(&mut output, &format!("language_server.{language}"), command);
@@ -7013,5 +7176,110 @@ mod tests {
             Some(0)
         );
         assert!(ConfigOverlay::parse("memory_max_entries=-1\n").is_err());
+    }
+
+    /// Spec 109 D9: `project_checks.<repository_id>` parses entries with and
+    /// without a directory, refuses one that leaves the repository, and
+    /// round-trips through the overlay serializer.
+    #[test]
+    fn project_checks_parse_and_round_trip() {
+        let overlay = ConfigOverlay::parse(
+            "project_checks.repo_abc=make test|./tools::just lint|cargo test -- tests::a\n",
+        )
+        .unwrap();
+        let checks = &overlay.project_checks_by_repository["repo_abc"];
+        assert_eq!(
+            checks,
+            &vec![
+                ProjectCheck {
+                    working_directory: String::new(),
+                    command: "make test".to_string(),
+                },
+                ProjectCheck {
+                    working_directory: "tools".to_string(),
+                    command: "just lint".to_string(),
+                },
+                ProjectCheck {
+                    working_directory: String::new(),
+                    command: "cargo test -- tests::a".to_string(),
+                },
+            ]
+        );
+        assert_eq!(
+            ConfigOverlay::parse(&overlay.to_policy_text()).unwrap(),
+            overlay
+        );
+        for bad in ["/etc::make", "../up::make", "a//b::make", "tools::"] {
+            assert!(
+                ConfigOverlay::parse(&format!("project_checks.repo_abc={bad}\n")).is_err(),
+                "{bad}"
+            );
+        }
+        assert!(ConfigOverlay::parse("project_checks.not-an-id=make test\n").is_err());
+    }
+
+    /// Spec 109 D9 / spec 34: a repository may narrow the user's project
+    /// checks, never add one, and a profile carries none.
+    #[test]
+    fn a_repository_may_narrow_project_checks_but_never_add_one() {
+        let user = ConfigOverlay::parse("project_checks.repo_abc=make test|make lint\n").unwrap();
+        let entries = |config: &Config| -> Vec<String> {
+            config
+                .project_checks_by_repository
+                .get("repo_abc")
+                .map(|checks| checks.iter().map(ProjectCheck::to_entry).collect())
+                .unwrap_or_default()
+        };
+
+        // Adding to an empty list is refused and adds nothing.
+        let mut config = Config::default();
+        let outcome = config.apply_overlay_scoped(
+            ConfigOverlay::parse("project_checks.repo_abc=make test\n").unwrap(),
+            ConfigScope::Repository,
+        );
+        assert!(entries(&config).is_empty());
+        assert_eq!(
+            outcome.rejected,
+            vec![RejectedConfigKey::new(
+                "project_checks.repo_abc",
+                RepositoryKeyClass::RestrictOnly
+            )]
+        );
+
+        // Narrowing keeps the shared entry; a new one is refused, not added.
+        let mut config = Config::default();
+        config.apply_overlay(user.clone());
+        let outcome = config.apply_overlay_scoped(
+            ConfigOverlay::parse("project_checks.repo_abc=make test|curl evil\n").unwrap(),
+            ConfigScope::Repository,
+        );
+        assert_eq!(entries(&config), vec!["make test".to_string()]);
+        assert_eq!(outcome.rejected.len(), 1, "{outcome:?}");
+
+        // A pure narrowing is not refused.
+        let mut config = Config::default();
+        config.apply_overlay(user.clone());
+        let outcome = config.apply_overlay_scoped(
+            ConfigOverlay::parse("project_checks.repo_abc=make lint\n").unwrap(),
+            ConfigScope::Repository,
+        );
+        assert_eq!(entries(&config), vec!["make lint".to_string()]);
+        assert!(outcome.rejected.is_empty(), "{outcome:?}");
+
+        // A profile carries no per-repository decision.
+        let mut config = Config::default();
+        config.apply_overlay(user);
+        let outcome = config.apply_overlay_scoped(
+            ConfigOverlay::parse("project_checks.repo_abc=make test\n").unwrap(),
+            ConfigScope::Profile,
+        );
+        assert_eq!(entries(&config).len(), 2);
+        assert_eq!(
+            outcome.rejected,
+            vec![RejectedConfigKey::new(
+                "project_checks.repo_abc",
+                RepositoryKeyClass::UserOwned
+            )]
+        );
     }
 }

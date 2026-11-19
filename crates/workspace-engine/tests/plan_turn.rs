@@ -6036,3 +6036,194 @@ fn a_worker_is_suggested_only_for_code_changing_ordinary_tasks() {
     assert!(proposed.patch_proposal.is_some());
     assert!(proposed.turn_presentation.worker_suggestion.is_none());
 }
+
+// --- Spec 109 D9: verification with no detected check
+
+/// A repository whose only build file is a `Makefile`: no manifest Damaian
+/// knows, so no detected check and, before D9, no completion floor.
+fn makefile_repo(name: &str) -> PathBuf {
+    let repo = temp_repo(name);
+    fs::write(repo.join("Makefile"), "test:\n\t@echo tests passed\n")
+        .expect("the Makefile is written");
+    repo
+}
+
+fn makefile_engine(repo: &Path, project_checks: &[&str]) -> WorkspaceEngine {
+    let mut project_checks_by_repository = BTreeMap::new();
+    if !project_checks.is_empty() {
+        project_checks_by_repository.insert(
+            workspace_engine::repository_id_for_root(repo),
+            project_checks
+                .iter()
+                .map(|entry| workspace_engine::ProjectCheck::parse(entry).unwrap())
+                .collect(),
+        );
+    }
+    WorkspaceEngine::new(Config {
+        data_dir: repo.join(".damaian"),
+        enable_index_watcher: false,
+        command_allowlist: vec!["make test".to_string()],
+        project_checks_by_repository,
+        ..Config::default()
+    })
+}
+
+/// Spec 109 D9 (1): in a repository with only a `Makefile`, the approved
+/// plan's `make test` is the floor of the root it covers. A patch in a later
+/// step reports it as left to task completion — not "no checks available" and
+/// not silence — and completion runs it, so the task is verified by the
+/// plan's check.
+#[test]
+fn a_makefile_repository_is_verified_by_its_plans_check() {
+    let repo = makefile_repo("d9-makefile-plan");
+    let engine = makefile_engine(&repo, &[]);
+    let make_test = CheckId::new("", "make test");
+    let mut adapter = scripted(vec![
+        vec![call(
+            "propose_plan",
+            r#"{"steps":[
+                {"title":"Run the project's tests","check":{"command":"make test","workingDirectory":"","purpose":"the Makefile's test target","required":true}},
+                {"title":"Make the change"}
+            ]}"#,
+        )],
+        vec![patch_call("src/added.rs")],
+    ]);
+    let paused = ask(&engine, &repo, "Add retry handling", &mut adapter);
+    let proposal = paused.plan_proposal.expect("the plan should be put up");
+    let mut after = scripted(vec![
+        vec![call(
+            "run_command",
+            r#"{"command":"make test","reason":"Run the required check"}"#,
+        )],
+        vec![call("complete_step", "{}")],
+        vec![patch_call("src/added.rs")],
+    ]);
+    let result = decide(&engine, &proposal.id, true, None, &mut after);
+    let session_id = result.session.id.clone();
+    let patch = result
+        .patch_proposal
+        .as_ref()
+        .expect("the patch is proposed in the later step")
+        .patch_id
+        .clone();
+    apply_patch_with_baselines(&engine, &repo, &patch, true);
+
+    let verified = run_verification_due(
+        &engine,
+        &repo,
+        &session_id,
+        &mut MockModelAdapter::new("Done."),
+    );
+    assert_eq!(loop_runs_of(&engine, &session_id, &make_test), 0);
+    let events = engine
+        .session_store
+        .read_verification_events(&session_id, &[])
+        .expect("the log should read");
+    let state = fold_verification(events.iter());
+    assert_ne!(
+        state.finished,
+        Some(VerificationOutcome::NoChecksAvailable),
+        "{state:?}"
+    );
+    let plan = engine
+        .session_store
+        .read_task_plan(&session_id, &verified.task.id)
+        .expect("the plan should read")
+        .expect("the task carries the plan");
+    let report = workspace_engine::VerificationReport::build(
+        &state,
+        &plan,
+        &["src/added.rs".to_string()],
+        &BTreeMap::new(),
+    );
+    assert_eq!(report.deferred_to_completion, vec![make_test.clone()]);
+    let summary = report.summary(&plan.report());
+    assert!(
+        summary.starts_with(&format!(
+            "No check ran for this change: {} is left to task completion.",
+            make_test.label()
+        )),
+        "{summary}"
+    );
+
+    let mut adapter = scripted(vec![vec![call("complete_step", "{}")]]);
+    let finished = continue_task(&engine, &repo, &session_id, &verified.task.id, &mut adapter);
+    assert_eq!(
+        loop_runs_of(&engine, &session_id, &make_test),
+        1,
+        "completion ran the plan's check once"
+    );
+    let events = engine
+        .session_store
+        .read_verification_events(&session_id, &[])
+        .expect("the log should read");
+    assert_eq!(
+        fold_verification(events.iter()).finished,
+        Some(VerificationOutcome::Passed)
+    );
+    assert_eq!(
+        finished.task.status,
+        TaskStatus::Complete,
+        "{:?}",
+        finished.task
+    );
+}
+
+/// Spec 109 D9 (2): a `project_checks` entry joins the completion floor of a
+/// repository Damaian detects no check for. A planless task runs it once,
+/// when the model answers; without the entry nothing runs at all.
+#[test]
+fn a_project_check_joins_the_floor_of_a_repository_with_no_detected_check() {
+    for configured in [true, false] {
+        let repo = makefile_repo(&format!("d9-project-check-{configured}"));
+        let engine = makefile_engine(&repo, if configured { &["make test"] } else { &[] });
+        let make_test = CheckId::new("", "make test");
+
+        let mut first = scripted(vec![vec![patch_call_with(
+            "src/a.rs",
+            "fn main() { println!(\"hi\"); }\n",
+        )]]);
+        let proposed = ask(&engine, &repo, "Say hi", &mut first);
+        let session = proposed.session.id.clone();
+        let patch = proposed
+            .patch_proposal
+            .as_ref()
+            .expect("the patch is proposed")
+            .patch_id
+            .clone();
+        apply_patch_with_baselines(&engine, &repo, &patch, true);
+        let mut answer = MockModelAdapter::new("Done.");
+        let finished = run_verification_and_approve_checks(&engine, &repo, &session, &mut answer);
+
+        // The patch's own verification has nothing to run (no detected
+        // check), so its `Started` is empty; the floor runs at the answer.
+        let expected = if configured {
+            vec![Vec::new(), vec![make_test.clone()]]
+        } else {
+            vec![Vec::new()]
+        };
+        assert_eq!(
+            started_checks(&engine, &session),
+            expected,
+            "configured={configured}: the project check runs once, at the answer"
+        );
+        assert_eq!(
+            loop_runs_of(&engine, &session, &make_test),
+            usize::from(configured)
+        );
+        if configured {
+            let report = engine
+                .session_store
+                .read_completion_report(&session, &finished.task.id)
+                .unwrap()
+                .expect("the task settles through the gate");
+            assert!(report.eligible, "{report:?}");
+        }
+        assert_eq!(
+            finished.task.status,
+            TaskStatus::Complete,
+            "configured={configured}: {:?}",
+            finished.task
+        );
+    }
+}

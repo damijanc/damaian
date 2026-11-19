@@ -626,7 +626,8 @@ impl ChatOrchestrator {
             .unwrap_or_else(|| TaskPlan::new(&task.id, now_millis()));
         let report = VerificationReport::build(&state, &plan, &changed, &file_hashes);
         let response = format!("{}\n\n{}", report.summary(&plan.report()), report.render());
-        let task = CompletionGateService::new(&self.session_store, repository_root)
+        let task = self
+            .completion_gate(repository_root)
             .settle(&task, CompletionSettlement::VerificationFailed)?
             .task;
         self.verification_turn_result(session, task, response, None, Some(report), changed)

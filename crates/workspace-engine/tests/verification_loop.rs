@@ -1119,6 +1119,7 @@ fn a_member_check_is_kept_in_the_completion_floor_when_the_root_does_not_run_it(
         &repo.root,
         &map,
         &changed,
+        &workspace_engine::DeclaredFloor::default(),
         &mut CheckReuse::none(),
     )
     .unwrap();
@@ -7302,4 +7303,162 @@ fn a_build_event_folds_into_the_report_and_never_into_the_checks() {
     let state = fold_verification(later.iter());
     assert!(state.build_results.is_empty());
     assert!(state.builds.contains_key(&build));
+}
+
+// --- Spec 109 D9: verification with no detected check
+
+/// A fixture holding `files`, mapped, with its engine.
+fn mapped_fixture(
+    name: &str,
+    files: &[(&str, &str)],
+) -> (PathBuf, WorkspaceEngine, workspace_engine::RepositoryMap) {
+    let root = temp_dir(name);
+    for (path, content) in files {
+        let file = root.join(path);
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(file, content).unwrap();
+    }
+    let engine = WorkspaceEngine::new(Config {
+        data_dir: temp_dir(&format!("{name}-data")),
+        enable_index_watcher: false,
+        shell: "/usr/bin/true".to_string(),
+        ..Config::default()
+    });
+    let map = engine
+        .repository_map(&root)
+        .expect("the fixture should map")
+        .0;
+    (root, engine, map)
+}
+
+fn proposed_ids(selection: &Selection) -> Vec<CheckId> {
+    match selection {
+        Selection::Proposed(checks) => checks.iter().map(|(check, _)| check.clone()).collect(),
+        other => panic!("expected proposed checks, got {other:?}"),
+    }
+}
+
+/// A root with only a `Makefile`, or only a `stack.yaml`, detects no check.
+/// Its completion floor is the approved plan's required checks covering it,
+/// so the completion run proposes those instead of "no checks available"; a
+/// plan check in a directory that does not cover the root is not taken.
+#[test]
+fn a_root_with_no_detected_check_takes_the_plans_covering_checks_as_its_floor() {
+    for (name, manifest, command) in [
+        ("d9-makefile", "Makefile", "make test"),
+        ("d9-stack", "stack.yaml", "stack test"),
+    ] {
+        let (root, engine, map) = mapped_fixture(
+            name,
+            &[(manifest, "x\n"), ("src/Main.hs", "main = pure ()\n")],
+        );
+        let changed = vec!["src/Main.hs".to_string()];
+        let floor = workspace_engine::DeclaredFloor {
+            plan_checks: vec![check("", command), check("docs", "make docs")],
+            project_checks: Vec::new(),
+        };
+
+        let without = workspace_engine::verification::propose_completion_checks(
+            &engine.validation_orchestrator,
+            &root,
+            &map,
+            &changed,
+            &workspace_engine::DeclaredFloor::default(),
+            &mut CheckReuse::none(),
+        )
+        .unwrap();
+        assert!(
+            matches!(without, Selection::NoChecksAvailable { .. }),
+            "{name}: no plan, no floor: {without:?}"
+        );
+
+        let with = workspace_engine::verification::propose_completion_checks(
+            &engine.validation_orchestrator,
+            &root,
+            &map,
+            &changed,
+            &floor,
+            &mut CheckReuse::none(),
+        )
+        .unwrap();
+        assert_eq!(proposed_ids(&with), vec![check("", command)], "{name}");
+        assert_eq!(
+            workspace_engine::plan_floor_of_roots(&map, &[String::new()], &floor.plan_checks),
+            vec![check("", command)],
+            "{name}"
+        );
+    }
+}
+
+/// A root with a detected check keeps its detected floor; the plan's checks
+/// do not join it there (they remain the plan's own obligations).
+#[test]
+fn a_root_with_a_detected_check_takes_no_plan_floor() {
+    let (_root, _engine, map) = mapped_fixture(
+        "d9-cargo",
+        &[
+            ("Cargo.toml", "[package]\nname = \"x\"\n"),
+            ("src/lib.rs", "\n"),
+        ],
+    );
+    let floor = workspace_engine::DeclaredFloor {
+        plan_checks: vec![check("", "make test")],
+        project_checks: Vec::new(),
+    };
+    assert!(
+        floor
+            .checks_for(&map, &["src/lib.rs".to_string()])
+            .is_empty()
+    );
+}
+
+/// A `project_checks` entry joins the floor when the task touched a
+/// non-documentation file inside its directory, detected checks or not; a
+/// documentation-only change or a change elsewhere brings none.
+#[test]
+fn a_project_check_joins_the_floor_where_the_task_touched_its_directory() {
+    let (root, engine, map) = mapped_fixture(
+        "d9-project",
+        &[
+            ("Cargo.toml", "[package]\nname = \"x\"\n"),
+            ("src/lib.rs", "\n"),
+            ("tools/run.sh", "\n"),
+            ("README.md", "\n"),
+        ],
+    );
+    let floor = workspace_engine::DeclaredFloor {
+        plan_checks: Vec::new(),
+        project_checks: vec![check("", "cargo clippy"), check("tools", "make lint")],
+    };
+    let ids = |touched: &[&str]| -> Vec<CheckId> {
+        let touched: Vec<String> = touched.iter().map(ToString::to_string).collect();
+        workspace_engine::floor_checks_with_declared(&root, &map, &touched, &floor)
+    };
+    assert_eq!(
+        ids(&["src/lib.rs"]),
+        vec![check("", "cargo clippy"), check("", "cargo test")]
+    );
+    assert_eq!(
+        ids(&["tools/run.sh"]),
+        vec![
+            check("", "cargo clippy"),
+            check("", "cargo test"),
+            check("tools", "make lint")
+        ]
+    );
+    assert!(ids(&["README.md"]).is_empty());
+
+    let selection = workspace_engine::verification::propose_completion_checks(
+        &engine.validation_orchestrator,
+        &root,
+        &map,
+        &["src/lib.rs".to_string()],
+        &floor,
+        &mut CheckReuse::none(),
+    )
+    .unwrap();
+    assert_eq!(
+        proposed_ids(&selection),
+        vec![check("", "cargo test"), check("", "cargo clippy")]
+    );
 }

@@ -687,6 +687,31 @@
             <div id="repository-root-detail" class="repository-root-detail" hidden></div>
             <div id="repository-roots-excluded" class="repository-roots-excluded" hidden></div>
           </section>
+          <section class="settings-section" id="project-checks-section">
+            <div class="section-heading">
+              <h3>Project checks</h3>
+              <div class="inline-actions">
+                <button id="project-checks-save-btn" class="btn-primary" type="button">
+                  Save
+                </button>
+              </div>
+            </div>
+            <p class="settings-page-hint">
+              Checks that must pass before a task in this repository completes, beside the ones
+              Damaian detects. Use them for a project whose checks Damaian does not detect, such
+              as one built by a <code>Makefile</code>. One command per line, run at the repository
+              root, or <code>&lt;directory&gt;::&lt;command&gt;</code> to run it in a directory; a
+              check applies when a task changes a file inside its directory. Saved in your user
+              configuration; the repository's own config can only remove one.
+            </p>
+            <p id="project-checks-status" class="settings-page-hint"></p>
+            <textarea
+              id="project-checks-editor"
+              rows="4"
+              spellcheck="false"
+              placeholder="make test&#10;tools::just lint"
+            ></textarea>
+          </section>
           <section class="settings-section" id="language-servers-section">
             <h3>Language servers</h3>
             <p class="settings-page-hint">
