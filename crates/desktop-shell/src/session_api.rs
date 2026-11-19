@@ -762,6 +762,14 @@ fn working_session_refusal(session_id: &str, action: &str) -> Option<String> {
 
 /// `GET /api/working-sessions` (spec 110 D3): every session with work running,
 /// what it is doing, for how long, and whether it can be cancelled.
+/// The ids `/api/working-sessions` lists, for `/api/sessions`' `state`.
+fn working_session_ids() -> std::collections::HashSet<String> {
+    lanes::working()
+        .into_iter()
+        .map(|row| row.session_id)
+        .collect()
+}
+
 pub(crate) fn handle_working_sessions(
     stream: &mut TcpStream,
     request: &Request,
@@ -938,7 +946,10 @@ pub(crate) fn handle_sessions(stream: &mut TcpStream, request: &Request) -> Resu
         request,
         200,
         "application/json",
-        &format!("{{\"sessions\":[{}]}}", sessions_json(&sessions)),
+        &format!(
+            "{{\"sessions\":[{}]}}",
+            sessions_json(&engine.session_store, &sessions, &working_session_ids())
+        ),
     )
 }
 

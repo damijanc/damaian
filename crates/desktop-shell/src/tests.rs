@@ -2412,6 +2412,75 @@ fn app_js_function(name: &str) -> &'static str {
     &rest[..end]
 }
 
+/// Spec 112 requirement 7: a session row draws the worker dot's look for
+/// `working`, `needs_you` and `failed` in place of its time, named for screen
+/// readers and on hover; any other session keeps its time. A collapsed
+/// project names its "N need you". The working-sessions poll refetches the
+/// sessions when the working set changes, and a local turn's end refetches
+/// them.
+#[test]
+fn app_js_draws_session_state_dots_in_the_sidebar() {
+    let app = super::APP_JS;
+    let table = &app[app.find("const SESSION_STATE_DOTS = {").expect("the table")..];
+    let table = &table[..table.find("};").unwrap()];
+    for line in [
+        r#"working: { look: "running", label: "Working" }"#,
+        r#"needs_you: { look: "needs-you", label: "Needs you" }"#,
+        r#"failed: { look: "failed", label: "Failed" }"#,
+    ] {
+        assert!(table.contains(line), "{line}: {table}");
+    }
+    assert_eq!(table.matches("look:").count(), 3, "three states: {table}");
+
+    let dot = app_js_function("createSessionStateDot");
+    assert!(dot.contains("if (!state) return null;"), "{dot}");
+    for part in [
+        "\"worker-dot session-state-dot\"",
+        "dot.dataset.state = state.look;",
+        "setAttribute(\"role\", \"img\")",
+        "setAttribute(\"aria-label\", state.label)",
+        "dot.title = state.label;",
+    ] {
+        assert!(dot.contains(part), "{part}: {dot}");
+    }
+    assert!(
+        app_js_function("renderProjectSession")
+            .contains("row.append(button, createSessionStateDot(session) || when, menuButton);")
+    );
+    // Worker rows keep the engine's dot.
+    assert!(app_js_function("renderProjectWorker").contains("createWorkerDot(row)"));
+
+    let list = app_js_function("renderProjectList");
+    assert!(list.contains("sessionsNeedingYou(sessions)"), "{list}");
+    assert!(list.contains("`${needYou} need you`"), "{list}");
+    assert!(app_js_function("sessionsNeedingYou").contains("session.state === \"needs_you\""));
+
+    let poll = app_js_function("pollWorkingSessions");
+    assert!(
+        poll.contains("if (workingSet !== sidebarWorkingSet)")
+            && poll.contains("void refreshSessionStates();"),
+        "{poll}"
+    );
+    let refresh = app_js_function("refreshSessionStates");
+    assert!(refresh.contains("/api/sessions?repo="), "{refresh}");
+    assert!(
+        refresh.contains("if (changed.some(Boolean)) renderProjectList();"),
+        "{refresh}"
+    );
+    for turn in ["sendChatPrompt", "askAgainFromExhausted"] {
+        let body = app_js_function(turn);
+        let finally = &body[body.rfind("} finally {").expect(turn)..];
+        assert!(
+            finally.contains("void refreshSessionStates([repo()]);"),
+            "{turn}: {finally}"
+        );
+    }
+
+    let css = super::STYLE_CSS;
+    assert!(css.contains(".project-need-you {"));
+    assert!(css.contains(".session-state-dot {"));
+}
+
 /// Spec 107 Task 2, requirement 1, per kind: the card of every decision the
 /// engine can report goes to the end of `#chat-log`, not into the bubble.
 /// The match is exhaustive, so a new engine kind fails to compile here
@@ -7133,6 +7202,66 @@ fn web_diagnostic_reveal_target_accepts_only_artifacts_under_the_data_dir() {
             "{refused} must be refused"
         );
     }
+
+    fs::remove_dir_all(data_dir).unwrap();
+}
+
+/// Spec 112 requirement 7: `/api/sessions` rows carry the state the sidebar
+/// draws — `working` from the lanes, `needs_you` and `failed` from the newest
+/// task — and no `state` at all otherwise.
+#[test]
+fn sessions_json_carries_each_sessions_sidebar_state() {
+    let data_dir = std::env::temp_dir().join(format!(
+        "damaian-session-state-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let store = workspace_engine::SessionStore::new(&data_dir);
+    let session_with = |title: &str, status: Option<TaskStatus>| {
+        let session = store.create_session("repo_1", title).unwrap();
+        if let Some(status) = status {
+            let task = store.create_task(&session.id, "go", "mock", "m").unwrap();
+            store.update_task_status(&task, status, None).unwrap();
+        }
+        session
+    };
+    // Working wins over the task's status: the turn is running right now.
+    let working = session_with("Working", Some(TaskStatus::WaitingForModel));
+    let needs_you = session_with("Needs you", Some(TaskStatus::WaitingForApproval));
+    let failed = session_with("Failed", Some(TaskStatus::Failed));
+    let complete = session_with("Complete", Some(TaskStatus::Complete));
+    let cancelled = session_with("Cancelled", Some(TaskStatus::Cancelled));
+    let empty = session_with("Empty", None);
+    let sessions = [&working, &needs_you, &failed, &complete, &cancelled, &empty]
+        .map(|session| session.clone())
+        .to_vec();
+    let lanes = std::collections::HashSet::from([working.id.clone()]);
+
+    let json = format!("[{}]", super::sessions_json(&store, &sessions, &lanes));
+    let rows: serde_json::Value = serde_json::from_str(&json).unwrap();
+    let state_of = |id: &str| {
+        rows.as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == id)
+            .unwrap()
+            .get("state")
+            .cloned()
+    };
+
+    assert_eq!(state_of(&working.id), Some(serde_json::json!("working")));
+    assert_eq!(
+        state_of(&needs_you.id),
+        Some(serde_json::json!("needs_you"))
+    );
+    assert_eq!(state_of(&failed.id), Some(serde_json::json!("failed")));
+    for idle in [&complete, &cancelled, &empty] {
+        assert_eq!(state_of(&idle.id), None, "{} has no state", idle.title);
+    }
+    assert_eq!(super::session_state(true, Some("failed")), Some("working"));
+    assert_eq!(super::session_state(false, Some("incomplete")), None);
 
     fs::remove_dir_all(data_dir).unwrap();
 }

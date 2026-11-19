@@ -405,7 +405,7 @@ button:disabled {
   min-width: 0;
   min-height: 34px;
   display: grid;
-  grid-template-columns: 12px minmax(0, 1fr);
+  grid-template-columns: 12px minmax(0, 1fr) auto;
   align-items: center;
   gap: 8px;
   border: 0;
@@ -590,6 +590,22 @@ button:disabled {
 
 .project-session-open:hover {
   color: inherit;
+}
+
+/* Spec 112 requirement 7: a collapsed project names how many of its sessions
+   wait on you. Text, not a dot: the count is the information. */
+.project-need-you {
+  color: var(--warn-ink);
+  font-size: 11px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+/* A session's state dot sits where its time would be, centred in that
+   column. */
+.session-state-dot {
+  justify-self: center;
+  margin: 0 6px;
 }
 
 /* Never truncated: the title ellipsizes before the time does. */

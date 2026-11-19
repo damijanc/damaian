@@ -1895,6 +1895,46 @@ impl SessionStore {
         Ok(statuses)
     }
 
+    /// The latest recorded status of the session's newest task — the one
+    /// whose first event comes last in the active log — or `None` for a
+    /// session with no task.
+    ///
+    /// The sidebar reads it for every listed session to show which ones wait
+    /// on the user or failed (spec 112 requirement 7), so it replays the log
+    /// once and keeps nothing but that one status.
+    pub fn read_latest_task_status(&self, session_id: &str) -> Result<Option<String>> {
+        let path = self.session_log_path(session_id);
+        let Ok(content) = fs::read_to_string(path) else {
+            return Ok(None);
+        };
+        let mut latest: Option<(String, String)> = None;
+        let mut seen = HashSet::new();
+        for event in active_events(&content) {
+            if !matches!(
+                event.event_type.as_str(),
+                "task_created" | "task_status_updated" | "worker_return_consumed"
+            ) {
+                continue;
+            }
+            // Same wrapper rule as `read_task_statuses`.
+            let task = event.payload.get("task").unwrap_or(&event.payload);
+            let (Some(id), Some(status)) = (
+                task.get("id").and_then(|value| value.as_str()),
+                task.get("status").and_then(|value| value.as_str()),
+            ) else {
+                continue;
+            };
+            if seen.insert(id.to_string()) {
+                latest = Some((id.to_string(), status.to_string()));
+            } else if let Some((latest_id, latest_status)) = latest.as_mut()
+                && latest_id == id
+            {
+                *latest_status = status.to_string();
+            }
+        }
+        Ok(latest.map(|(_, status)| status))
+    }
+
     /// Every task in the session as a full record: the latest status, with the
     /// metadata from whichever event recorded it.
     ///
@@ -6050,6 +6090,44 @@ mod tests {
         let session = store.create_session("repo_1", "Untouched").unwrap();
 
         assert_eq!(store.session_mode(&session.id), SessionMode::Code);
+    }
+
+    /// Spec 112 requirement 7: the sidebar's state reads the newest task's
+    /// latest status, not an older task's, and nothing for a session with no
+    /// task.
+    #[test]
+    fn latest_task_status_follows_the_newest_task() {
+        let store = SessionStore::new(temp_data_dir("latest-task"));
+        let session = store.create_session("repo_1", "Turns").unwrap();
+        assert_eq!(store.read_latest_task_status(&session.id).unwrap(), None);
+
+        let first = store.create_task(&session.id, "one", "mock", "m").unwrap();
+        let second = store.create_task(&session.id, "two", "mock", "m").unwrap();
+        store
+            .update_task_status(&second, TaskStatus::WaitingForApproval, None)
+            .unwrap();
+        // A later event for the older task does not make it the latest.
+        store
+            .update_task_status(&first, TaskStatus::Failed, Some("boom"))
+            .unwrap();
+        assert_eq!(
+            store
+                .read_latest_task_status(&session.id)
+                .unwrap()
+                .as_deref(),
+            Some("waiting_for_approval")
+        );
+
+        store
+            .update_task_status(&second, TaskStatus::Failed, Some("boom"))
+            .unwrap();
+        assert_eq!(
+            store
+                .read_latest_task_status(&session.id)
+                .unwrap()
+                .as_deref(),
+            Some("failed")
+        );
     }
 
     #[test]

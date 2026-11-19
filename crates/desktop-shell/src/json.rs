@@ -520,12 +520,50 @@ pub(crate) fn patch_files_json(files: &[ProposedFilePatch]) -> String {
         .join(",")
 }
 
-pub(crate) fn sessions_json(sessions: &[Session]) -> String {
+/// The `/api/sessions` rows, each with the `state` the sidebar draws as a
+/// dot (spec 112 requirement 7), or none.
+pub(crate) fn sessions_json(
+    store: &SessionStore,
+    sessions: &[Session],
+    working: &std::collections::HashSet<String>,
+) -> String {
     sessions
         .iter()
-        .map(session_summary_json)
+        .map(|session| {
+            // A log that cannot be read shows no dot rather than failing the
+            // whole list.
+            let latest = store.read_latest_task_status(&session.id).ok().flatten();
+            let state = session_state(working.contains(&session.id), latest.as_deref());
+            match state {
+                Some(state) => {
+                    format!("{{{},\"state\":\"{state}\"}}", session_fields_json(session))
+                }
+                None => session_summary_json(session),
+            }
+        })
         .collect::<Vec<_>>()
         .join(",")
+}
+
+/// Which of the sidebar's three states a session is in (spec 112 D6):
+/// `working` while it holds a lane — the source the working-sessions poll
+/// reads, so the dot and the composer slot agree — else its newest task's
+/// status. A turn paused for a decision holds no lane, so the two never
+/// compete. Every other status (idle, complete, stopped, cancelled) has none.
+pub(crate) fn session_state(
+    working: bool,
+    latest_task_status: Option<&str>,
+) -> Option<&'static str> {
+    if working {
+        return Some("working");
+    }
+    match latest_task_status {
+        Some(status) if status == workspace_engine::TaskStatus::WaitingForApproval.as_str() => {
+            Some("needs_you")
+        }
+        Some(status) if status == workspace_engine::TaskStatus::Failed.as_str() => Some("failed"),
+        _ => None,
+    }
 }
 
 pub(crate) fn export_filename(

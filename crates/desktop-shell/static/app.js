@@ -9264,6 +9264,32 @@ function createWorkerDot(row) {
   return dot;
 }
 
+// Spec 112 requirement 7: a session row's `state` from `/api/sessions`, drawn
+// with the worker dot's look (style guide §4). Every other session — idle,
+// complete, stopped, cancelled — has no state and keeps its time.
+const SESSION_STATE_DOTS = {
+  working: { look: "running", label: "Working" },
+  needs_you: { look: "needs-you", label: "Needs you" },
+  failed: { look: "failed", label: "Failed" },
+};
+
+function createSessionStateDot(session) {
+  const state = SESSION_STATE_DOTS[session.state];
+  if (!state) return null;
+  const dot = document.createElement("span");
+  dot.className = "worker-dot session-state-dot";
+  dot.dataset.state = state.look;
+  dot.setAttribute("role", "img");
+  dot.setAttribute("aria-label", state.label);
+  dot.title = state.label;
+  return dot;
+}
+
+function sessionsNeedingYou(sessions) {
+  return (sessions || []).filter((session) => !session.archived && session.state === "needs_you")
+    .length;
+}
+
 // What the sidebar draws from a project's rows. The board replaces the rows
 // every second; the sidebar is redrawn only when this changes.
 function workerSidebarSignature(rows) {
@@ -11753,6 +11779,24 @@ function renderProjectList() {
       <span class="project-name"></span>
     `;
     projectButton.querySelector(".project-name").textContent = projectName(projectPath);
+    // A collapsed project hides its rows, so it names what in them needs you.
+    // Its sessions are fetched once for this, and the working-sessions poll
+    // keeps them current (`refreshSessionStates`).
+    if (!expanded) {
+      const sessions = projectSessionsByPath.get(projectPath);
+      const needYou = sessionsNeedingYou(sessions);
+      if (needYou) {
+        const count = document.createElement("span");
+        count.className = "project-need-you";
+        count.textContent = `${needYou} need you`;
+        projectButton.append(count);
+      }
+      if (!sessions && !projectSessionsLoading.has(projectPath)) {
+        void loadProjectSessions(projectPath)
+          .then(renderProjectList)
+          .catch(() => projectSessionsByPath.set(projectPath, []));
+      }
+    }
     projectButton.addEventListener("click", async () => {
       try {
         if (activeProject && expanded) {
@@ -11902,7 +11946,8 @@ function renderProjectSession(projectPath, session) {
     toggleSessionMenu(projectPath, session, menuButton);
   });
 
-  row.append(button, when, menuButton);
+  // The state replaces the time: a session that needs you is the news.
+  row.append(button, createSessionStateDot(session) || when, menuButton);
   return row;
 }
 
@@ -12031,6 +12076,37 @@ async function loadProjectSessions(projectPath) {
   } finally {
     projectSessionsLoading.delete(normalized);
   }
+}
+
+// Refetches every loaded project's sessions for their `state` (spec 112 D6)
+// and redraws the sidebar only when a row changed, so an open ⋮ menu is not
+// replaced on every working-set change for nothing.
+async function refreshSessionStates(paths = [...projectSessionsByPath.keys()]) {
+  const signature = (sessions) =>
+    JSON.stringify(
+      (sessions || []).map((session) => [
+        session.id,
+        session.title,
+        session.state,
+        session.archived,
+        session.updatedAtMs,
+      ]),
+    );
+  const changed = await Promise.all(
+    paths.map(async (path) => {
+      let payload;
+      try {
+        payload = await api(`/api/sessions?repo=${encodeURIComponent(path)}`);
+      } catch {
+        return false;
+      }
+      const sessions = payload.sessions || [];
+      const before = signature(projectSessionsByPath.get(path));
+      projectSessionsByPath.set(path, sessions);
+      return before !== signature(sessions);
+    }),
+  );
+  if (changed.some(Boolean)) renderProjectList();
 }
 
 async function startNewSession(projectPath = repo()) {
@@ -16082,6 +16158,8 @@ let workingSessionsPolledAt = 0;
 // transition to "not working any more" can be told from "never was": the slot
 // reloads the session on it (`syncComposerStatus`), whichever entry it showed.
 let busyElsewhereApplied = false;
+// The working set the sidebar's session states were last fetched for.
+let sidebarWorkingSet = "";
 
 function startWorkingSessionsPoll() {
   clearInterval(workingSessionsPollTimer);
@@ -16100,6 +16178,13 @@ async function pollWorkingSessions() {
   }
   workingSessionsById = new Map((payload.sessions || []).map((row) => [row.sessionId, row]));
   workingSessionsPolledAt = Date.now();
+  // A session starting or ending work is when its sidebar state can change:
+  // a turn that pauses for a decision or fails releases its lane.
+  const workingSet = [...workingSessionsById.keys()].sort().join("\n");
+  if (workingSet !== sidebarWorkingSet) {
+    sidebarWorkingSet = workingSet;
+    void refreshSessionStates();
+  }
   // A plain request's running action has no stream to say what it is doing;
   // the shell's lane label does (spec 109 D7).
   for (const action of runningActions) {
@@ -17190,6 +17275,9 @@ async function sendChatPrompt(options = {}) {
     chatSubmitting = false;
     currentTurn = null;
     setComposerBusy();
+    // Whatever the outcome, the session's sidebar state may have changed (a
+    // failure reloads nothing else), and a short turn can end between polls.
+    if (repo()) void refreshSessionStates([repo()]);
     // Whatever the outcome, an agentic turn may have changed files.
     void refreshRepoBar();
   }
@@ -17285,6 +17373,9 @@ async function askAgainFromExhausted(sessionId, taskId) {
     chatSubmitting = false;
     currentTurn = null;
     setComposerBusy();
+    // Whatever the outcome, the session's sidebar state may have changed (a
+    // failure reloads nothing else), and a short turn can end between polls.
+    if (repo()) void refreshSessionStates([repo()]);
     void refreshRepoBar();
   }
 }
