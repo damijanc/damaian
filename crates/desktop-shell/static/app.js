@@ -14177,6 +14177,8 @@ function busyElsewhereWork() {
   if (!info || runningTurnStream(currentSessionId) || runningActionFor(currentSessionId)) {
     return null;
   }
+  // This window's own work, ended since the poll was sent, is still listed.
+  if ((localWorkEndedAt.get(currentSessionId) || 0) >= workingSessionsRequestedAt) return null;
   return info;
 }
 
@@ -16246,6 +16248,19 @@ let workingSessionsById = new Map();
 let workingSessionsPollTimer = null;
 // When the last poll answered, so Busy elsewhere's clock runs between polls.
 let workingSessionsPolledAt = 0;
+// When the poll whose answer is in `workingSessionsById` was sent. A poll sent
+// before this window's own work in a session ended can still list that work.
+let workingSessionsRequestedAt = 0;
+// When this window's own work in each session last ended: a turn stream or a
+// running action. Read against `workingSessionsRequestedAt` so that work never
+// reads as busy elsewhere once it is over (spec 112 fix, 2026-11-20): it did,
+// for up to one poll, and the slot's reload when it went away dropped the card
+// of a pending command or plan, which a reload cannot draw.
+const localWorkEndedAt = new Map();
+
+function noteLocalWorkEnded(sessionId) {
+  if (sessionId) localWorkEndedAt.set(sessionId, Date.now());
+}
 // Whether `currentSessionId` was busy elsewhere on the last sync, so the
 // transition to "not working any more" can be told from "never was": the slot
 // reloads the session on it (`syncComposerStatus`), whichever entry it showed.
@@ -16261,6 +16276,7 @@ function startWorkingSessionsPoll() {
 
 async function pollWorkingSessions() {
   let payload;
+  const requestedAt = Date.now();
   try {
     payload = await api("/api/working-sessions");
   } catch {
@@ -16270,6 +16286,7 @@ async function pollWorkingSessions() {
   }
   workingSessionsById = new Map((payload.sessions || []).map((row) => [row.sessionId, row]));
   workingSessionsPolledAt = Date.now();
+  workingSessionsRequestedAt = requestedAt;
   // A session starting or ending work is when its sidebar state can change:
   // a turn that pauses for a decision or fails releases its lane.
   const workingSet = [...workingSessionsById.keys()].sort().join("\n");
@@ -16446,6 +16463,7 @@ async function streamRequest(streamPath, fallbackPath, data, handlers, signal) {
     throw error;
   } finally {
     runningTurnStreams.delete(turn);
+    noteLocalWorkEnded(turn.sessionId);
     settleTurnNotes(turn);
   }
 }
@@ -17010,6 +17028,7 @@ function beginRunningAction({ label = "Starting", stop = null } = {}) {
     },
     end() {
       runningActions.delete(action);
+      noteLocalWorkEnded(action.sessionId);
       for (const home of action.homes) unobserveStatusHome(home);
       action.homes.clear();
       syncRunningState();

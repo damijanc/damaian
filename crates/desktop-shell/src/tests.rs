@@ -2469,6 +2469,49 @@ fn app_js_settles_a_patch_card_with_no_pending_file() {
     assert!(super::STYLE_CSS.contains(".patch-actions[hidden] {\n  display: none;"));
 }
 
+/// Spec 112 fix (2026-11-20): a working-sessions answer from a poll that
+/// started before this window's own turn or action in the session ended still
+/// lists that work. Read as "busy elsewhere", it flipped the slot on and, at
+/// the next poll, off again — and going off reloads the session, which drew no
+/// card for a pending command or plan: the card appeared and vanished about two
+/// seconds later. The poll stamps when it was *sent*, every local end is
+/// noted, and only a poll sent after the end can report work elsewhere.
+#[test]
+fn app_js_reads_busy_elsewhere_only_from_a_poll_sent_after_local_work_ended() {
+    let poll = app_js_function("pollWorkingSessions");
+    let sent = poll
+        .find("workingSessionsRequestedAt")
+        .expect("the poll records when it was sent");
+    let fetched = poll
+        .find("api(\"/api/working-sessions\")")
+        .expect("the poll fetches the working sessions");
+    assert!(
+        poll[..fetched].contains("const requestedAt = Date.now()"),
+        "the send time is taken before the request: {poll}"
+    );
+    assert!(sent > fetched, "it is applied only with the answer: {poll}");
+
+    let busy = app_js_function("busyElsewhereWork");
+    assert!(
+        busy.contains("localWorkEndedAt.get(currentSessionId)")
+            && busy.contains("workingSessionsRequestedAt"),
+        "busy elsewhere ignores a poll sent before local work ended: {busy}"
+    );
+
+    let stream = app_js_function("streamRequest");
+    let finally = &stream[stream.find("finally").expect("a finally block")..];
+    assert!(
+        finally.contains("noteLocalWorkEnded(turn.sessionId)"),
+        "a stream's end is noted: {stream}"
+    );
+    let action = app_js_function("beginRunningAction");
+    let end = &action[action.find("end() {").expect("an end method")..];
+    assert!(
+        end.contains("noteLocalWorkEnded(action.sessionId)"),
+        "a running action's end is noted: {action}"
+    );
+}
+
 fn app_js_function(name: &str) -> &'static str {
     let app = super::APP_JS;
     let start = app
