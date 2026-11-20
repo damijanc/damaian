@@ -137,6 +137,39 @@ impl CommandRule {
             }
         };
         let (pattern, directory) = split_directory(rest.trim());
+        Self::build(effect, pattern, directory.map(str::to_string), source)
+    }
+
+    /// A rule from its parts, checked the way [`Self::parse`] checks a line:
+    /// the pattern must read as one command (or one wrapper group). Used
+    /// where the rule is built rather than written, as the migration of the
+    /// old command keys does (D6), so a pattern that would read back as a
+    /// different rule is refused rather than silently changed.
+    pub fn new(
+        effect: RuleEffect,
+        pattern: &str,
+        directory: Option<String>,
+        source: RuleSource,
+    ) -> Result<Self, String> {
+        if split_directory(pattern.trim()).1.is_some() {
+            return Err(
+                "the command ends in `in <directory>`, which a rule reads as its directory"
+                    .to_string(),
+            );
+        }
+        Self::build(effect, pattern, directory, source)
+    }
+
+    fn build(
+        effect: RuleEffect,
+        pattern: &str,
+        directory: Option<String>,
+        source: RuleSource,
+    ) -> Result<Self, String> {
+        if source == RuleSource::Session {
+            return Err("a session rule comes from approving a command, not from text".to_string());
+        }
+        let pattern = pattern.trim();
         if pattern.is_empty() {
             return Err("the rule names no command".to_string());
         }
@@ -152,7 +185,7 @@ impl CommandRule {
         Ok(Self {
             effect,
             pattern: pattern.to_string(),
-            directory: directory.map(str::to_string),
+            directory,
             source,
             line: None,
         })

@@ -157,7 +157,7 @@ See [Worker Sessions](USER_GUIDE.md#worker-sessions). The `worker_task_budget_*`
 
 See [Command Approval](USER_GUIDE.md#command-approval).
 
-Five of these keys are **planned to be replaced (spec 111)** by one list of command rules: `command_allowlist`, `command_allowlist.<repository_id>`, `command_blocklist`, `require_approval_for_risky_commands` and `command_access`. They work as described here until that change ships.
+Five of these keys are **planned to be replaced (spec 111)** by one list of command rules: `command_allowlist`, `command_allowlist.<repository_id>`, `command_blocklist`, `require_approval_for_risky_commands` and `command_access`. They work as described here until that change ships. When command rules start to decide, the old entries are read as rules with the same effect and keep their source: each `command_allowlist` and *Always allow* entry becomes `allow` of that exact command where it applied (the repository root, or the project root it names), and each `command_blocklist` entry becomes `deny <entry> *`. An entry a rule cannot say exactly (one with `$`, `*` or shell control) or that never ran (a blocklist entry or a destructive pattern blocked it) is not read, and the deprecation note names it with the reason. The old keys keep loading for one release after that, then are removed.
 
 | Key | Default | Values | What it does | Repository may change it? |
 |---|---|---|---|---|
