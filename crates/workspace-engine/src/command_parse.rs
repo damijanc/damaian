@@ -13,6 +13,16 @@
 //! know is kept as written, and in a group of short flags everything from the
 //! first unknown letter on is kept as one word, because it may be that
 //! option's value.
+//!
+//! Wrappers (spec 111 context.md D9, decided by the owner 2026-11-20): `sudo`,
+//! `env`, `nice`, `time` and `command` are unwrapped. The wrapper becomes a
+//! part holding only its own options (and `env`'s assignments), followed by
+//! the command it runs as a further part, joined by
+//! [`ChainOperator::Wraps`]. So the rules see `rm -rf /` in `sudo rm -rf /`,
+//! and both parts must be allowed for it to run. A wrapper option the table
+//! does not model, one that changes how or where the command runs (`sudo
+//! -s`, `env -C`, `env PATH=…`), and `xargs`, whose command takes arguments
+//! from its input, make the command unanalysable.
 
 use crate::command_policy::{Operator, chain_line, normalize_lexically};
 use std::collections::BTreeSet;
@@ -61,6 +71,9 @@ pub enum ChainOperator {
     /// `;` or a newline.
     Sequence,
     Pipe,
+    /// The left part is a wrapper (`sudo`, `env`, …) and runs the right
+    /// part.
+    Wraps,
 }
 
 /// One simple command of a chain.
@@ -126,7 +139,7 @@ pub fn parse_command(command: &str, context: &ParseContext) -> CommandParse {
     if !line.home_tilde.is_empty() && context.home.is_none() {
         return unanalysable("uses `~` and the home directory is not known");
     }
-    let operators: Vec<ChainOperator> = line
+    let written_operators: Vec<ChainOperator> = line
         .operators
         .iter()
         .map(|operator| match operator {
@@ -138,6 +151,7 @@ pub fn parse_command(command: &str, context: &ParseContext) -> CommandParse {
         .collect();
     let mut working_directory = normalize_lexically(context.working_directory);
     let mut parts = Vec::with_capacity(line.commands.len());
+    let mut operators = Vec::with_capacity(written_operators.len());
     for (index, raw_words) in line.commands.iter().enumerate() {
         if raw_words.is_empty() {
             return unanalysable("has an operator with nothing on one side");
@@ -157,9 +171,20 @@ pub fn parse_command(command: &str, context: &ParseContext) -> CommandParse {
             base: working_directory.clone(),
             home: context.home,
         };
-        let part = parse_part(&words, &resolver);
+        let group = match unwrap(&words, &resolver) {
+            Ok(group) => group,
+            Err(reason) => return CommandParse::Unanalysable { reason },
+        };
+        if group.len() > 1 && group.iter().any(|part| part.program == "cd") {
+            return unanalysable("runs `cd` through a wrapper");
+        }
+        if index > 0 {
+            operators.push(written_operators[index - 1]);
+        }
+        let mut group = group.into_iter();
+        let part = group.next().expect("a group has at least one part");
         if part.program == "cd" {
-            let next = operators.get(index);
+            let next = written_operators.get(index);
             match (&part.shape, next) {
                 (_, None) => {}
                 (PartShape::Unknown { arguments }, Some(ChainOperator::And)) => {
@@ -184,6 +209,10 @@ pub fn parse_command(command: &str, context: &ParseContext) -> CommandParse {
             }
         }
         parts.push(part);
+        for wrapped in group {
+            operators.push(ChainOperator::Wraps);
+            parts.push(wrapped);
+        }
     }
     CommandParse::Chain(Chain { parts, operators })
 }
@@ -245,11 +274,7 @@ const SYSTEM_DIRECTORIES: [&str; 4] = ["/bin/", "/usr/bin/", "/sbin/", "/usr/sbi
 
 fn parse_part(words: &[Word], resolver: &Resolver) -> CommandPart {
     let written = words[0].text;
-    let name = SYSTEM_DIRECTORIES
-        .iter()
-        .find_map(|directory| written.strip_prefix(directory))
-        .filter(|name| !name.contains('/'))
-        .unwrap_or(written);
+    let name = system_name(written);
     let arguments = &words[1..];
     let Some(grammar) = grammar(name) else {
         return CommandPart {
@@ -548,6 +573,240 @@ fn parse_dd(words: &[Word], resolver: &Resolver) -> PartShape {
         options,
         operands,
     }
+}
+
+/// The parts one simple command runs as: itself, or a wrapper followed by
+/// what it wraps (recursively, so `sudo nice rm` is three parts).
+fn unwrap(words: &[Word], resolver: &Resolver) -> Result<Vec<CommandPart>, String> {
+    let written = words[0].text;
+    let name = system_name(written);
+    if name == "xargs" {
+        return Err(
+            "uses `xargs`, whose command takes arguments from its input, so what runs is \
+             not known"
+                .to_string(),
+        );
+    }
+    let Some(wrapper) = wrapper(name) else {
+        return Ok(vec![parse_part(words, resolver)]);
+    };
+    let unmodelled =
+        |option: &str| format!("uses an option of `{name}` the rules do not model (`{option}`)");
+    let mut options = BTreeSet::new();
+    let mut index = 1;
+    while let Some(word) = words.get(index) {
+        let text = word.text;
+        if text == "--" {
+            index += 1;
+            break;
+        }
+        if !text.starts_with('-') || (text == "-" && wrapper.flag("-").is_none()) {
+            break;
+        }
+        index += 1;
+        if name == "nice" && text.len() > 1 && text[1..].bytes().all(|byte| byte.is_ascii_digit()) {
+            // The old spelling of `nice -n 10`.
+            options.insert(CommandOption {
+                name: "--adjustment".to_string(),
+                value: Some(Argument::Word(text[1..].to_string())),
+            });
+            continue;
+        }
+        let (spellings, inline): (Vec<String>, Option<&str>) = match text.split_once('=') {
+            Some((long, value)) if long.starts_with("--") => (vec![long.to_string()], Some(value)),
+            _ if text.starts_with("--") || text == "-" => (vec![text.to_string()], None),
+            _ => (
+                text[1..]
+                    .chars()
+                    .map(|letter| format!("-{letter}"))
+                    .collect(),
+                None,
+            ),
+        };
+        let count = spellings.len();
+        for (position, spelling) in spellings.iter().enumerate() {
+            let flag = wrapper.flag(spelling).ok_or_else(|| unmodelled(text))?;
+            if wrapper.refused.contains(&flag.canonical) {
+                return Err(format!(
+                    "uses `{name} {text}`, which changes how or where the command runs"
+                ));
+            }
+            let value = match (flag.value, inline) {
+                (Value::None, None) => None,
+                (Value::None, Some(_)) => return Err(unmodelled(text)),
+                // A value-taking short flag must end its group (`-uroot` is
+                // not modelled).
+                (_, None) if position + 1 < count => return Err(unmodelled(text)),
+                (kind, Some(inline)) => Some(resolver.inline_value(kind, inline)),
+                (kind, None) => {
+                    let next = words.get(index).ok_or_else(|| unmodelled(text))?;
+                    index += 1;
+                    Some(resolver.value(kind, next))
+                }
+            };
+            options.insert(CommandOption {
+                name: flag.canonical.to_string(),
+                value,
+            });
+        }
+    }
+    let mut operands = Vec::new();
+    if wrapper.assignments {
+        while let Some((key, _)) = words
+            .get(index)
+            .and_then(|word| word.text.split_once('='))
+            .filter(|(key, _)| !key.is_empty())
+        {
+            if key == "PATH" {
+                return Err("sets `PATH` for the command, which changes what runs".to_string());
+            }
+            operands.push(Argument::Word(words[index].text.to_string()));
+            index += 1;
+        }
+    }
+    let describes = options
+        .iter()
+        .any(|option| wrapper.describes.contains(&option.name.as_str()));
+    if describes || index >= words.len() {
+        // Nothing is run (`command -v rm`, a bare `env`): the rest are words.
+        operands.extend(
+            words[index..]
+                .iter()
+                .map(|word| resolver.path_if_path_like(word)),
+        );
+        return Ok(vec![wrapper_part(name, options, operands, resolver)]);
+    }
+    let mut group = vec![wrapper_part(name, options, operands, resolver)];
+    group.extend(unwrap(&words[index..], resolver)?);
+    Ok(group)
+}
+
+fn wrapper_part(
+    name: &str,
+    options: BTreeSet<CommandOption>,
+    operands: Vec<Argument>,
+    resolver: &Resolver,
+) -> CommandPart {
+    CommandPart {
+        program: name.to_string(),
+        working_directory: resolver.base.clone(),
+        shape: PartShape::Known {
+            subcommand: None,
+            global_options: BTreeSet::new(),
+            options,
+            operands,
+        },
+    }
+}
+
+/// A program named by its system path is its name (`/usr/bin/sudo` is
+/// `sudo`).
+fn system_name(written: &str) -> &str {
+    SYSTEM_DIRECTORIES
+        .iter()
+        .find_map(|directory| written.strip_prefix(directory))
+        .filter(|name| !name.contains('/'))
+        .unwrap_or(written)
+}
+
+struct Wrapper {
+    flags: &'static [Flag],
+    /// Canonical names that change how or where the command runs, so the
+    /// command is unanalysable: `sudo -s` hands it to a shell, `env -C`
+    /// moves it.
+    refused: &'static [&'static str],
+    /// Canonical names that make the wrapper describe the command instead
+    /// of running it (`command -v`).
+    describes: &'static [&'static str],
+    /// `env NAME=value …`.
+    assignments: bool,
+}
+
+impl Wrapper {
+    fn flag(&self, spelling: &str) -> Option<&'static Flag> {
+        self.flags
+            .iter()
+            .find(|flag| flag.spellings.contains(&spelling))
+    }
+}
+
+const SUDO: Wrapper = Wrapper {
+    flags: &[
+        flag("--preserve-env", &["-E", "--preserve-env"]),
+        flag("--set-home", &["-H", "--set-home"]),
+        flag("--non-interactive", &["-n", "--non-interactive"]),
+        flag("--stdin", &["-S", "--stdin"]),
+        flag("--reset-timestamp", &["-k", "--reset-timestamp"]),
+        flag("--background", &["-b", "--background"]),
+        flag("--preserve-groups", &["-P", "--preserve-groups"]),
+        flag("--askpass", &["-A", "--askpass"]),
+        flag("--login", &["-i", "--login"]),
+        flag("--shell", &["-s", "--shell"]),
+        path("--chdir", &["-D", "--chdir"]),
+        word("--user", &["-u", "--user"]),
+        word("--group", &["-g", "--group"]),
+        word("--prompt", &["-p", "--prompt"]),
+        word("--close-from", &["-C", "--close-from"]),
+    ],
+    refused: &["--login", "--shell", "--chdir"],
+    describes: &[],
+    assignments: false,
+};
+
+const ENV: Wrapper = Wrapper {
+    flags: &[
+        flag("--ignore-environment", &["-i", "--ignore-environment", "-"]),
+        flag("--debug", &["-v", "--debug"]),
+        word("--unset", &["-u", "--unset"]),
+        path("--chdir", &["-C", "--chdir"]),
+        word("--split-string", &["-S", "--split-string"]),
+        word("-P", &["-P"]),
+    ],
+    refused: &["--chdir", "--split-string", "-P"],
+    describes: &[],
+    assignments: true,
+};
+
+const NICE: Wrapper = Wrapper {
+    flags: &[word("--adjustment", &["-n", "--adjustment"])],
+    refused: &[],
+    describes: &[],
+    assignments: false,
+};
+
+const TIME: Wrapper = Wrapper {
+    flags: &[
+        flag("-p", &["-p"]),
+        flag("-l", &["-l"]),
+        flag("-a", &["-a"]),
+        flag("-h", &["-h"]),
+        path("-o", &["-o"]),
+    ],
+    refused: &[],
+    describes: &[],
+    assignments: false,
+};
+
+const COMMAND: Wrapper = Wrapper {
+    flags: &[
+        flag("-p", &["-p"]),
+        flag("-v", &["-v"]),
+        flag("-V", &["-V"]),
+    ],
+    refused: &[],
+    describes: &["-v", "-V"],
+    assignments: false,
+};
+
+fn wrapper(program: &str) -> Option<&'static Wrapper> {
+    Some(match program {
+        "sudo" => &SUDO,
+        "env" => &ENV,
+        "nice" => &NICE,
+        "time" => &TIME,
+        "command" => &COMMAND,
+        _ => return None,
+    })
 }
 
 // --- The table of known programs (D3) -------------------------------------
@@ -1411,5 +1670,71 @@ mod tests {
     #[test]
     fn an_unknown_short_flag_keeps_the_rest_of_its_group() {
         assert_eq!(options(&only_part("rm -rZf x")), ["--recursive", "-Zf"]);
+    }
+
+    /// Context D9 (the owner, 2026-11-20): a wrapper is its own part, holding
+    /// only its own options, followed by the command it runs.
+    #[test]
+    fn wrappers_unwrap_into_the_wrapper_and_the_command_it_runs() {
+        let CommandParse::Chain(chain) = parse("sudo -u root -E rm -rf / && ls") else {
+            panic!("should parse");
+        };
+        let programs: Vec<&str> = chain
+            .parts
+            .iter()
+            .map(|part| part.program.as_str())
+            .collect();
+        assert_eq!(programs, ["sudo", "rm", "ls"]);
+        assert_eq!(chain.operators, [ChainOperator::Wraps, ChainOperator::And]);
+        assert_eq!(options(&chain.parts[0]), ["--preserve-env", "--user"]);
+        assert_eq!(operands(&chain.parts[0]), [] as [Argument; 0]);
+        assert_eq!(chain.parts[1], only_part("rm -rf /"));
+        assert_eq!(
+            parse("sudo --user=root --preserve-env rm -fr /"),
+            parse("sudo -E -u root rm -rf /"),
+            "a wrapper's options compare in any spelling too"
+        );
+
+        let CommandParse::Chain(nested) =
+            parse("/usr/bin/nice -n 5 time -p env RUST_LOG=debug cargo run")
+        else {
+            panic!("should parse");
+        };
+        let programs: Vec<&str> = nested
+            .parts
+            .iter()
+            .map(|part| part.program.as_str())
+            .collect();
+        assert_eq!(programs, ["nice", "time", "env", "cargo"]);
+        assert_eq!(operands(&nested.parts[2]), [word("RUST_LOG=debug")]);
+        assert_eq!(operands(&nested.parts[3]), [word("run")]);
+        assert_eq!(
+            parse("nice -10 make"),
+            parse("nice -n 10 make"),
+            "the old spelling of the adjustment"
+        );
+        assert_eq!(
+            options(&only_part("command -v rm")),
+            ["-v"],
+            "describes, runs nothing"
+        );
+        assert_eq!(operands(&only_part("command -v rm")), [word("rm")]);
+        assert_eq!(only_part("env").program, "env");
+
+        for command in [
+            "xargs rm -rf",
+            "find . -name x | xargs rm",
+            "sudo -s ls",
+            "sudo -i",
+            "sudo --frobnicate ls",
+            "sudo -uroot ls",
+            "env -C /tmp rm -rf x",
+            "env PATH=/tmp cargo test",
+            "env -S 'rm -rf /'",
+            "sudo cd /tmp",
+            "sudo nice xargs rm",
+        ] {
+            assert_unanalysable(command);
+        }
     }
 }

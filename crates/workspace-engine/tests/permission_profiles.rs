@@ -276,6 +276,14 @@ fn weakening_cases() -> Vec<WeakeningCase> {
             "command_blocklist=\n",
             KeepsUserEntry(|c| c.command_blocklist.iter().any(|p| p == "rm -rf /")),
         ),
+        // Spec 111 D2: a repository or profile may add `ask` and `deny`
+        // rules, never an `allow`.
+        case(
+            "command_rules",
+            "",
+            "command_rule=allow rm -rf /\n",
+            Reported("command_rule"),
+        ),
         case(
             "secret_patterns",
             "secret_patterns=USER_SECRET\n",

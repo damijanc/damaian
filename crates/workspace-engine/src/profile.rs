@@ -429,11 +429,12 @@ pub fn split_profile_keys(overlay: ConfigOverlay) -> (ConfigOverlay, Vec<Rejecte
         hook_reviews_by_repository,
         project_checks_by_repository,
         language_servers,
+        command_rules,
     } = overlay;
 
     let mut refused = Vec::new();
     let mut refuse = |key: String, class: RepositoryKeyClass| {
-        refused.push(RejectedConfigKey { key, class });
+        refused.push(RejectedConfigKey::new(key, class));
     };
     // Redirecting keys, budgets a profile may not touch, and preferences: the
     // merge refuses a preference at profile scope as Forbidden too.
@@ -711,6 +712,9 @@ pub fn split_profile_keys(overlay: ConfigOverlay) -> (ConfigOverlay, Vec<Rejecte
         mcp_servers: carried_servers,
         mcp_deferral_ceiling_tokens,
         mcp_tools: carried_tools,
+        // Spec 111 D2: carried as written; an `allow` among them is a
+        // direction refusal, which the merge makes and reports.
+        command_rules,
         ..ConfigOverlay::default()
     };
     (carried, refused)

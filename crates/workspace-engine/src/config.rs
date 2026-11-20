@@ -1,4 +1,5 @@
 use crate::clarification::MAX_QUESTIONS_PER_TURN_CEILING;
+use crate::command_rules::{CommandRule, RuleEffect, RuleSource};
 use crate::context_manager::{ContextBudget, ContextCategory};
 use crate::error::{ClientError, Result};
 use crate::hash::repository_id_for_root;
@@ -170,13 +171,17 @@ impl RepositoryKeyClass {
 pub struct RejectedConfigKey {
     pub key: String,
     pub class: RepositoryKeyClass,
+    /// The line of the file, for a repeatable key whose name alone does not
+    /// say which entry was refused (`command_rule`, spec 111 D2).
+    pub line: Option<usize>,
 }
 
 impl RejectedConfigKey {
-    fn new(key: impl Into<String>, class: RepositoryKeyClass) -> Self {
+    pub(crate) fn new(key: impl Into<String>, class: RepositoryKeyClass) -> Self {
         Self {
             key: key.into(),
             class,
+            line: None,
         }
     }
 }
@@ -598,6 +603,11 @@ pub struct Config {
     /// keyed by language. A program Damaian spawns, so it is set by user or
     /// admin config only, like `shell`.
     pub language_servers: BTreeMap<String, String>,
+    /// `command_rule` lines from every scope, each with its source, in the
+    /// order they were read (spec 111 D1). Repository and profile scopes
+    /// contribute `ask` and `deny` only; their `allow` is refused at load.
+    /// Not yet consulted by the command policy (spec 111 Task 4).
+    pub command_rules: Vec<CommandRule>,
 }
 
 /// The languages `language_server.<language>` accepts: the names
@@ -1518,6 +1528,7 @@ impl Config {
             hook_reviews_by_repository,
             project_checks_by_repository,
             language_servers,
+            command_rules,
         } = overlay;
 
         let mut outcome = OverlayOutcome::default();
@@ -1611,6 +1622,32 @@ impl Config {
                 self.language_servers.insert(language, command);
                 outcome.record(scope, key, None, false);
             }
+        }
+        // Spec 111 D2: the user's and admin's rules are theirs to point either
+        // way; a repository or profile may add `ask` and `deny` only, so its
+        // `allow` is refused here, naming the line, and never reaches the
+        // rule list. Evaluation keeps the same limit should one arrive.
+        let source = match scope {
+            ConfigScope::User => RuleSource::User,
+            ConfigScope::Admin => RuleSource::Admin,
+            ConfigScope::Repository => RuleSource::Repository,
+            ConfigScope::Profile => RuleSource::Profile,
+        };
+        let mut taken = Vec::new();
+        for mut rule in command_rules {
+            if !trusted && rule.effect == RuleEffect::Allow {
+                let mut refused =
+                    RejectedConfigKey::new("command_rule", RepositoryKeyClass::RestrictOnly);
+                refused.line = rule.line;
+                rejected.push(refused);
+                continue;
+            }
+            rule.source = source;
+            taken.push(rule.text());
+            self.command_rules.push(rule);
+        }
+        if !taken.is_empty() {
+            outcome.record(scope, "command_rule", Some(taken), false);
         }
         for provider in model_providers {
             let key = format!("model_provider.{}", provider.id);
@@ -3887,6 +3924,7 @@ impl Default for Config {
             // None: with nothing configured no server is ever spawned, and the
             // heuristic tier stands alone (proposal §5.4).
             language_servers: BTreeMap::new(),
+            command_rules: Vec::new(),
         }
     }
 }
@@ -4025,6 +4063,9 @@ pub struct ConfigOverlay {
     pub project_checks_by_repository: BTreeMap<String, Vec<ProjectCheck>>,
     /// `language_server.<language>` entries, by language.
     pub language_servers: BTreeMap<String, String>,
+    /// `command_rule` lines, repeatable, in file order (spec 111 D1). Parsed
+    /// as the user's; the merge sets each rule's source from its scope.
+    pub command_rules: Vec<CommandRule>,
 }
 
 /// Which commands a permission profile lets run at all, narrowest first, so
@@ -4256,6 +4297,9 @@ classify_overlay_fields! {
     // A program Damaian spawns in the background, like `shell` (spec 25,
     // context.md §6).
     language_servers => Capability,
+    // Spec 111 D2: a rule decides whether a command runs. A repository or
+    // profile may add `ask` and `deny` rules only; its `allow` is refused.
+    command_rules => Capability,
 }
 
 impl ConfigOverlay {
@@ -4277,7 +4321,18 @@ impl ConfigOverlay {
                     line_number + 1
                 )));
             };
-            overlay.set(key.trim(), value.trim())?;
+            overlay
+                .set(key.trim(), value.trim())
+                .map_err(|error| match (key.trim(), error) {
+                    ("command_rule", ClientError::InvalidInput(message)) => {
+                        ClientError::InvalidInput(format!(
+                            "Invalid config line {}: {message}",
+                            line_number + 1
+                        ))
+                    }
+                    (_, error) => error,
+                })?;
+            overlay.stamp_command_rule_line(key.trim(), line_number + 1);
         }
         Ok(overlay)
     }
@@ -4321,13 +4376,27 @@ impl ConfigOverlay {
             let snapshot = overlay.clone();
             if overlay.set(key.trim(), value.trim()).is_err() {
                 overlay = snapshot;
-                rejected.push(RejectedConfigKey::new(
+                let mut refused = RejectedConfigKey::new(
                     bounded_key_name(key.trim()),
                     RepositoryKeyClass::Unparsable,
-                ));
+                );
+                refused.line = Some(line_number + 1);
+                rejected.push(refused);
+            } else {
+                overlay.stamp_command_rule_line(key.trim(), line_number + 1);
             }
         }
         (overlay, rejected)
+    }
+
+    /// Records which line a `command_rule` came from, so a refusal at the
+    /// scope merge can name it (spec 111 D2).
+    fn stamp_command_rule_line(&mut self, key: &str, line: usize) {
+        if key == "command_rule"
+            && let Some(rule) = self.command_rules.last_mut()
+        {
+            rule.line = Some(line);
+        }
     }
 
     pub fn load_or_default(path: impl AsRef<Path>) -> Result<Self> {
@@ -4474,6 +4543,10 @@ impl ConfigOverlay {
             "command_allowlist" => self.command_allowlist = Some(split_list(value)),
             "web_domain_allowlist" => self.web_domain_allowlist = Some(split_web_domains(value)),
             "command_blocklist" => self.command_blocklist = Some(split_list(value)),
+            "command_rule" => self.command_rules.push(
+                CommandRule::parse(value, RuleSource::User)
+                    .map_err(|error| ClientError::InvalidInput(format!("command_rule: {error}")))?,
+            ),
             "secret_patterns" => self.secret_patterns = Some(split_list(value)),
             "require_approval_for_file_edits" => {
                 self.require_approval_for_file_edits = Some(parse_bool(key, value)?)
@@ -5136,6 +5209,7 @@ impl ConfigOverlay {
             hook_reviews_by_repository,
             project_checks_by_repository,
             language_servers,
+            command_rules,
         } = self;
         let mut output = String::new();
         if let Some(value) = data_dir {
@@ -5539,6 +5613,9 @@ impl ConfigOverlay {
         }
         for (language, command) in language_servers {
             push_line(&mut output, &format!("language_server.{language}"), command);
+        }
+        for rule in command_rules {
+            push_line(&mut output, "command_rule", &rule.text());
         }
         output
     }

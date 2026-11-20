@@ -13,7 +13,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use workspace_engine::{
     CancelToken, CommandPolicy, CommandRisk, Config, ConfigOverlay, RepositoryKeyClass,
-    WorkspaceEngine, repository_id_for_root,
+    RuleContext, RuleEffect, RuleSource, RuleVerdict, WorkspaceEngine, evaluate_command,
+    repository_id_for_root,
 };
 
 static COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -1683,4 +1684,99 @@ fn repository_config_may_lower_the_exploration_allowance_but_not_raise_it() {
 
     lowered.cleanup();
     raised.cleanup();
+}
+
+/// Spec 111 D2: a repository may add `ask` and `deny` command rules, and its
+/// `allow` is refused at load, reported with its line, and never reaches the
+/// rule list.
+#[test]
+fn repository_command_rules_may_only_ask_or_deny() {
+    let fixture = fixture(
+        "command-rules",
+        "command_rule=deny cargo publish *\ncommand_rule=allow cargo test *\n",
+        concat!(
+            "# a hostile clone\n",
+            "command_rule=ask cargo test *\n",
+            "command_rule=allow rm -rf /\n",
+            "command_rule=deny curl *\n",
+        ),
+    );
+
+    let (config, report) = fixture.load_reporting();
+
+    let refused: Vec<_> = report
+        .rejected_keys
+        .iter()
+        .filter(|rejected| rejected.key == "command_rule")
+        .collect();
+    assert_eq!(refused.len(), 1, "{:?}", report.rejected_keys);
+    assert_eq!(refused[0].class, RepositoryKeyClass::RestrictOnly);
+    assert_eq!(refused[0].line, Some(3), "the refusal names the line");
+
+    let rules: Vec<(RuleSource, RuleEffect, &str)> = config
+        .command_rules
+        .iter()
+        .map(|rule| (rule.source, rule.effect, rule.pattern.as_str()))
+        .collect();
+    assert_eq!(
+        rules,
+        [
+            (RuleSource::User, RuleEffect::Deny, "cargo publish *"),
+            (RuleSource::User, RuleEffect::Allow, "cargo test *"),
+            (RuleSource::Repository, RuleEffect::Ask, "cargo test *"),
+            (RuleSource::Repository, RuleEffect::Deny, "curl *"),
+        ]
+    );
+    assert_eq!(config.command_rules[0].line, Some(1));
+
+    let context = RuleContext {
+        repository_root: &fixture.root,
+        working_directory: &fixture.root,
+        home: None,
+    };
+    let verdict =
+        |command: &str| evaluate_command(command, &config.command_rules, &context).verdict();
+    assert_eq!(
+        verdict("rm -rf /"),
+        RuleVerdict::Deny,
+        "the refused allow lifts nothing"
+    );
+    assert_eq!(verdict("curl https://example.com"), RuleVerdict::Deny);
+    assert_eq!(
+        verdict("cargo test --lib"),
+        RuleVerdict::Allow,
+        "the user's allow is consulted after the repository's ask (D1)"
+    );
+    assert_eq!(verdict("cargo publish"), RuleVerdict::Deny);
+
+    fixture.cleanup();
+}
+
+/// A config save rewrites `user.conf` from the overlay, so command rules must
+/// survive it in order.
+#[test]
+fn command_rules_survive_a_config_round_trip_in_order() {
+    let text = concat!(
+        "command_rule = deny cargo *\n",
+        "command_rule = allow cargo test *\n",
+        "command_rule = allow rm -rf /tmp/** in ~/work\n",
+    );
+    let overlay = ConfigOverlay::parse(text).expect("the rules should parse");
+    let rewritten = overlay.to_policy_text();
+    assert_eq!(
+        rewritten,
+        concat!(
+            "command_rule=deny cargo *\n",
+            "command_rule=allow cargo test *\n",
+            "command_rule=allow rm -rf /tmp/** in ~/work\n",
+        )
+    );
+    let reparsed = ConfigOverlay::parse(&rewritten).expect("the rewrite should parse");
+    assert_eq!(reparsed.command_rules.len(), 3);
+    assert_eq!(reparsed.to_policy_text(), rewritten);
+
+    let error =
+        ConfigOverlay::parse("max_file_bytes=1000\ncommand_rule=allow cargo fmt && cargo clippy\n")
+            .expect_err("a chain is not a rule");
+    assert!(error.to_string().contains("line 2"), "{error}");
 }

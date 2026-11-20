@@ -8,6 +8,7 @@ pub mod clarification;
 pub mod command_parse;
 pub mod command_policy;
 pub mod command_purpose;
+pub mod command_rules;
 pub mod command_runner;
 pub mod commit;
 pub mod compaction;
@@ -107,6 +108,10 @@ pub use command_policy::{
     allow_always_eligible,
 };
 pub use command_purpose::{CommandPurpose, command_purpose};
+pub use command_rules::{
+    BuiltInDefault, BuiltInDenial, CommandRule, Decider, PartDecision, RuleContext, RuleEffect,
+    RuleEvaluation, RuleSource, RuleVerdict, evaluate_command,
+};
 pub use command_runner::{CommandExecution, CommandRunOptions, CommandRunner, CommandTermination};
 pub use commit::{
     CommitCandidate, CommitCandidateSource, CommitEngine, CommitError, CommitHookOutcome,

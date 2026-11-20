@@ -30,6 +30,7 @@ fn key_for_overlay_field(field: &str) -> String {
         "hook_reviews_by_repository" => "hook_review.<repository_id>.<hook_id>",
         "project_checks_by_repository" => "project_checks.<repository_id>",
         "language_servers" => "language_server.<language>",
+        "command_rules" => "command_rule",
         // The four definition families are checked field by field below.
         "model_providers" => "model_provider.<id>.",
         "mcp_servers" => "mcp_server.<id>.",

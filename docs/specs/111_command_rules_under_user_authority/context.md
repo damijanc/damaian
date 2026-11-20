@@ -92,3 +92,67 @@
   would block this: recursive `rm` on `/`. Your rule `…` allows it.") and is
   audited `command_rule_override` with the rule text and the built-in reason
   name (never the command's output).
+
+- **D8 — how Task 2 reads D1, D2 and D5 (2026-11-20).** Settled while
+  building `command_rules.rs`, in the reading the decisions above imply:
+  - *Order and limits.* Per part: built-in `deny` defaults, then repository,
+    profile, user, admin, session rules (admin config has the user's
+    authority and is applied after it, as it is for every other key).
+    Repository and profile rules only raise a part toward `ask`/`deny`; a
+    user or admin rule sets it either way, so a user `allow` also lifts a
+    repository `ask` or `deny` (D1's order). A session rule only allows and
+    lifts any `ask` but never a `deny` of any source (D2 names user `deny`
+    and blocks; a repository `deny` is not lifted either).
+  - *Built-in recursive `rm`.* Denied when an operand is not strictly inside
+    the repository: `/`, home, the root itself, a parent of it, or anything
+    outside (that is what makes `rm -rf /tmp` blocked, proposal §4). Any
+    recursive `rm`, with or without `-f`. Differences from the text patterns
+    for Task 3's corpus: `rm -rf /abs/path/inside/repo` is no longer a
+    built-in block (the relative spelling never was); `rm -r /` is now one;
+    `rm -rf *` is unanalysable, so it asks instead of being blocked.
+  - *The other defaults.* `git reset` with `--hard`; `git clean` with
+    `--force` and `-d` (any spelling); `dd` whose `of=` is under `/dev`
+    except `/dev/null`, `/dev/stdout`, `/dev/stderr`, `/dev/tty` (the text
+    pattern blocked every `dd if=`); a program named `mkfs*`; `shutdown` and
+    `reboot` with any arguments (the text pattern matched only the bare
+    word). Text inside another program's arguments (`echo git reset --hard`)
+    no longer matches. macOS's own `newfs_*` is not in D5's list and is not
+    denied.
+  - *Patterns.* A written rule's `*` is always a wildcard (quoting does not
+    make it literal); a trailing ` *` word matches any further arguments,
+    options included, and also none; a trailing `**` needs at least one
+    segment (`/tmp/**` is below `/tmp`, not `/tmp`); a path pattern matches
+    only a path argument and a word pattern only a word, so an unknown
+    program's `x` and `./x` differ; a glob in a known program's name does
+    not match it. `in <directory>` must be absolute or start at `~`, and
+    cannot contain spaces. A pattern that is a chain or unanalysable is a
+    config error.
+  - *Session rules* are exact: the approved command parsed in its
+    directory; each part of an approved chain is covered, alone or in
+    another chain, in the directory it ran in. A quoted `'*'` stays literal.
+  - *Unanalysable commands* ask; no rule of any effect applies to them.
+  - *Config.* `command_rule` is repeatable; `ConfigOverlay::command_rules`
+    keeps file order and line numbers and writes the lines back on save; a
+    repository or profile `allow` is refused as `restrict_only`, with the
+    line in the new `RejectedConfigKey::line`. `Config::to_policy_text` (the
+    effective-policy text) does not list rules yet: Task 5's Settings work.
+
+- **D9 — wrappers are unwrapped (decided by the owner, 2026-11-20: "A:
+  unwrap them").** `sudo`, `env`, `nice`, `time` and `command` parse into the
+  wrapper as its own part, holding only its own options (and `env`'s
+  `NAME=value` assignments), followed by the command it runs as a further
+  part, joined by `ChainOperator::Wraps`; wrappers nest (`sudo nice rm` is
+  three parts). Every part must be allowed, so the built-in defaults and a
+  user `deny` see `rm -rf /` in `sudo rm -rf /`, and `allow sudo *` covers
+  only the `sudo` part. A one-part pattern covers any single part, wrapped
+  or not; a wrapped pattern (`allow sudo make install`) covers a group that
+  matches it part for part, and not the command without its wrapper. A
+  session rule covers the exact group it was approved for. Unanalysable
+  (asks, no rule covers it): a wrapper option the table does not model, a
+  value-taking short flag inside a group (`-uroot`), `sudo -s`/`-i`/`-D`,
+  `env -C`/`-S`/`-P`, `env PATH=…` (it changes which program runs), `cd`
+  behind a wrapper, and `xargs` anywhere, since its command takes arguments
+  from its input; a rule pattern naming `xargs` is therefore a config error.
+  `command -v`/`-V` and a wrapper with no command run nothing and stay one
+  part. Not covered: other wrappers (`nohup`, `timeout`, `caffeinate`,
+  `arch`, …) still parse as unknown programs.
