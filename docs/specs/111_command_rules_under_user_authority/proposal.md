@@ -1,7 +1,8 @@
 # Feature Spec: Command Rules Under the User's Authority
 
-Status: In progress (specified 2026-11-12; started 2026-11-12, Task 1 the
-parser done; Tasks 1–6 in [tasks.md](tasks.md))
+Status: In progress (specified 2026-11-12; started 2026-11-12, Tasks 1–3
+done: the parser, the rules beside the old policy, the migration of the old
+keys; Tasks 1–6 in [tasks.md](tasks.md))
 Order: 111 of 111
 Plan: none. Written from the owner's design discussion on 2026-11-12 (spec 109
 D5 "Approve for this session", and a comparison with OpenCode's permission

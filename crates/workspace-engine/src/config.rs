@@ -1,5 +1,8 @@
 use crate::clarification::MAX_QUESTIONS_PER_TURN_CEILING;
-use crate::command_rules::{CommandRule, RuleEffect, RuleSource};
+use crate::command_policy::{contains_shell_control, destructive_pattern, normalize_lexically};
+use crate::command_rules::{
+    CommandRule, RuleContext, RuleEffect, RuleEvaluation, RuleSource, evaluate_command,
+};
 use crate::context_manager::{ContextBudget, ContextCategory};
 use crate::error::{ClientError, Result};
 use crate::hash::repository_id_for_root;
@@ -230,6 +233,73 @@ impl OverlayOutcome {
             // admin config overruling what earlier scopes resolved is flagged.
             widened: loosened && scope == ConfigScope::Admin,
         });
+    }
+}
+
+/// An entry of an old command key that no rule can stand in for (spec 111
+/// D6), with why. It is left out of [`LegacyCommandRules::rules`] and named
+/// in the deprecation note.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnmigratedCommandEntry {
+    /// `command_allowlist`, `command_allowlist.<repository_id>` (an Always
+    /// allow entry) or `command_blocklist`.
+    pub key: &'static str,
+    pub entry: String,
+    pub reason: String,
+}
+
+/// The old command keys read as command rules, from
+/// [`Config::legacy_command_rules`] (spec 111 D6).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LegacyCommandRules {
+    /// The `allow` rules, then the `deny` rules, each with its source.
+    pub rules: Vec<CommandRule>,
+    pub unmigrated: Vec<UnmigratedCommandEntry>,
+    /// How many entries each old key had in force, for the note.
+    pub allowlist_entries: usize,
+    pub always_allow_entries: usize,
+    pub blocklist_entries: usize,
+}
+
+impl LegacyCommandRules {
+    /// What Settings says about the old keys while they still load (D6):
+    /// one line per key in use, then one per entry that could not become a
+    /// rule. Empty when none of the old keys has an entry.
+    pub fn deprecation_notes(&self) -> Vec<String> {
+        let mut notes = Vec::new();
+        for (key, count, reads_as) in [
+            (
+                "command_allowlist",
+                self.allowlist_entries,
+                "an `allow` rule for that exact command at the repository root",
+            ),
+            (
+                "command_allowlist.<repository_id>",
+                self.always_allow_entries,
+                "an `allow` rule for that exact command where you allowed it",
+            ),
+            (
+                "command_blocklist",
+                self.blocklist_entries,
+                "a `deny` rule for that command with any further arguments (`deny <entry> *`)",
+            ),
+        ] {
+            if count > 0 {
+                notes.push(format!(
+                    "`{key}` is deprecated (spec 111): each of its {count} {entries} is read as \
+                     {reads_as}. Write them as `command_rule` lines; the key is removed one \
+                     release after command rules decide.",
+                    entries = if count == 1 { "entry" } else { "entries" },
+                ));
+            }
+        }
+        for entry in &self.unmigrated {
+            notes.push(format!(
+                "`{}` entry `{}` is not read as a rule: {}.",
+                entry.key, entry.entry, entry.reason
+            ));
+        }
+        notes
     }
 }
 
@@ -1627,12 +1697,7 @@ impl Config {
         // way; a repository or profile may add `ask` and `deny` only, so its
         // `allow` is refused here, naming the line, and never reaches the
         // rule list. Evaluation keeps the same limit should one arrive.
-        let source = match scope {
-            ConfigScope::User => RuleSource::User,
-            ConfigScope::Admin => RuleSource::Admin,
-            ConfigScope::Repository => RuleSource::Repository,
-            ConfigScope::Profile => RuleSource::Profile,
-        };
+        let source = rule_source(scope);
         let mut taken = Vec::new();
         for mut rule in command_rules {
             if !trusted && rule.effect == RuleEffect::Allow {
@@ -3282,6 +3347,136 @@ impl Config {
             .get(&repository_id_for_root(repository_root))
             .cloned()
             .unwrap_or_default()
+    }
+
+    /// The old command keys read as command rules (spec 111 D6), for the
+    /// repository at `repository_root`: `command_allowlist` and the Always
+    /// allow entries become `allow` rules of the exact command in the exact
+    /// directory where they applied (the repository root, or the sub-root a
+    /// `cd <root> && <command>` entry names), and `command_blocklist`
+    /// entries become `deny <entry> *` rules, the prefix they meant. Each
+    /// rule keeps the source of the scope that put its entry in force, taken
+    /// from `report`, so the trust limits of D2 apply to it; without a
+    /// report every entry is attributed to the user.
+    ///
+    /// An entry is left out, and named in [`LegacyCommandRules::unmigrated`],
+    /// when no rule would decide what it decided: an allowlist entry that
+    /// the old policy never let run (it was blocked, or held shell control),
+    /// or one a rule pattern cannot say exactly; a blocklist entry that is
+    /// not one command.
+    ///
+    /// Nothing calls this to decide yet: until spec 111 Task 4 the old keys
+    /// decide in [`crate::command_policy`], and the equivalence corpus
+    /// (`tests/command_rule_equivalence.rs`) holds the two side by side.
+    pub fn legacy_command_rules(
+        &self,
+        repository_root: &Path,
+        home: Option<&Path>,
+        report: Option<&RepositoryConfigReport>,
+    ) -> LegacyCommandRules {
+        let mut legacy = LegacyCommandRules::default();
+        let root = normalize_lexically(repository_root);
+        let always_allowed = self
+            .command_allowlist_by_repository
+            .get(&repository_id_for_root(repository_root))
+            .cloned()
+            .unwrap_or_default();
+        // The scope that set `command_allowlist` last holds the whole list
+        // (user and admin replace it); the Always allow fold adds after it.
+        let allowlist_scope = report.and_then(|report| {
+            report
+                .applied
+                .iter()
+                .rev()
+                .find(|applied| applied.key == "command_allowlist")
+                .map(|applied| applied.scope)
+        });
+        let mut denies = Vec::new();
+        for (entry, source) in self.blocklist_sources(report) {
+            legacy.blocklist_entries += 1;
+            match CommandRule::new(RuleEffect::Deny, &format!("{entry} *"), None, source) {
+                Ok(rule) => denies.push(rule),
+                Err(reason) => legacy.unmigrated.push(UnmigratedCommandEntry {
+                    key: "command_blocklist",
+                    entry,
+                    reason,
+                }),
+            }
+        }
+        for entry in &self.command_allowlist {
+            let entry = entry.trim();
+            let from_always_allow = always_allowed.iter().any(|always| always.trim() == entry);
+            if from_always_allow {
+                legacy.always_allow_entries += 1;
+            } else {
+                legacy.allowlist_entries += 1;
+            }
+            let key = if from_always_allow {
+                "command_allowlist.<repository_id>"
+            } else {
+                "command_allowlist"
+            };
+            let source = match allowlist_scope {
+                Some(ConfigScope::Admin) if !from_always_allow => RuleSource::Admin,
+                _ => RuleSource::User,
+            };
+            match legacy_allow_rule(entry, &root, home, &self.command_blocklist, source) {
+                Ok(rule) => legacy.rules.push(rule),
+                Err(reason) => legacy.unmigrated.push(UnmigratedCommandEntry {
+                    key,
+                    entry: entry.to_string(),
+                    reason,
+                }),
+            }
+        }
+        // After the allows: within one source the last match wins, and a
+        // blocklist entry beat an allowlist entry in the old policy.
+        legacy.rules.extend(denies);
+        legacy
+    }
+
+    /// Each effective `command_blocklist` entry with the source of the scope
+    /// that put it in force, replaying the merge: a user or admin list
+    /// replaces the entries so far, and a repository or profile list adds
+    /// the ones not already present.
+    fn blocklist_sources(
+        &self,
+        report: Option<&RepositoryConfigReport>,
+    ) -> Vec<(String, RuleSource)> {
+        let mut sources: Vec<(String, RuleSource)> = Vec::new();
+        for applied in report
+            .iter()
+            .flat_map(|report| &report.applied)
+            .filter(|applied| applied.key == "command_blocklist")
+        {
+            let entries = applied.entries.clone().unwrap_or_default();
+            match applied.scope {
+                ConfigScope::User | ConfigScope::Admin => {
+                    sources = entries
+                        .into_iter()
+                        .map(|entry| (entry, rule_source(applied.scope)))
+                        .collect();
+                }
+                ConfigScope::Repository | ConfigScope::Profile => {
+                    for entry in entries {
+                        if !sources.iter().any(|(known, _)| *known == entry) {
+                            sources.push((entry, rule_source(applied.scope)));
+                        }
+                    }
+                }
+            }
+        }
+        self.command_blocklist
+            .iter()
+            .map(|entry| {
+                let source = sources
+                    .iter()
+                    .find(|(known, _)| known == entry)
+                    .map_or(RuleSource::User, |(_, source)| *source);
+                (entry.trim().to_string(), source)
+            })
+            .filter(|(entry, _)| !entry.is_empty())
+            .collect()
     }
 
     pub fn apply_repository_allowlist(&mut self, repository_root: &Path) -> Vec<String> {
@@ -6609,6 +6804,96 @@ fn parse_basis_points(key: &str, value: &str) -> Result<u16> {
         return Err(invalid());
     }
     Ok(bps as u16)
+}
+
+/// The rule source a config scope's command rules carry (spec 111 D2).
+fn rule_source(scope: ConfigScope) -> RuleSource {
+    match scope {
+        ConfigScope::User => RuleSource::User,
+        ConfigScope::Admin => RuleSource::Admin,
+        ConfigScope::Repository => RuleSource::Repository,
+        ConfigScope::Profile => RuleSource::Profile,
+    }
+}
+
+/// One `command_allowlist` (or Always allow) entry as the `allow` rule that
+/// decides what it decided, or why no rule can. The old allowlist matched
+/// the exact text, only where it was granted, after the blocklist, the
+/// destructive patterns and the shell-control gate had had their say; an
+/// entry those always stopped allowed nothing, so it must not become a user
+/// `allow`, which would override the blocks it never overrode (D2).
+fn legacy_allow_rule(
+    entry: &str,
+    root: &Path,
+    home: Option<&Path>,
+    blocklist: &[String],
+    source: RuleSource,
+) -> std::result::Result<CommandRule, String> {
+    // `cd <sub-root> && <command>` is how a grant for one project root is
+    // stored (spec 24 `context.md` §2); it applies there and nowhere else.
+    let (directory, command) = match entry
+        .strip_prefix("cd ")
+        .and_then(|rest| rest.split_once(" && "))
+    {
+        Some((relative, command)) => (
+            normalize_lexically(&root.join(relative.trim())),
+            command.trim(),
+        ),
+        None => (root.to_path_buf(), entry),
+    };
+    let directory_text = directory.to_string_lossy().into_owned();
+    if !directory.starts_with(root) {
+        return Err("it names a directory outside the repository".to_string());
+    }
+    if directory_text.contains('*') {
+        return Err("the directory contains `*`, which a rule reads as a wildcard".to_string());
+    }
+    if command.contains('*') {
+        return Err(
+            "it contains `*`, which the allowlist matched literally and a rule reads as a \
+             wildcard"
+                .to_string(),
+        );
+    }
+    if contains_shell_control(command) {
+        return Err(
+            "it contains shell control, so the allowlist never matched it: the command always \
+             asked"
+                .to_string(),
+        );
+    }
+    if let Some(blocking) = blocklist
+        .iter()
+        .find(|blocked| command.starts_with(blocked.as_str()))
+    {
+        return Err(format!(
+            "`command_blocklist` entry `{blocking}` blocks it, and the blocklist came first"
+        ));
+    }
+    if let Some(pattern) = destructive_pattern(command) {
+        return Err(format!(
+            "Damaian blocks it (`{pattern}`), and the allowlist never overrode that; write a \
+             `command_rule = allow …` line to override it"
+        ));
+    }
+    let rule = CommandRule::new(RuleEffect::Allow, command, Some(directory_text), source)?;
+    // An entry the old policy did let run keeps running even where the
+    // built-in defaults now see a block the text patterns missed (`rm -r
+    // /tmp/x`): it becomes a user `allow`, which overrides them, and Task 4's
+    // card warns about the override (D7). Only a command that cannot be
+    // analysed where it runs (`~` with no home directory) has no rule.
+    match evaluate_command(
+        command,
+        &[],
+        &RuleContext {
+            repository_root: root,
+            working_directory: &directory,
+            home,
+        },
+    ) {
+        RuleEvaluation::Unanalysable { reason } => Err(format!("the command {reason}")),
+        RuleEvaluation::Parts(_) => Ok(rule),
+    }
 }
 
 fn split_list(value: &str) -> Vec<String> {

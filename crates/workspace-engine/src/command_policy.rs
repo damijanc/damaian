@@ -842,7 +842,7 @@ fn configured_exact_matches(patterns: &[String], command: &str) -> bool {
     patterns.iter().any(|pattern| pattern.trim() == command)
 }
 
-fn contains_shell_control(command: &str) -> bool {
+pub(crate) fn contains_shell_control(command: &str) -> bool {
     command.contains(';')
         || command.contains('&')
         || command.contains('|')
@@ -911,7 +911,7 @@ fn first_word(command: &str) -> String {
 /// The built-in destructive pattern `command` matches, if any (spec 10). The
 /// name is the canonical pattern, not the exact text, so a family of
 /// spellings shares one cause.
-fn destructive_pattern(command: &str) -> Option<&'static str> {
+pub(crate) fn destructive_pattern(command: &str) -> Option<&'static str> {
     let trimmed = command.trim();
     if trimmed.starts_with("rm -rf /")
         || trimmed == "rm -rf ."

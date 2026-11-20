@@ -156,3 +156,54 @@
   `command -v`/`-V` and a wrapper with no command run nothing and stay one
   part. Not covered: other wrappers (`nohup`, `timeout`, `caffeinate`,
   `arch`, …) still parse as unknown programs.
+
+- **D10 — how Task 3 reads D6 (2026-11-20).** `Config::legacy_command_rules(
+  repository_root, home, report)` builds the rules; it is computed for a
+  repository rather than stored at load, because what an allowlist entry
+  meant depends on where the command runs.
+  - *Allowlist and Always allow.* The old allowlist matched exact text, only
+    at the repository root (or at the sub-root a `cd <root> && <command>`
+    entry names, spec 24), so each entry becomes `allow <command> in
+    <that directory>` — not a bare `allow <command>`, which would cover every
+    directory. Source: the scope that set `command_allowlist` last (user or
+    admin); Always allow entries are the user's. An entry is not migrated,
+    and is named in `LegacyCommandRules::unmigrated` with a reason, when the
+    old policy never let it run (a blocklist prefix or a destructive pattern
+    caught it, or it holds shell control, which was asked before the
+    allowlist was consulted) — as a user `allow` it would now override those
+    blocks — or when a rule cannot say it exactly (`*` is literal in the
+    allowlist and a wildcard in a rule; `$…` and other unanalysable text).
+    An entry the old policy did run is migrated even where the new built-in
+    defaults deny it (`rm -r /tmp/x`, which the text patterns missed): the
+    user `allow` overrides, and Task 4's card warns (D7).
+  - *Blocklist.* Each entry becomes `deny <entry> *`, with the source of the
+    scope that put it in force, found by replaying the merge from the
+    report's applied keys (user and admin replace the list; repository and
+    profile add to it). Without a report every entry is the user's. An
+    entry that is not one command is not migrated.
+  - *Order.* The allows, then the denies, then the `command_rule` lines:
+    within one source the last match wins, so a blocklist entry still beats
+    an allowlist entry, and the user's own rules beat both.
+  - *Deprecation note.* `LegacyCommandRules::deprecation_notes()` gives one
+    line per old key in use and one per unmigrated entry. Showing it in
+    Settings is Task 5's; nothing shows it yet.
+  - *Equivalence.* `tests/command_rule_equivalence.rs` replays the command
+    policy's own test commands, the destructive spellings, the legacy-key
+    entries and their variants, and 217 commands recorded from real
+    Damaian sessions on this repository (`tests/fixtures/command_corpus/`,
+    home paths replaced), through the old policy and the migrated rules,
+    with no legacy keys and with every key from user, repository and Always
+    allow, at the root and a sub-root. The recorded set shows no
+    difference. The listed differences are D8/D9's fixes and four migration
+    effects: another spelling of an allowlisted command is allowed too
+    (`cargo  test`, `rm -fr target`, the path written out); a blocklist
+    prefix ending inside a word (`docker` vs `dockerx`) no longer matches;
+    a blocklisted command now denies inside a chain and behind a wrapper;
+    an allowlist entry a rule cannot say asks. None lets a command run
+    that the old policy asked for, except another spelling of an
+    allowlisted command.
+  - *Open for Task 4.* An unanalysable command asks and no rule applies
+    to it (D8), so a blocklisted command written with `$…` or a glob asks
+    instead of being blocked; and the allowlist branch kept
+    `require_approval_for_all_commands`, so an `allow` from a migrated
+    entry must still ask when that key is on.
