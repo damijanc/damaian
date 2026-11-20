@@ -740,6 +740,8 @@ Use the terminal icon in the conversation header to show or hide the bottom term
 
 Commands are entered manually by the user and run directly on the local machine. Use `cd` to change the panel's working directory, and `clear` to clear the panel output.
 
+To make the panel taller or shorter, drag its top edge. With the edge focused (Tab to it), **↑** and **↓** change the height in small steps, and **Shift** with an arrow in larger ones. Double-click the edge to go back to the default height. The height is remembered across restarts, and the panel always leaves room for the header and the prompt box.
+
 ## Chat
 
 Type in the prompt box at the bottom of the window to ask questions about the selected repository. Damaian retrieves relevant local files, redacts detected secrets, streams the answer, and shows the context files used for the response.
@@ -997,6 +999,8 @@ Use the conversation box to request file changes.
 4. Select **Apply N** to write the checked changes, or **Reject** to record the checked files as rejected without changing the workspace.
 
 Damaian checks file hashes before applying a stored patch. If a target file changed after preview, that file is blocked instead of overwriting newer local work.
+
+Once every file of a patch is applied or rejected, the card drops **Apply N** and **Reject** and its header says what happened, for example **1 applied · 1 rejected**. A proposal that would change nothing, because every file already holds the proposed content, is never shown: the assistant is told the patch changes nothing and carries on. A file that is unchanged beside real changes is left out of the patch. During automatic repair after a failed check, a repair that repeats what is already on disk is instead reported as **Repair stalled**.
 
 ### Protecting paths from a task's patches
 

@@ -305,10 +305,11 @@ impl ChatOrchestrator {
                         .iter()
                         .map(|change| change.path.as_str()),
                 )
-                .and_then(|()| {
+                .and_then(|()| self.without_unchanged_files(cx, generated_edit.changes.clone()))
+                .and_then(|changes| {
                     self.patch_engine.create_patch(
                         cx.repository_root,
-                        &generated_edit.changes,
+                        &changes,
                         Some(&cx.task.id),
                         &generated_edit.summary,
                     )
@@ -330,6 +331,39 @@ impl ChatOrchestrator {
             }
         };
         Ok(ControlFlow::Continue((action_marker, result)))
+    }
+
+    /// Observation 99: a proposal never raises a decision with nothing in it.
+    /// A file that already holds the proposed content is left out, and a
+    /// proposal that is only such files is refused back to the model as the
+    /// tool result, so it moves on instead of the user approving an empty card.
+    ///
+    /// A verification repair turn is exempt: a repair that repeats the content
+    /// already on disk is spec 102's evidence of a stall, which the repair
+    /// loop detects from the patch and reports as **Repair stalled**.
+    fn without_unchanged_files(
+        &self,
+        cx: &CallContext<'_, '_>,
+        changes: Vec<ProposedChange>,
+    ) -> Result<Vec<ProposedChange>> {
+        if cx.turn_options.verification_turn {
+            return Ok(changes);
+        }
+        let unchanged = self
+            .patch_engine
+            .unchanged_paths(cx.repository_root, &changes);
+        if !changes.is_empty() && unchanged.len() == changes.len() {
+            return Err(ClientError::InvalidInput(
+                "the patch changes nothing: every file already has the proposed content. \
+                 Do not propose it again; continue with the next step, or re-read the file \
+                 if you expected it to differ."
+                    .to_string(),
+            ));
+        }
+        Ok(changes
+            .into_iter()
+            .filter(|change| !unchanged.contains(&change.path))
+            .collect())
     }
 
     /// A patch that passed the worktree and protected-path checks stops the
@@ -693,6 +727,7 @@ impl ChatOrchestrator {
                 .and_then(|()| {
                     region_edits_to_changes(cx.repository_root, &self.path_policy, &edits)
                 })
+                .and_then(|changes| self.without_unchanged_files(cx, changes))
                 .and_then(|changes| {
                     self.patch_engine.create_patch(
                         cx.repository_root,

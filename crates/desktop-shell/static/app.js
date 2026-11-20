@@ -4043,6 +4043,82 @@ function setTerminalOpen(open) {
   }
 }
 
+// The terminal panel's height is the user's choice: dragging the top edge (or
+// arrow keys on the focused edge) sets it, and it survives restarts. CSS keeps
+// the same floor and cap, so a stored height that no longer fits the window
+// still draws sensibly. The existing ResizeObserver on the xterm element refits
+// the terminal and resizes the pty as the height changes.
+const terminalHeightStorageKey = "damaian:terminalPanelHeight";
+const terminalMinHeight = 140;
+// Room left for the header and composer above the terminal.
+const terminalReservedHeight = 220;
+
+function clampTerminalHeight(height) {
+  const cap = Math.max(terminalMinHeight, window.innerHeight - terminalReservedHeight);
+  return Math.round(Math.min(Math.max(height, terminalMinHeight), cap));
+}
+
+function setTerminalHeight(height, { persist = false } = {}) {
+  const panel = $("terminal-panel");
+  if (height == null) {
+    panel.style.removeProperty("--terminal-panel-height");
+  } else {
+    panel.style.setProperty("--terminal-panel-height", `${clampTerminalHeight(height)}px`);
+  }
+  if (!persist) return;
+  try {
+    if (height == null) localStorage.removeItem(terminalHeightStorageKey);
+    else localStorage.setItem(terminalHeightStorageKey, String(clampTerminalHeight(height)));
+  } catch {
+    // Storage is a convenience; the drag still applies for this window.
+  }
+}
+
+function wireTerminalResize() {
+  let stored = Number.NaN;
+  try {
+    stored = Number(localStorage.getItem(terminalHeightStorageKey));
+  } catch {
+    // No stored height: the CSS default applies.
+  }
+  if (Number.isFinite(stored) && stored > 0) setTerminalHeight(stored);
+
+  const handle = $("terminal-resize-handle");
+  const panel = $("terminal-panel");
+  let drag = null;
+  handle.addEventListener("pointerdown", (event) => {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    drag = { startY: event.clientY, startHeight: panel.getBoundingClientRect().height };
+    handle.setPointerCapture(event.pointerId);
+    handle.classList.add("dragging");
+    document.body.classList.add("terminal-resizing");
+  });
+  handle.addEventListener("pointermove", (event) => {
+    if (!drag) return;
+    // The handle is on the top edge: dragging up makes the panel taller.
+    setTerminalHeight(drag.startHeight + (drag.startY - event.clientY));
+  });
+  const endDrag = (event) => {
+    if (!drag) return;
+    drag = null;
+    if (handle.hasPointerCapture(event.pointerId)) handle.releasePointerCapture(event.pointerId);
+    handle.classList.remove("dragging");
+    document.body.classList.remove("terminal-resizing");
+    setTerminalHeight(panel.getBoundingClientRect().height, { persist: true });
+  };
+  handle.addEventListener("pointerup", endDrag);
+  handle.addEventListener("pointercancel", endDrag);
+  handle.addEventListener("dblclick", () => setTerminalHeight(null, { persist: true }));
+  handle.addEventListener("keydown", (event) => {
+    if (event.key !== "ArrowUp" && event.key !== "ArrowDown") return;
+    event.preventDefault();
+    const step = event.shiftKey ? 96 : 24;
+    const current = panel.getBoundingClientRect().height;
+    setTerminalHeight(current + (event.key === "ArrowUp" ? step : -step), { persist: true });
+  });
+}
+
 // Lazily build the xterm.js instance and wire it to the pty transport.
 function createTerminalInstance() {
   if (term) return;
@@ -15168,6 +15244,22 @@ function createPatchPreview(payload, patchRepo, { onResolved = null } = {}) {
   // what will actually happen rather than the indefinite "Selected". The patch
   // id it used to show is still on `state.patchId`.
   function updateHeaderCounts() {
+    // Observation 99: once no file is pending (all applied or rejected, or a
+    // patch that arrived with none), the card is a record, not a decision.
+    // "0 files · Apply 0 · Reject" asked the user to decide nothing.
+    const settled = !state.files.some((file) => file.state === "pending");
+    wrapper.classList.toggle("settled", settled);
+    actions.hidden = settled;
+    if (settled) {
+      // Applied files leave `state.files`; rejected ones stay, marked.
+      const rejected = state.files.filter((file) => file.state === "rejected").length;
+      const applied = state.initialFileCount - state.files.length;
+      const parts = [];
+      if (applied) parts.push(`${applied} applied`);
+      if (rejected) parts.push(`${rejected} rejected`);
+      meta.textContent = parts.length ? parts.join(" · ") : "No changes";
+      return;
+    }
     const selected = state.files.filter((file) => file.selected);
     const additions = selected.reduce((sum, file) => sum + file.additions, 0);
     const deletions = selected.reduce((sum, file) => sum + file.deletions, 0);
@@ -15351,8 +15443,8 @@ function createPatchPreview(payload, patchRepo, { onResolved = null } = {}) {
       const empty = document.createElement("p");
       empty.className = "empty-state";
       empty.textContent = state.initialFileCount
-        ? "No patch files left to review."
-        : "No patch files returned.";
+        ? "Every file of this patch is decided."
+        : "This patch changes nothing.";
       list.append(empty);
     }
 
@@ -16715,6 +16807,8 @@ $("symbol-search-input").addEventListener("input", (event) => {
 $("symbol-search-input").addEventListener("keydown", (event) => {
   if (event.key === "Escape") closeSymbolSearch();
 });
+
+wireTerminalResize();
 
 $("terminal-close-btn").addEventListener("click", () => {
   setTerminalOpen(false);

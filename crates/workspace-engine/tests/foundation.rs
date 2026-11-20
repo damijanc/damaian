@@ -1323,6 +1323,73 @@ fn keeps_a_redaction_placeholder_the_file_already_holds() {
     fs::remove_dir_all(repo).unwrap();
 }
 
+/// Observation 99: `unchanged_paths` names the changes whose file already
+/// holds the proposed content. A new file, even an empty one, is a change.
+#[test]
+fn unchanged_paths_names_files_that_already_hold_the_proposed_content() {
+    let repo = temp_dir("patch-unchanged-paths");
+    write_fixture(&repo, "src/a.rs", "pub fn a() {}\n");
+    write_fixture(&repo, "src/b.rs", "pub fn b() {}\n");
+    let scanner = SecretScanner::default();
+    let config = test_config(&repo);
+    let engine = PatchEngine::new(
+        config.clone(),
+        test_audit(&repo, scanner.clone()),
+        scanner,
+        PathPolicy::new(&config),
+    );
+    let change = |path: &str, new_content: &str| ProposedChange {
+        path: path.to_string(),
+        new_content: new_content.to_string(),
+        status: None,
+        allow_restricted: false,
+    };
+
+    let unchanged = engine.unchanged_paths(
+        &repo,
+        &[
+            change("src/a.rs", "pub fn a() {}\n"),
+            change("src/b.rs", "pub fn b() -> u8 { 1 }\n"),
+            change("src/empty.rs", ""),
+        ],
+    );
+    assert_eq!(unchanged, ["src/a.rs"]);
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+/// A deletion arrives with empty content, so deleting an existing empty file
+/// must not be taken for "unchanged": it is kept and becomes a `deleted` file.
+#[test]
+fn deleting_an_empty_file_is_a_change_not_unchanged() {
+    let repo = temp_dir("patch-delete-empty-file");
+    write_fixture(&repo, "pkg/__init__.py", "");
+    let scanner = SecretScanner::default();
+    let config = test_config(&repo);
+    let engine = PatchEngine::new(
+        config.clone(),
+        test_audit(&repo, scanner.clone()),
+        scanner,
+        PathPolicy::new(&config),
+    );
+    let deletion = [ProposedChange {
+        path: "pkg/__init__.py".to_string(),
+        new_content: String::new(),
+        status: Some("deleted".to_string()),
+        allow_restricted: false,
+    }];
+
+    assert!(engine.unchanged_paths(&repo, &deletion).is_empty());
+    let patch = engine
+        .create_patch(&repo, &deletion, None, "remove init")
+        .unwrap();
+    assert_eq!(patch.files.len(), 1);
+    assert_eq!(patch.files[0].path, "pkg/__init__.py");
+    assert_eq!(patch.files[0].status, "deleted");
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
 // Rollback capture is faithful, per
 // `docs/specs/16_session_checkpoints_and_rewind.md` §5.2: redaction covers what
 // leaves the user's control, and a rollback snapshot is a local copy made so
@@ -3865,6 +3932,64 @@ fn chat_propose_patch_tool_call_with_restricted_path_feeds_error_back_for_retry(
         .unwrap();
     assert!(messages.iter().any(|message| {
         message.role == "tool" && message.content.contains("Cannot propose that patch")
+    }));
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+/// Observation 99: a `propose_patch` whose every file already holds the
+/// proposed content raises no card. The model is told the patch changes
+/// nothing and carries on; an unchanged file beside a real change is left out
+/// of the patch it does propose.
+#[test]
+fn chat_propose_patch_that_changes_nothing_is_fed_back_and_raises_no_card() {
+    let repo = temp_dir("chat-propose-patch-noop");
+    write_fixture(&repo, "README.md", "# Noop\n");
+    write_fixture(&repo, "src/a.rs", "pub fn a() {}\n");
+    let mut config = test_config(&repo);
+    config.model_providers.push(native_tool_provider());
+    let engine = WorkspaceEngine::new(config);
+    let call = |id: &str, files: serde_json::Value| ToolCall {
+        id: id.to_string(),
+        name: "propose_patch".to_string(),
+        arguments_json: serde_json::json!({"summary": "Touch a", "files": files}).to_string(),
+    };
+    let mut adapter = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![String::new(), String::new()],
+        vec![
+            vec![call(
+                "call_1",
+                serde_json::json!([{"path": "src/a.rs", "content": "pub fn a() {}\n"}]),
+            )],
+            vec![call(
+                "call_2",
+                serde_json::json!([
+                    {"path": "src/a.rs", "content": "pub fn a() {}\n"},
+                    {"path": "src/b.rs", "content": "pub fn b() {}\n"},
+                ]),
+            )],
+        ],
+    );
+    let mut on_token = |_token: &str| {};
+
+    let result = engine
+        .chat_orchestrator
+        .ask(&repo, "Add b", &[], &mut adapter, &mut on_token)
+        .unwrap();
+
+    let proposal = result.patch_proposal.expect("the second call proposes b");
+    let paths: Vec<&str> = proposal
+        .files
+        .iter()
+        .map(|file| file.path.as_str())
+        .collect();
+    assert_eq!(paths, ["src/b.rs"], "the unchanged a.rs is left out");
+    let messages = engine
+        .session_store
+        .read_messages(&result.session.id)
+        .unwrap();
+    assert!(messages.iter().any(|message| {
+        message.role == "tool" && message.content.contains("the patch changes nothing")
     }));
 
     fs::remove_dir_all(repo).unwrap();

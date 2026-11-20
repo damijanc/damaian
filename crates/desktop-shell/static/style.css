@@ -1206,6 +1206,12 @@ button:disabled {
   gap: 6px;
 }
 
+/* A settled patch card has nothing left to decide (observation 99); without
+   this the author `display` above keeps Apply 0 and Reject on screen. */
+.patch-actions[hidden] {
+  display: none;
+}
+
 /* `display` below is an author declaration, so it beats the UA `[hidden]`
    rule and the notice would sit there as an empty bordered box. */
 .patch-secret-notice[hidden] {
@@ -1934,9 +1940,14 @@ button:disabled {
   color: var(--muted);
 }
 
+/* The height is the user's: the top-edge handle sets --terminal-panel-height
+   (app.js clamps and persists it). The cap leaves the header and composer
+   room; the floor keeps the tab bar and a few rows of output. */
 .terminal-panel {
-  min-height: 220px;
-  max-height: min(360px, 38vh);
+  position: relative;
+  height: var(--terminal-panel-height, min(320px, 38vh));
+  min-height: 140px;
+  max-height: max(140px, calc(100vh - 220px));
   display: grid;
   grid-template-rows: auto minmax(0, 1fr);
   border-top: 1px solid var(--line);
@@ -1947,6 +1958,36 @@ button:disabled {
 
 .terminal-panel[hidden] {
   display: none;
+}
+
+/* A thin strip straddling the panel's top border, so the border itself is
+   what the user grabs. */
+.terminal-resize-handle {
+  position: absolute;
+  top: -4px;
+  right: 0;
+  left: 0;
+  z-index: 2;
+  height: 8px;
+  cursor: row-resize;
+  touch-action: none;
+}
+
+.terminal-resize-handle:hover,
+.terminal-resize-handle:focus-visible,
+.terminal-resize-handle.dragging {
+  outline: none;
+  background: linear-gradient(
+    transparent 3px,
+    var(--accent) 3px,
+    var(--accent) 5px,
+    transparent 5px
+  );
+}
+
+body.terminal-resizing {
+  cursor: row-resize;
+  user-select: none;
 }
 
 /* The close control would be a 28px square, which alone keeps the bar above

@@ -182,6 +182,34 @@ impl PatchEngine {
         }
     }
 
+    /// The changes whose file already holds exactly the proposed content, by
+    /// their requested path. Such a change edits nothing, so a model's
+    /// proposal leaves it out, and one that is all such changes is refused
+    /// (observation 99).
+    ///
+    /// Path errors are left to [`Self::create_patch`], which reports them.
+    pub fn unchanged_paths(
+        &self,
+        root_path: impl AsRef<Path>,
+        changes: &[ProposedChange],
+    ) -> Vec<String> {
+        changes
+            .iter()
+            // A deletion carries empty content, so deleting an existing empty
+            // file (`.gitkeep`, an empty `__init__.py`) would otherwise look
+            // unchanged. Removing a file is always a change.
+            .filter(|change| change.status.as_deref() != Some("deleted"))
+            .filter(|change| {
+                self.path_policy
+                    .resolve_for_write(&root_path, &change.path)
+                    .ok()
+                    .and_then(|target| read_existing(&target.absolute_path).ok().flatten())
+                    .is_some_and(|old| old == change.new_content)
+            })
+            .map(|change| change.path.clone())
+            .collect()
+    }
+
     pub fn create_patch(
         &self,
         root_path: impl AsRef<Path>,

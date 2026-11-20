@@ -2401,6 +2401,74 @@ fn app_js_offers_rewind_only_for_the_turns_own_files() {
     );
 }
 
+/// Observation 106: the terminal panel's height is the user's. A separator on
+/// its top edge sets `--terminal-panel-height`, clamped, persisted, and reset
+/// by double-click; the hard 360px cap is gone; the xterm element is still
+/// observed so a height change refits the terminal and resizes the pty.
+#[test]
+fn terminal_panel_has_a_persisted_resize_handle() {
+    let html = super::INDEX_HTML;
+    let panel = &html[html.find(r#"<section id="terminal-panel""#).expect("panel")..];
+    let panel = &panel[..panel.find("</section>").unwrap()];
+    assert!(panel.contains(r#"id="terminal-resize-handle""#), "{panel}");
+    assert!(panel.contains(r#"role="separator""#), "{panel}");
+
+    let css = super::STYLE_CSS;
+    let rule = &css[css.find(".terminal-panel {").expect("panel rule")..];
+    let rule = &rule[..rule.find('}').unwrap()];
+    assert!(
+        rule.contains("height: var(--terminal-panel-height,"),
+        "{rule}"
+    );
+    assert!(
+        !rule.contains("min(360px, 38vh)"),
+        "the old hard cap: {rule}"
+    );
+    assert!(css.contains(".terminal-resize-handle {"));
+    assert!(css.contains("cursor: row-resize;"));
+
+    let wire = app_js_function("wireTerminalResize");
+    for needle in [
+        "localStorage.getItem(terminalHeightStorageKey)",
+        "setPointerCapture(event.pointerId)",
+        "drag.startHeight + (drag.startY - event.clientY)",
+        "setTerminalHeight(panel.getBoundingClientRect().height, { persist: true })",
+        r#"addEventListener("dblclick", () => setTerminalHeight(null, { persist: true }))"#,
+        r#""ArrowUp""#,
+    ] {
+        assert!(wire.contains(needle), "wireTerminalResize lacks {needle}");
+    }
+    let set = app_js_function("setTerminalHeight");
+    assert!(
+        set.contains(
+            r#"setProperty("--terminal-panel-height", `${clampTerminalHeight(height)}px`)"#
+        )
+    );
+    assert!(set.contains("localStorage.setItem(terminalHeightStorageKey"));
+    assert!(super::APP_JS.contains("\nwireTerminalResize();\n"));
+    assert!(
+        app_js_function("createTerminalInstance")
+            .contains(r#"termResizeObserver.observe($("terminal-xterm"))"#),
+        "a height change must still refit xterm"
+    );
+}
+
+/// Observation 99: a patch card with no pending file is a record, not a
+/// decision. It drops Apply and Reject instead of offering "Apply 0".
+#[test]
+fn app_js_settles_a_patch_card_with_no_pending_file() {
+    let preview = app_js_function("createPatchPreview");
+    assert!(
+        preview
+            .contains(r#"const settled = !state.files.some((file) => file.state === "pending");"#),
+        "{preview}"
+    );
+    assert!(preview.contains("actions.hidden = settled;"));
+    assert!(preview.contains(r#"wrapper.classList.toggle("settled", settled);"#));
+    assert!(!preview.contains("No patch files left to review."));
+    assert!(super::STYLE_CSS.contains(".patch-actions[hidden] {\n  display: none;"));
+}
+
 fn app_js_function(name: &str) -> &'static str {
     let app = super::APP_JS;
     let start = app
