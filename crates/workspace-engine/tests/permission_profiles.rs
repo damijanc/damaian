@@ -604,6 +604,15 @@ fn weakening_cases() -> Vec<WeakeningCase> {
             "hook_review.repo_0123456789abcdef.lint=sha256:abc\n",
             Reported("hook_review.repo_0123456789abcdef.lint"),
         ),
+        // Spec 109 D9: a check the user did not configure would make Damaian
+        // run a command of the clone's choosing at every task's end, so a
+        // repository may only narrow the user's list.
+        case(
+            "project_checks_by_repository",
+            "",
+            "project_checks.repo_0123456789abcdef=make\n",
+            Reported("project_checks.repo_0123456789abcdef"),
+        ),
         // Spec 25: a language server is a program Damaian spawns, like the
         // shell (25 context.md §6).
         case(
