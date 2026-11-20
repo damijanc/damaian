@@ -28,6 +28,7 @@ fn key_for_overlay_field(field: &str) -> String {
         "web_domain_allowlist_by_repository" => "web_domain_allowlist.<repository_id>",
         "permission_profile_by_repository" => "permission_profile.<repository_id>",
         "hook_reviews_by_repository" => "hook_review.<repository_id>.<hook_id>",
+        "project_checks_by_repository" => "project_checks.<repository_id>",
         "language_servers" => "language_server.<language>",
         // The four definition families are checked field by field below.
         "model_providers" => "model_provider.<id>.",
