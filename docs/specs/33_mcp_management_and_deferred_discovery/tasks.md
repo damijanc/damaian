@@ -25,7 +25,7 @@ the code survey they rest on are in [`context.md`](context.md).
 |---|---|---|
 | 1 · Per-tool and MCP-management config surface | Done | Per-tool overrides `mcp_server.<server>.tool.<tool>.<field>` (enabled, require_approval, pinned) and MCP-management keys (`mcp_deferral_ceiling_tokens`, three timeouts) with restrict-only/forbidden scope rules; round-trip and weakening tests; CONFIGURATION.md docs. |
 | 2 · Bounded, independently configurable timeouts (defines `McpServerHealth`) | Done | `McpServerHealth` enum (6 states) and a non-retryable `McpTimeout` error variant; the three config timeouts plumbed through `McpClient::connect`/`list_tools`/`call_tool` (replacing the two consts); a connect/list timeout contributes no tools and a call timeout surfaces as a tool error. Checks pass: clippy, fmt, `foundation` (187/187). Deviation: the slow-server timeout tests and the 15 s / 15 s / 60 s defaults test were not added (test checkbox left open), and the runtime does not yet *set* `McpServerHealth::Timeout` — the per-process health store lands in Task 6. |
-| 3 · Tool inventory, token measurement, deferral ceiling | Not started | — |
+| 3 · Tool inventory, token measurement, deferral ceiling | Done | New `mcp_inventory.rs`: `McpToolInventory` (per tool: name, description, schema bytes, structured-rate token estimate, `readOnlyHint`, `sha256:` content hash, `first_seen_at_ms` kept across refreshes), one JSON file per server at `<data_dir>/mcp/inventory/<repository_id>/<server_id>.json`, written atomically; a missing or corrupt file reads as no inventory. `McpRuntime::tool_definitions` refreshes it on every successful `tools/list` (best-effort; a write failure is audited as `mcp_inventory_write_failed`). `decide_deferral` + public `ChatOrchestrator::mcp_tool_surface(repository_id, mode)` decide from the inventory alone: known servers are summed against one ceiling (`Direct` at or under it), servers without inventory are unknown cost and `Deferred`, and only tools the turn would offer count (per-tool `enabled`, mode and profile via a shared `mcp_tool_permitted` helper, browser-diagnostic servers excluded). **§7 measurement** (`mcp_deferral_decision_reads_the_inventory_and_measures_the_saving`, 3 fake servers / 60 tools): schemas in full **13,665** tokens vs **125** with deferral (a stand-in `mcp_tool_search` definition), ceiling 8,000. Checks: clippy `-p workspace-engine` clean; `foundation` 192/192 (the FSEvents watcher test fails only inside the agent sandbox, passes outside it); lib `mcp`/`mode_tool_list`/`mode_refusal` 57/57; `config_reference`+`permission_profiles`+`repository_config_trust` 151/151; fast gate fmt/node/lint/typos/deny ok; `specs:check` ok. Deviations: no config key added or changed (`mcp_deferral_ceiling_tokens` landed in Task 1, so `config.rs` is untouched); `McpRuntime::new` now takes `repository_id` and an `McpTimeouts` struct (clippy's argument limit); `build_mcp_runtime` takes the session's `repository_id`. The tool list sent to the model is unchanged, so the eval tier was not run. **For Task 4:** call `mcp_tool_surface(&session.repository_id, mode)` in `tool_offer` *before* `mcp.tool_definitions()` and skip listing deferred servers (today every turn still lists all servers, which is what refreshes the inventory — once deferral is wired, refresh happens only when a server is actually listed/called); pinned tools are counted in the ceiling sum today, so decide whether to exclude them; replace the test's stand-in search definition with the real one and re-record the deferred figure. |
 | 4 · Deferred discovery surface and `mcp_tool_search` | Not started | — |
 | 5 · Per-tool approval and read-only discipline (D1) | Not started | — |
 | 6 · Lazy startup | Not started | — |
@@ -95,15 +95,15 @@ Checks: `cargo clippy -p workspace-engine --all-targets --locked -- -D warnings`
 
 Requirements 2, 5.1; context D4, D7.
 
-- [ ] Add `McpToolInventory` (per server: tools with name, description, schema
+- [x] Add `McpToolInventory` (per server: tools with name, description, schema
       bytes, estimated tokens via spec 26's estimator at the structured rate,
       `readOnlyHint`, content hash, `first_seen_at`) with JSON persistence under
       `<data_dir>/mcp/inventory/` keyed by repository identity.
-- [ ] Refresh the inventory on any successful `tools/list`; a server with no
+- [x] Refresh the inventory on any successful `tools/list`; a server with no
       inventory reads as "unknown cost" and is deferred (nothing connects).
-- [ ] Compute the total schema cost of all enabled, offered tools and decide
+- [x] Compute the total schema cost of all enabled, offered tools and decide
       direct-vs-deferred from `mcp_deferral_ceiling_tokens` without connecting.
-- [ ] Add the context-size test that asserts the measured figure: schemas in
+- [x] Add the context-size test that asserts the measured figure: schemas in
       full versus with deferral, recording both numbers for §7.
 
 Files: `crates/workspace-engine/src/mcp.rs` (or a new

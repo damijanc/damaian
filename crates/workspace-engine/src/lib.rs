@@ -34,6 +34,7 @@ pub mod indexer;
 pub mod language;
 pub mod lsp;
 pub mod mcp;
+pub mod mcp_inventory;
 pub mod memory;
 pub mod mode;
 pub mod model;
@@ -190,6 +191,10 @@ pub use lsp::{
 pub use mcp::{
     McpClient, McpRuntime, McpServerRuntime, McpTool, McpToolResult, namespaced_tool_name,
     parse_namespaced_tool_name,
+};
+pub use mcp_inventory::{
+    McpDeferralDecision, McpInventoryTool, McpServerInventory, McpToolInventory, McpToolSurface,
+    decide_deferral, estimate_mcp_tool_tokens,
 };
 pub use memory::{
     EvidenceRef, EvidenceRefusal, ExplicitMemoryRequest, ExplicitMemoryRequestOutcome,

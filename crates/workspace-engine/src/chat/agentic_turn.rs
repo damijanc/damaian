@@ -48,7 +48,7 @@ impl ChatOrchestrator {
         apply_protected_paths_reminder(&mut messages, &active_protected, &self.scanner);
         // Per-turn MCP runtime: connects lazily, caches tool lists and
         // connections for this turn, and tears everything down on drop.
-        let mut mcp = self.build_mcp_runtime(&session.id);
+        let mut mcp = self.build_mcp_runtime(&session.id, &session.repository_id);
         // Layer 1 (`proposal.md` §5.2): the mode is captured once, here, before
         // any tool is offered, and never re-read later in the turn — a mode
         // change mid-turn must not take effect until the next turn (§5.4).

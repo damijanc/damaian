@@ -1,4 +1,6 @@
 use super::*;
+use crate::mcp_inventory::{McpDeferralDecision, McpToolInventory, decide_deferral};
+use crate::profile::ProfileCapabilities;
 
 /// The tools one turn offers the model, decided once before its first
 /// request (spec 20 Layer 1, `proposal.md` §5.2).
@@ -12,7 +14,67 @@ pub(super) struct ToolOffer {
     pub(super) native_tools: Option<Vec<ToolDefinition>>,
 }
 
+/// The mode and profile layers for one MCP tool. The turn's offer and the
+/// deferral decision both ask this, so the cost the ceiling is measured
+/// against is the cost of exactly the tools the turn would offer.
+fn mcp_tool_permitted(
+    mode: SessionMode,
+    capabilities: &ProfileCapabilities,
+    server_id: &str,
+    tool_name: &str,
+    read_only_hint: Option<bool>,
+) -> bool {
+    permits(
+        mode,
+        capabilities,
+        &ToolAction::McpCall {
+            server_id: server_id.to_string(),
+            tool_name: tool_name.to_string(),
+            arguments_json: String::new(),
+        },
+        None,
+        read_only_hint,
+    )
+    .is_allowed()
+}
+
 impl ChatOrchestrator {
+    /// Spec 33 §5.1 (D2, D4): whether this repository's MCP tools go to the
+    /// model directly or wait behind search, decided from the persisted
+    /// inventory alone — it connects to nothing and starts no process. A
+    /// server never listed for this repository is unknown cost and deferred.
+    ///
+    /// The cost counted is that of every tool the turn would offer: active,
+    /// non-browser-diagnostic servers; tools whose
+    /// `mcp_server.<server>.tool.<tool>.enabled` is not `false`; and the mode
+    /// and profile layers, read with the inventory's recorded read-only claim.
+    pub fn mcp_tool_surface(&self, repository_id: &str, mode: SessionMode) -> McpDeferralDecision {
+        let browser_mcp_server_ids = self.browser_diagnostic_mcp_server_ids();
+        let active = self.config.active_mcp_servers();
+        let server_ids: Vec<&str> = active
+            .iter()
+            .map(|server| server.id.as_str())
+            .filter(|id| !browser_mcp_server_ids.iter().any(|browser| browser == id))
+            .collect();
+        let inventory = McpToolInventory::load(&self.config.data_dir, repository_id, &server_ids);
+        let capabilities = self.config.profile_capabilities();
+        decide_deferral(
+            &inventory,
+            &server_ids,
+            self.config.mcp_deferral_ceiling_tokens,
+            |server_id, tool| {
+                self.config.mcp_tool_settings(server_id, &tool.name).enabled
+                    && mcp_tool_permitted(
+                        mode,
+                        &capabilities,
+                        server_id,
+                        &tool.name,
+                        tool.read_only_hint,
+                    )
+            },
+        )
+    }
+
     /// Filters every tool definition through the one permission matrix for
     /// the mode captured at the top of the turn. Withholding a tool anywhere
     /// else would be a second copy of the matrix.
@@ -222,18 +284,7 @@ impl ChatOrchestrator {
                     return false;
                 }
                 let hint = mcp.tool_read_only_hint(&server_id, &tool_name);
-                permits(
-                    mode,
-                    &capabilities,
-                    &ToolAction::McpCall {
-                        server_id,
-                        tool_name,
-                        arguments_json: String::new(),
-                    },
-                    None,
-                    hint,
-                )
-                .is_allowed()
+                mcp_tool_permitted(mode, &capabilities, &server_id, &tool_name, hint)
             }));
             tools
         });

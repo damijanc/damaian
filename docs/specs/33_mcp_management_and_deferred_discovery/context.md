@@ -95,7 +95,7 @@ manages. `crates/workspace-engine/src/chat.rs` (23,166 lines) is the orchestrato
   and adds the tool's schema to the turn's tool list from that round onward.
   This is the spec's "second step", costs no extra round trip, and only
   connects the server whose tool was actually chosen.
-- **D4 — inventory persistence (recommended).** The ceiling decision must not
+- **D4 — inventory persistence (decided in Task 3, 2026-11-21).** The ceiling decision must not
   require connecting, or "a session that uses no MCP tool starts no server"
   fails. Persist a `McpToolInventory` per server — tools with `name`,
   `description`, input-schema byte length and estimated tokens,
@@ -103,7 +103,10 @@ manages. `crates/workspace-engine/src/chat.rs` (23,166 lines) is the orchestrato
   `<data_dir>/mcp/inventory/`, refreshed on any successful connect/list. The
   deferral decision reads the persisted figure; a server with no inventory is
   treated as "unknown cost" and deferred, so nothing connects until searched or
-  called.
+  called. As built: one file per server,
+  `<data_dir>/mcp/inventory/<repository_id>/<server_id>.json`, so sessions
+  refreshing different servers never overwrite each other; a missing or corrupt
+  file reads as no inventory (deferred).
 - **D5 — health persistence (decided 2026-11-10; corrects §5.3).** `McpServerHealth`
   is defined in terms of *this session* (`Unknown` = "never contacted this
   session", `Failed` = "not retried automatically this session"), so persisting
@@ -131,5 +134,5 @@ manages. `crates/workspace-engine/src/chat.rs` (23,166 lines) is the orchestrato
 ## Open items not yet decided
 
 None. D2's default, D3, D5 and D6 were confirmed by the owner as written on
-2026-11-10, and D1 was already decided. D4 (inventory persistence) remains a
-recommendation to firm up in Task 3, not an open security or behaviour decision.
+2026-11-10, and D1 was already decided. D4 (inventory persistence) was firmed up in
+Task 3 as recorded above.

@@ -137,7 +137,8 @@ impl ChatOrchestrator {
         } else if let Some(mcp_call) = &pending.mcp_call {
             let summary = mcp_call_summary(&mcp_call.server_id, &mcp_call.tool_name);
             let content = if approved {
-                let mut mcp = self.build_mcp_runtime(&pending.session.id);
+                let mut mcp =
+                    self.build_mcp_runtime(&pending.session.id, &pending.session.repository_id);
                 // A fresh runtime has fetched no tool lists, and the read-only
                 // hint lives in them; without this every hint reads as `None`.
                 mcp.tool_definitions();

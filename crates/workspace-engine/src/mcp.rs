@@ -13,6 +13,7 @@ use crate::cancel::CancelToken;
 use crate::command_runner::kill_process_group;
 use crate::config::{McpServerConfig, McpTransport};
 use crate::error::{ClientError, Result};
+use crate::mcp_inventory::McpToolInventory;
 use crate::model::{ToolDefinition, escape_curl_config_value};
 use crate::process_registry::{ProcessKind, ProcessRegistry, RegistrationHandle};
 use serde::{Deserialize, Serialize};
@@ -700,6 +701,14 @@ fn parse_rpc_body(body: &str) -> Option<Value> {
 // Runtime
 // ---------------------------------------------------------------------------
 
+/// The three independently configured MCP budgets (spec 33 §5.4, D6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct McpTimeouts {
+    pub connect: Duration,
+    pub list: Duration,
+    pub call: Duration,
+}
+
 /// One active server plus its already-resolved auth token.
 pub struct McpServerRuntime {
     pub config: McpServerConfig,
@@ -722,6 +731,9 @@ pub struct McpRuntime {
     data_dir: Option<PathBuf>,
     /// Attribution for any server this runtime spawns.
     session_id: String,
+    /// The repository whose tool inventory a successful `tools/list`
+    /// refreshes (spec 33 D4). Empty for an inert runtime.
+    repository_id: String,
     connect_timeout: Duration,
     list_timeout: Duration,
     call_timeout: Duration,
@@ -733,9 +745,8 @@ impl McpRuntime {
         audit_log: AuditLog,
         data_dir: PathBuf,
         session_id: &str,
-        connect_timeout: Duration,
-        list_timeout: Duration,
-        call_timeout: Duration,
+        repository_id: &str,
+        timeouts: McpTimeouts,
     ) -> Self {
         Self {
             servers,
@@ -744,9 +755,10 @@ impl McpRuntime {
             audit_log: Some(audit_log),
             data_dir: Some(data_dir),
             session_id: session_id.to_string(),
-            connect_timeout,
-            list_timeout,
-            call_timeout,
+            repository_id: repository_id.to_string(),
+            connect_timeout: timeouts.connect,
+            list_timeout: timeouts.list,
+            call_timeout: timeouts.call,
         }
     }
 
@@ -760,6 +772,7 @@ impl McpRuntime {
             audit_log: None,
             data_dir: None,
             session_id: String::new(),
+            repository_id: String::new(),
             connect_timeout: Duration::ZERO,
             list_timeout: Duration::ZERO,
             call_timeout: Duration::ZERO,
@@ -856,6 +869,7 @@ impl McpRuntime {
                                 ("toolCount", tools.len().to_string()),
                             ],
                         );
+                        self.refresh_inventory(&server_id, &tools);
                         self.tools.insert(server_id.clone(), tools);
                     }
                     Err(error) => {
@@ -876,6 +890,31 @@ impl McpRuntime {
             }
         }
         definitions
+    }
+
+    /// Records a successful listing in the persisted inventory (spec 33 D4),
+    /// so a later turn can decide direct-versus-deferred without connecting.
+    /// Best-effort: a failed write leaves the previous record, and an absent
+    /// record reads as unknown cost and defers, so a failure here can only
+    /// make the surface more conservative, never offer more.
+    fn refresh_inventory(&self, server_id: &str, tools: &[McpTool]) {
+        let Some(data_dir) = &self.data_dir else {
+            return;
+        };
+        if self.repository_id.is_empty() {
+            return;
+        }
+        if let Err(error) =
+            McpToolInventory::record_listing(data_dir, &self.repository_id, server_id, tools)
+        {
+            self.record(
+                "mcp_inventory_write_failed",
+                &[
+                    ("server", server_id.to_string()),
+                    ("error", error.to_string()),
+                ],
+            );
+        }
     }
 
     /// Executes a tool call, returning the flattened result. Errors are the

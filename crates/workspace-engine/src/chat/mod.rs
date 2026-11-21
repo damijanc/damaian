@@ -38,7 +38,7 @@ use crate::hash::{create_id, file_hash, now_millis, repository_id_for_root};
 use crate::hooks::{HookContext, HookDispatcher, HookEvent, HookOutcome, Verdict};
 use crate::indexer::{ProjectIndexer, SearchResult};
 use crate::language::detect_language;
-use crate::mcp::{McpRuntime, McpServerRuntime, parse_namespaced_tool_name};
+use crate::mcp::{McpRuntime, McpServerRuntime, McpTimeouts, parse_namespaced_tool_name};
 use crate::memory::{
     EvidenceRef as MemoryEvidence, MemoryCategory, MemoryEntry, MemoryMatchReason, MemoryProposal,
     MemoryProvenance, MemoryScope, MemoryState, MemoryStore, ProjectIdentity, ProposalOrigin,

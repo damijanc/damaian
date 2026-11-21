@@ -5,7 +5,7 @@ impl ChatOrchestrator {
     /// each HTTP server's auth token up front. Returns an inert runtime when no
     /// servers are active (the common case), so there's zero overhead and no
     /// behavior change for users who don't configure MCP.
-    pub(super) fn build_mcp_runtime(&self, session_id: &str) -> McpRuntime {
+    pub(super) fn build_mcp_runtime(&self, session_id: &str, repository_id: &str) -> McpRuntime {
         let servers: Vec<McpServerRuntime> = self
             .config
             .active_mcp_servers()
@@ -30,9 +30,12 @@ impl ChatOrchestrator {
                 self.audit_log.clone(),
                 self.config.data_dir.clone(),
                 session_id,
-                std::time::Duration::from_millis(self.config.mcp_connect_timeout_ms),
-                std::time::Duration::from_millis(self.config.mcp_list_timeout_ms),
-                std::time::Duration::from_millis(self.config.mcp_call_timeout_ms),
+                repository_id,
+                McpTimeouts {
+                    connect: std::time::Duration::from_millis(self.config.mcp_connect_timeout_ms),
+                    list: std::time::Duration::from_millis(self.config.mcp_list_timeout_ms),
+                    call: std::time::Duration::from_millis(self.config.mcp_call_timeout_ms),
+                },
             )
         }
     }

@@ -6538,6 +6538,292 @@ done
     );
 }
 
+/// A stdio MCP server that answers `initialize` and `tools/list` with
+/// `tools_array`, the `mcp_stdio_client_handshakes_lists_and_calls_tools`
+/// script shape. `tools_array` must contain no `%` or `'`: it is spliced into
+/// a single-quoted `printf` format.
+fn write_listing_mcp_server(dir: &Path, name: &str, tools_array: &str) -> PathBuf {
+    assert!(!tools_array.contains('%') && !tools_array.contains('\''));
+    let script = dir.join(format!("{name}.sh"));
+    fs::write(
+        &script,
+        format!(
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed 's/.*"id":\([0-9]*\).*/\1/')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{{"jsonrpc":"2.0","id":%s,"result":{{"protocolVersion":"2025-06-18","capabilities":{{}},"serverInfo":{{"name":"fake","version":"0"}}}}}}\n' "$id" ;;
+    *'"method":"tools/list"'*)
+      printf '{{"jsonrpc":"2.0","id":%s,"result":{{"tools":{tools_array}}}}}\n' "$id" ;;
+  esac
+done
+"#
+        ),
+    )
+    .unwrap();
+    script
+}
+
+/// `count` tools shaped like a real issue-tracker server's: a sentence of
+/// description and four described, typed parameters each. Real servers run
+/// larger (enum lists, nested filter objects), so this under-states a real
+/// configuration's cost rather than inflating it.
+fn realistic_mcp_tools(prefix: &str, count: usize) -> Vec<serde_json::Value> {
+    (0..count)
+        .map(|index| {
+            serde_json::json!({
+                "name": format!("{prefix}_tool_{index}"),
+                "description": format!(
+                    "Performs operation {index} of the {prefix} service against the \
+                     configured account and returns the matching records as JSON."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "owner": { "type": "string", "description": "Account or organisation that owns the resource." },
+                        "resource": { "type": "string", "description": "Name of the repository, project, or workspace." },
+                        "query": { "type": "string", "description": "Free-text filter applied to titles and bodies." },
+                        "limit": { "type": "integer", "description": "Maximum number of results to return (default 30)." }
+                    },
+                    "required": ["owner", "resource"]
+                },
+                "annotations": { "readOnlyHint": index % 2 == 0 }
+            })
+        })
+        .collect()
+}
+
+/// The `McpTool` a server's `tools/list` entry parses to.
+fn mcp_tool_from_json(tool: &serde_json::Value) -> workspace_engine::McpTool {
+    workspace_engine::McpTool {
+        name: tool["name"].as_str().unwrap().to_string(),
+        description: tool["description"].as_str().unwrap_or_default().to_string(),
+        input_schema_json: tool["inputSchema"].to_string(),
+        read_only_hint: tool["annotations"]["readOnlyHint"].as_bool(),
+    }
+}
+
+/// Spec 33 Task 3 (§5.1, §7, D2, D4, D7): the deferral decision is made from
+/// the persisted inventory without connecting, a successful `tools/list`
+/// refreshes it, and — the work package's primary claim — schemas sent in
+/// full cost measurably more than the deferred surface.
+#[test]
+fn mcp_deferral_decision_reads_the_inventory_and_measures_the_saving() {
+    use workspace_engine::{
+        McpToolInventory, McpToolSurface, SessionMode, estimate_mcp_tool_tokens,
+    };
+
+    let repo = temp_dir("mcp-deferral-measure");
+    write_fixture(&repo, "README.md", "# MCP deferral measurement\n");
+    let mut config = test_config(&repo);
+    config.model_providers.push(ModelProviderConfig {
+        id: "openai".to_string(),
+        label: "OpenAI".to_string(),
+        base_url: String::new(),
+        api_key_env: String::new(),
+        models: Vec::new(),
+        supports_native_tools: true,
+        max_output_tokens: None,
+        context_token_budget: None,
+        context_window: None,
+        provider_reports_usage: true,
+        price_per_million_input_tokens: None,
+        price_per_million_output_tokens: None,
+        price_per_million_cached_input_tokens: None,
+        supports_explicit_cache_breakpoints: false,
+    });
+    // Several servers: one large (an issue tracker's ~40 tools), one medium,
+    // one small.
+    let servers = [("tracker", 40), ("errors", 15), ("docs", 5)];
+    let scripts = repo.join("servers");
+    fs::create_dir_all(&scripts).unwrap();
+    let mut listed = Vec::new();
+    for (id, count) in servers {
+        let tools = realistic_mcp_tools(id, count);
+        let array = serde_json::to_string(&tools).unwrap();
+        let script = write_listing_mcp_server(&scripts, id, &array);
+        config.mcp_servers.push(McpServerConfig {
+            id: id.to_string(),
+            label: id.to_string(),
+            transport: McpTransport::Stdio,
+            command: "sh".to_string(),
+            args: vec![script.to_string_lossy().to_string()],
+            env: Vec::new(),
+            url: String::new(),
+            auth_token_env: String::new(),
+            enabled: true,
+            require_approval: true,
+        });
+        listed.push((id, tools));
+    }
+    let ceiling = config.mcp_deferral_ceiling_tokens;
+    assert_eq!(ceiling, 8_000, "D2's default ceiling");
+    let data_dir = config.data_dir.clone();
+    let engine = WorkspaceEngine::new(config);
+    let repository_id = workspace_engine::hash::repository_id_for_root(&repo);
+
+    // Before any listing: every server is unknown cost and deferred, and the
+    // decision started nothing.
+    let cold = engine
+        .chat_orchestrator
+        .mcp_tool_surface(&repository_id, SessionMode::Code);
+    assert_eq!(cold.unknown_servers.len(), 3, "{cold:?}");
+    assert_eq!(cold.known_tokens, 0);
+    for (id, _) in servers {
+        assert_eq!(cold.surface_for(id), McpToolSurface::Deferred);
+    }
+    let registry = workspace_engine::ProcessRegistry::open(&data_dir).unwrap();
+    assert!(
+        registry.entries().unwrap().is_empty(),
+        "deciding the surface must not start a server"
+    );
+    assert!(
+        !McpToolInventory::directory(&data_dir, &repository_id).exists(),
+        "and must not write an inventory it did not list"
+    );
+
+    // A turn lists every server today (Task 4 replaces that surface); each
+    // successful `tools/list` refreshes the inventory.
+    let mut adapter = MockModelAdapter::new("Done.");
+    ask_with_cancel(
+        &engine,
+        &repo,
+        "Which tools can you use?",
+        &mut adapter,
+        &CancelToken::new(),
+        &mut |_token| {},
+    );
+    for (id, tools) in &listed {
+        let record = McpToolInventory::load_server(&data_dir, &repository_id, id)
+            .unwrap_or_else(|| panic!("a successful tools/list records {id}"));
+        assert_eq!(record.tools.len(), tools.len());
+        assert!(record.tools.iter().all(|tool| tool.schema_bytes > 0
+            && tool.estimated_tokens > 0
+            && tool.content_hash.starts_with("sha256:")
+            && tool.first_seen_at_ms > 0));
+        assert_eq!(record.tools[0].read_only_hint, Some(true));
+        assert_eq!(record.tools[1].read_only_hint, Some(false));
+    }
+
+    // The full figure, measured independently of the inventory: D7's estimate
+    // over every listed tool's description and serialized input schema.
+    let full: usize = listed
+        .iter()
+        .flat_map(|(_, tools)| tools)
+        .map(|tool| estimate_mcp_tool_tokens(&mcp_tool_from_json(tool)))
+        .sum();
+    let warm = engine
+        .chat_orchestrator
+        .mcp_tool_surface(&repository_id, SessionMode::Code);
+    assert!(warm.unknown_servers.is_empty(), "{warm:?}");
+    assert_eq!(
+        warm.known_tokens, full,
+        "the inventory records what was listed"
+    );
+    assert!(full > ceiling, "this configuration is over the ceiling");
+    assert_eq!(warm.known_surface, McpToolSurface::Deferred);
+
+    // The deferred figure: what §5.1's stage 1 sends instead — one search tool.
+    // A stand-in for the definition Task 4 adds; Task 4 re-measures with its
+    // real definition.
+    let search_stand_in = workspace_engine::McpTool {
+        name: "mcp_tool_search".to_string(),
+        description: "Search the configured MCP servers for a tool by capability. Returns \
+                      matching tool names, their server, and a one-line description; call a \
+                      returned name to use it."
+            .to_string(),
+        input_schema_json: r#"{"type":"object","properties":{"query":{"type":"string","description":"What the tool should do, in a few words."}},"required":["query"]}"#.to_string(),
+        read_only_hint: Some(true),
+    };
+    let deferred = estimate_mcp_tool_tokens(&search_stand_in);
+    eprintln!(
+        "spec 33 §7: {} servers, {} tools — schemas in full {full} tokens, \
+         with deferral {deferred} tokens (ceiling {ceiling})",
+        servers.len(),
+        listed.iter().map(|(_, tools)| tools.len()).sum::<usize>(),
+    );
+    assert!(
+        deferred * 10 < full,
+        "deferral must be measurably lower: full {full}, deferred {deferred}"
+    );
+
+    // Ask mode offers only read-only-claimed tools, so the cost counted halves.
+    let ask = engine
+        .chat_orchestrator
+        .mcp_tool_surface(&repository_id, SessionMode::Ask);
+    assert!(
+        ask.known_tokens < warm.known_tokens && ask.known_tokens > 0,
+        "{ask:?}"
+    );
+
+    // Still nothing running once the turn is over, and a further decision
+    // connects to nothing.
+    assert!(registry.entries().unwrap().is_empty());
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+/// A small configuration stays direct, and a disabled tool does not count.
+#[test]
+fn mcp_deferral_decision_keeps_a_small_configuration_direct() {
+    use workspace_engine::{McpToolInventory, McpToolSurface, SessionMode};
+
+    let repo = temp_dir("mcp-deferral-small");
+    write_fixture(&repo, "README.md", "# MCP deferral small\n");
+    let mut config = test_config(&repo);
+    config.apply_overlay(
+        ConfigOverlay::parse(
+            "mcp_server.small.command=unused-never-started\n\
+             mcp_server.small.enabled=true\n\
+             mcp_server.small.tool.small_tool_1.enabled=false\n",
+        )
+        .unwrap(),
+    );
+    let data_dir = config.data_dir.clone();
+    let repository_id = workspace_engine::hash::repository_id_for_root(&repo);
+    let tools: Vec<workspace_engine::McpTool> = realistic_mcp_tools("small", 3)
+        .iter()
+        .map(mcp_tool_from_json)
+        .collect();
+    McpToolInventory::record_listing(&data_dir, &repository_id, "small", &tools).unwrap();
+    let engine = WorkspaceEngine::new(config);
+
+    let decision = engine
+        .chat_orchestrator
+        .mcp_tool_surface(&repository_id, SessionMode::Code);
+    assert_eq!(decision.surface_for("small"), McpToolSurface::Direct);
+    let enabled_cost: usize = [&tools[0], &tools[2]]
+        .iter()
+        .map(|tool| workspace_engine::estimate_mcp_tool_tokens(tool))
+        .sum();
+    assert_eq!(
+        decision.known_tokens, enabled_cost,
+        "a disabled tool costs nothing"
+    );
+
+    // A repository may lower the ceiling (D2); at zero even this is deferred.
+    let mut lowered = test_config(&repo);
+    lowered.apply_overlay(
+        ConfigOverlay::parse(
+            "mcp_server.small.command=unused-never-started\n\
+             mcp_server.small.enabled=true\n\
+             mcp_deferral_ceiling_tokens=0\n",
+        )
+        .unwrap(),
+    );
+    let lowered = WorkspaceEngine::new(lowered);
+    assert_eq!(
+        lowered
+            .chat_orchestrator
+            .mcp_tool_surface(&repository_id, SessionMode::Code)
+            .surface_for("small"),
+        McpToolSurface::Deferred
+    );
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
 #[test]
 fn mcp_kill_switch_and_allowlist_gate_active_servers() {
     let base = "mcp_server.a.command=a-cmd\n\
