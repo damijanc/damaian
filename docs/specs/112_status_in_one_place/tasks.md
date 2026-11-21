@@ -34,6 +34,8 @@ The full seven-check gate passed in CI on 2026-11-20 (Quality run 44697297442, o
 
 **Fixed 2026-11-20 (was open):** reloading a session restored a pending decision's card only for a question or for a turn the startup recovery sweep reattached; a command, patch or plan paused while the app runs got the composer line and no card. A reload now reads the card with `GET /api/pending-card`, built on the engine's side-effect-free `read_pending_approval` (the sweep's per-task reader without its fail-and-audit), and draws it with the live builders; see spec 107's note of the same date. Tests: `recovery::tests::a_reload_reads_the_pending_card_of_every_decision_kind`, `…plan_review_in_the_live_shape`, `reading_a_pending_card_writes_nothing`, `a_settled_task_has_no_pending_card`, `tests::app_js_redraws_a_live_pending_card_on_reload`. Checked by hand with `serves_the_ui_for_manual_inspection` on port 4911: a live command pause, then a switch away and back, redrew the card, and Reject resumed through `/api/resume-command-stream`.
 
+Both 2026-11-20 fixes passed the full seven-check gate in CI on 2026-11-20 (Quality run 44883576383).
+
 ## Task 1 · Classes and tokens (req 8)
 
 No behaviour change.
