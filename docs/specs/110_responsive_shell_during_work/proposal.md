@@ -1,7 +1,7 @@
 # Feature Spec: A Responsive Shell While Damaian Works
 
-Status: In progress (specified 2026-11-11; started 2026-11-12; Task 1 done,
-Tasks 1b and 1c ready; Tasks 1, 1b, 1c, 2–4 in [tasks.md](tasks.md))
+Status: In progress (specified 2026-11-11; started 2026-11-12; Tasks 1, 1c
+and 3 done, Tasks 1b and 2 not started; Tasks 1, 1b, 1c, 2–4 in [tasks.md](tasks.md))
 Order: 110 of 110
 Plan: none. Written from the owner's spec 33 Task 1 run on 2026-11-11; the
 code survey and decisions are in [context.md](context.md).

@@ -11,7 +11,6 @@ let sessionHasRecordedDiagnostics = false;
 let apiToken = "";
 let bootstrapPromise = null;
 let bootstrapError = null;
-let chatSubmitting = false;
 let pinnedContextFiles = [];
 // Repository-relative root paths for the selected repository, newest map
 // first. Used to qualify a basename or a patch file by the root that owns it
@@ -259,18 +258,42 @@ function toast(message, { duration } = {}) {
   );
 }
 
+// A response body as the object every route answers. A refusal is JSON
+// (`{"error": …, "code": …}`); anything that is not a JSON object is kept as
+// the error text, so callers read one shape.
+function parseApiPayload(text) {
+  try {
+    const payload = JSON.parse(text);
+    if (payload && typeof payload === "object" && !Array.isArray(payload)) return payload;
+  } catch {
+    // Not JSON: the text itself is the message.
+  }
+  return { error: text };
+}
+
+// The error a refused request throws: the route's own message, never its JSON
+// (spec 110 Task 3 — a 409 from any route reads as a sentence). `status` and
+// `payload` stay on it for callers that branch on `code`.
+function refusalError(response, text) {
+  const payload = parseApiPayload(text);
+  const message =
+    (typeof payload.error === "string" && payload.error.trim()) ||
+    (typeof payload.message === "string" && payload.message.trim()) ||
+    response.statusText ||
+    `Request failed (${response.status})`;
+  const error = new Error(message);
+  error.payload = payload;
+  error.status = response.status;
+  return error;
+}
+
 async function api(path, options = {}, retriedAuth = false) {
   if (isProtectedApiPath(path)) {
     await ensureDesktopApiReady();
   }
   const response = await fetch(apiUrl(path), withApiToken(path, options));
   const text = await response.text();
-  let payload;
-  try {
-    payload = JSON.parse(text);
-  } catch {
-    payload = { error: text };
-  }
+  const payload = parseApiPayload(text);
   if (response.status === 401 && isProtectedApiPath(path) && !retriedAuth) {
     apiToken = "";
     bootstrapError = null;
@@ -281,9 +304,7 @@ async function api(path, options = {}, retriedAuth = false) {
   if (!response.ok || payload.error) {
     // The commit dialog branches on `code` (a rewritten message, a failed
     // hook, HEAD moving) instead of parsing prose.
-    const error = new Error(payload.error || response.statusText);
-    error.payload = payload;
-    throw error;
+    throw refusalError(response, text);
   }
   // An answer from the API is proof it is available, whichever way the token
   // arrived.
@@ -350,7 +371,7 @@ function startBootstrap() {
       if (!token) throw new Error("Desktop API token missing from Tauri bootstrap");
       apiToken = token;
       setDesktopApiBanner(null);
-      if (!chatSubmitting) $("ask-btn").disabled = false;
+      if (!sessionSubmitting()) $("ask-btn").disabled = false;
       // Before the first session renders, so its messages are drawn once with
       // the setting already known.
       await refreshWorkersEnabled();
@@ -371,7 +392,7 @@ function startBootstrap() {
     })
     .catch((error) => {
       bootstrapError = error;
-      if (!chatSubmitting) $("ask-btn").disabled = false;
+      if (!sessionSubmitting()) $("ask-btn").disabled = false;
       setDesktopApiBanner(`Desktop API unavailable: ${error.message}`);
       toast(`Desktop API unavailable: ${error.message}`);
     });
@@ -1559,7 +1580,7 @@ let repoActionCurrent = null;
 // soon as the first one committed.
 let commitPreparing = false;
 // Covers the `/api/findings-repair` request before `sendChatPrompt` sets
-// `chatSubmitting`, so a double click cannot start two repairs.
+// `sessionSubmitting()`, so a double click cannot start two repairs.
 let findingsRepairPending = false;
 
 function openFindingIds(severity) {
@@ -1606,7 +1627,7 @@ function renderRepoAction() {
   slot.dataset.tone = action.tone || "";
   const main = $("repo-action-main");
   main.textContent = action.label;
-  main.disabled = chatSubmitting || findingsRepairPending || commitPreparing;
+  main.disabled = sessionSubmitting() || findingsRepairPending || commitPreparing;
   const more = $("repo-action-more");
   more.hidden = !action.more;
   if (action.more) {
@@ -6690,6 +6711,7 @@ function startTurnIndicator(target, onStop = null) {
   }
   target.body.after(row);
   running.homes.add(row);
+  running.liveMessage = target.message;
   observeStatusHome(row);
 
   const startedAt = Date.now();
@@ -6728,7 +6750,7 @@ function startTurnIndicator(target, onStop = null) {
     // Read by the usage row, so the turn's duration is the clock the user
     // watched rather than a second timing that could disagree with it.
     startedAt,
-    // The composer's Stop for a turn this window streams (`currentTurn`).
+    // The composer's Stop for a turn this window streams (`windowTurnFor`).
     action: running,
     phase(payload) {
       if (done) return;
@@ -8602,7 +8624,7 @@ async function refreshWorkersEnabled() {
   }
   // Redraw the open conversation so its blocks gain or lose the action. Not
   // during a turn: the next load redraws it anyway.
-  if (changed && currentSessionId && !chatSubmitting) {
+  if (changed && currentSessionId && !sessionSubmitting()) {
     void loadSession(currentSessionId).catch((error) => toast(error.message));
   }
 }
@@ -9008,7 +9030,7 @@ function renderWorkerResultCards(workerReturns) {
     action.className = "btn-sm btn-primary";
     action.textContent = "Continue with result";
     action.addEventListener("click", async () => {
-      if (chatSubmitting) {
+      if (sessionSubmitting()) {
         toast("A turn is already running.");
         return;
       }
@@ -11649,7 +11671,7 @@ function renderFindingsPanel() {
   wireFileReferences(list, repo());
 
   const fix = $("findings-fix-btn");
-  fix.disabled = findingsSelection.size === 0 || chatSubmitting;
+  fix.disabled = findingsSelection.size === 0 || sessionSubmitting();
   fix.textContent = findingsSelection.size
     ? `Fix selected (${findingsSelection.size})`
     : "Fix selected";
@@ -11769,7 +11791,7 @@ async function fixSelectedFindings() {
 // the prompt, and the agentic chat turn runs it. Shared by Fix selected and the
 // repo bar's Fix N errors / warnings.
 async function repairFindings(ids) {
-  if (chatSubmitting || findingsRepairPending) {
+  if (sessionSubmitting() || findingsRepairPending) {
     toast("A turn is already running");
     return;
   }
@@ -11808,7 +11830,7 @@ async function repairFindings(ids) {
     });
     if (!send) return;
     findingsSelection.clear();
-    // `sendChatPrompt` sets `chatSubmitting` before its first await, which
+    // `sendChatPrompt` begins its window turn before its first await, which
     // keeps the buttons disabled from here.
     findingsRepairPending = false;
     closeFindingsPopover();
@@ -12047,7 +12069,9 @@ async function setSessionArchived(projectPath, session, archived) {
   if (normalized === repo()) {
     await loadSessions(currentSessionId || "", false);
   } else {
-    await loadProjectSessions(normalized);
+    // Not `loadProjectSessions`, which skips while another load is in flight
+    // and would draw that older list.
+    await fetchProjectSessions(normalized);
     renderProjectList();
   }
   if (workersEnabled) refreshWorkersAfterAction(normalized);
@@ -12139,15 +12163,32 @@ function _renderSessionList() {
   renderProjectList();
 }
 
+// Sidebar fetches of one project overlap while sessions work: the working-set
+// refresh, a turn's end, an archive, a rename. Each answer is newer than the
+// fetches started before it, so one that arrives after a later fetch's answer
+// is dropped — a list read before an archive never puts the archived session
+// back (spec 110 Task 3). Returns the project's newest known list.
+let projectSessionsFetches = 0;
+const projectSessionsApplied = new Map();
+
+async function fetchProjectSessions(projectPath) {
+  const fetchNumber = ++projectSessionsFetches;
+  const payload = await api(`/api/sessions?repo=${encodeURIComponent(projectPath)}`);
+  if (fetchNumber > (projectSessionsApplied.get(projectPath) || 0)) {
+    projectSessionsApplied.set(projectPath, fetchNumber);
+    projectSessionsByPath.set(projectPath, payload.sessions || []);
+  }
+  return projectSessionsByPath.get(projectPath) || [];
+}
+
 async function loadProjectSessions(projectPath) {
   const normalized = normalizeProjectPath(projectPath);
   if (!normalized || projectSessionsLoading.has(normalized)) return;
   projectSessionsLoading.add(normalized);
   try {
-    const payload = await api(`/api/sessions?repo=${encodeURIComponent(normalized)}`);
-    projectSessionsByPath.set(normalized, payload.sessions || []);
+    const sessions = await fetchProjectSessions(normalized);
     if (normalized === repo()) {
-      renderSessionOptions(payload.sessions || []);
+      renderSessionOptions(sessions);
     }
   } finally {
     projectSessionsLoading.delete(normalized);
@@ -12170,16 +12211,13 @@ async function refreshSessionStates(paths = [...projectSessionsByPath.keys()]) {
     );
   const changed = await Promise.all(
     paths.map(async (path) => {
-      let payload;
+      const before = signature(projectSessionsByPath.get(path));
       try {
-        payload = await api(`/api/sessions?repo=${encodeURIComponent(path)}`);
+        await fetchProjectSessions(path);
       } catch {
         return false;
       }
-      const sessions = payload.sessions || [];
-      const before = signature(projectSessionsByPath.get(path));
-      projectSessionsByPath.set(path, sessions);
-      return before !== signature(sessions);
+      return before !== signature(projectSessionsByPath.get(path));
     }),
   );
   if (changed.some(Boolean)) renderProjectList();
@@ -12204,14 +12242,13 @@ async function startNewSession(projectPath = repo()) {
 async function renameSessionForProject(projectPath, session) {
   const title = await promptDialog("Session name", session.title);
   if (!title?.trim()) return;
-  const payload = await api(
-    "/api/session-rename",
-    form({ session_id: session.id, title: title.trim() }),
-  );
+  await api("/api/session-rename", form({ session_id: session.id, title: title.trim() }));
+  // The open session stays open: renaming another one, even while a turn
+  // runs, only redraws its row (spec 110 Task 3).
   if (normalizeProjectPath(projectPath) === repo()) {
-    await loadSessions(payload.session.id, false);
+    await loadSessions(currentSessionId || "", false);
   } else {
-    await loadProjectSessions(projectPath);
+    await fetchProjectSessions(normalizeProjectPath(projectPath));
     renderProjectList();
   }
   toast("Session renamed");
@@ -12231,7 +12268,7 @@ async function deleteSessionForProject(projectPath, session, { confirmed = false
   } else if (normalized === repo()) {
     await loadSessions(currentSessionId || "", false);
   } else {
-    await loadProjectSessions(normalized);
+    await fetchProjectSessions(normalized);
     renderProjectList();
   }
   toast("Session deleted");
@@ -12257,8 +12294,7 @@ async function exportSessionDownload(session) {
   await ensureDesktopApiReady();
   const response = await fetch(apiUrl(path), withApiToken(path, {}));
   if (!response.ok) {
-    const text = await response.text();
-    throw new Error(text || response.statusText);
+    throw refusalError(response, await response.text());
   }
   const filename =
     exportFilenameFromDisposition(response.headers.get("content-disposition")) ||
@@ -12928,7 +12964,7 @@ function createQuestionCard(question, questionRepo, { answered = null, onAnswer 
       settle(value);
       return;
     }
-    if (chatSubmitting) {
+    if (sessionSubmitting()) {
       toast("A turn is already running");
       return;
     }
@@ -12942,7 +12978,8 @@ function createQuestionCard(question, questionRepo, { answered = null, onAnswer 
     const indicator = startTurnIndicator(assistantMessage);
     let assistantText = "";
     let streamError = null;
-    chatSubmitting = true;
+    const turn = beginWindowTurn();
+    turn.action = indicator.action;
     setComposerBusy();
     try {
       await streamResumeAnswerRequest(
@@ -12974,10 +13011,7 @@ function createQuestionCard(question, questionRepo, { answered = null, onAnswer 
               updateChatMessage(assistantMessage, assistantText);
             }
             appendProposals(assistantMessage, payload, questionRepo);
-            if (payload.sessionId) {
-              currentSessionId = payload.sessionId;
-              localStorage.setItem(lastSessionStorageKey(), currentSessionId);
-            }
+            followTurnSession(indicator?.action, payload.sessionId);
             appendContextDisclosure(assistantMessage.body, payload.contextFiles || []);
             appendTurnNotes(assistantMessage.body, payload.turnNotes);
             markMessageUsage(assistantMessage, payload.usage, null);
@@ -12993,7 +13027,7 @@ function createQuestionCard(question, questionRepo, { answered = null, onAnswer 
       streamError = error;
     } finally {
       indicator.finish("failed");
-      chatSubmitting = false;
+      turn.end();
       setComposerBusy();
     }
     if (streamError) {
@@ -13119,7 +13153,7 @@ function createFetchApproval(proposal, proposalRepo) {
   deny.addEventListener("click", () => void decide("deny", "Not fetched"));
 
   async function decide(decision, settledText) {
-    if (chatSubmitting) {
+    if (sessionSubmitting()) {
       toast("A turn is already running");
       return;
     }
@@ -13132,7 +13166,8 @@ function createFetchApproval(proposal, proposalRepo) {
     const indicator = startTurnIndicator(assistantMessage);
     let assistantText = "";
     let streamError = null;
-    chatSubmitting = true;
+    const turn = beginWindowTurn();
+    turn.action = indicator.action;
     setComposerBusy();
     try {
       await streamResumeFetchRequest(
@@ -13164,10 +13199,7 @@ function createFetchApproval(proposal, proposalRepo) {
               updateChatMessage(assistantMessage, assistantText);
             }
             appendProposals(assistantMessage, payload, proposalRepo);
-            if (payload.sessionId) {
-              currentSessionId = payload.sessionId;
-              localStorage.setItem(lastSessionStorageKey(), currentSessionId);
-            }
+            followTurnSession(indicator?.action, payload.sessionId);
             if (payload.taskId) assistantMessage.message.dataset.taskId = payload.taskId;
             appendContextDisclosure(assistantMessage.body, payload.contextFiles || []);
             appendTurnNotes(assistantMessage.body, payload.turnNotes);
@@ -13184,7 +13216,7 @@ function createFetchApproval(proposal, proposalRepo) {
       streamError = error;
     } finally {
       indicator.finish("failed");
-      chatSubmitting = false;
+      turn.end();
       setComposerBusy();
     }
     if (streamError) {
@@ -13845,6 +13877,10 @@ function createVerificationOfferCard(due) {
 // after the user approved a command was silently dropped and could never be
 // reviewed.
 function appendProposals(message, payload, repo) {
+  // A turn whose session the user has left: its cards and the decision it
+  // waits on belong to that session, and loading it draws them from the log
+  // (spec 110 Task 3). Drawn here they would land in the open session.
+  if (!liveTurnShown(message)) return;
   noteContextPayload(payload);
   // Spec 107: the card of the decision the turn waits on goes below the
   // conversation, not into this bubble. Which proposal that is comes from the
@@ -14103,7 +14139,7 @@ function pendingDecisionApplies() {
   if (!pendingDecision) return null;
   const inWorker = Boolean(workerView) || isWorkerSession(currentSessionId);
   const running = Boolean(runningActionFor(currentSessionId));
-  return !chatSubmitting && !inWorker && !running ? pendingDecision : null;
+  return !sessionSubmitting() && !inWorker && !running ? pendingDecision : null;
 }
 
 // Spec 112 requirement 1: the elements whose state the composer slot would
@@ -14388,10 +14424,7 @@ function createFallbackOffer(proposal, proposalRepo) {
               updateChatMessage(assistantMessage, assistantText);
             }
             appendProposals(assistantMessage, payload, proposalRepo);
-            if (payload.sessionId) {
-              currentSessionId = payload.sessionId;
-              localStorage.setItem(lastSessionStorageKey(), currentSessionId);
-            }
+            followTurnSession(indicator?.action, payload.sessionId);
             if (payload.taskId) assistantMessage.message.dataset.taskId = payload.taskId;
             appendContextDisclosure(assistantMessage.body, payload.contextFiles || []);
             appendTurnNotes(assistantMessage.body, payload.turnNotes);
@@ -14557,10 +14590,7 @@ function createContextReview(review, reviewRepo) {
               updateChatMessage(assistantMessage, assistantText);
             }
             appendProposals(assistantMessage, payload, reviewRepo);
-            if (payload.sessionId) {
-              currentSessionId = payload.sessionId;
-              localStorage.setItem(lastSessionStorageKey(), currentSessionId);
-            }
+            followTurnSession(indicator?.action, payload.sessionId);
             appendContextDisclosure(assistantMessage.body, payload.contextFiles || []);
             appendTurnNotes(assistantMessage.body, payload.turnNotes);
             markMessageUsage(assistantMessage, payload.usage, null);
@@ -14680,10 +14710,7 @@ function createRoundBudgetOffer(proposal, proposalRepo) {
               updateChatMessage(assistantMessage, assistantText);
             }
             appendProposals(assistantMessage, payload, proposalRepo);
-            if (payload.sessionId) {
-              currentSessionId = payload.sessionId;
-              localStorage.setItem(lastSessionStorageKey(), currentSessionId);
-            }
+            followTurnSession(indicator?.action, payload.sessionId);
             if (payload.taskId) assistantMessage.message.dataset.taskId = payload.taskId;
             appendContextDisclosure(assistantMessage.body, payload.contextFiles || []);
             appendTurnNotes(assistantMessage.body, payload.turnNotes);
@@ -15039,10 +15066,7 @@ function createPlanReview(
               updateChatMessage(assistantMessage, assistantText);
             }
             appendProposals(assistantMessage, payload, proposalRepo);
-            if (payload.sessionId) {
-              currentSessionId = payload.sessionId;
-              localStorage.setItem(lastSessionStorageKey(), currentSessionId);
-            }
+            followTurnSession(indicator?.action, payload.sessionId);
             if (payload.taskId) assistantMessage.message.dataset.taskId = payload.taskId;
             appendContextDisclosure(assistantMessage.body, payload.contextFiles || []);
             appendTurnNotes(assistantMessage.body, payload.turnNotes);
@@ -15933,10 +15957,7 @@ function createCommandApprovalPreview(
               updateChatMessage(assistantMessage, assistantText);
             }
             appendProposals(assistantMessage, payload, proposalRepo);
-            if (payload.sessionId) {
-              currentSessionId = payload.sessionId;
-              localStorage.setItem(lastSessionStorageKey(), currentSessionId);
-            }
+            followTurnSession(indicator?.action, payload.sessionId);
             if (payload.taskId) assistantMessage.message.dataset.taskId = payload.taskId;
             appendContextDisclosure(assistantMessage.body, payload.contextFiles || []);
             appendTurnNotes(assistantMessage.body, payload.turnNotes);
@@ -16039,9 +16060,7 @@ async function loadSessions(preferredSessionId = "", reloadSelected = false) {
     clearSessionList();
     return;
   }
-  const payload = await api(`/api/sessions?repo=${encodeURIComponent(repoPath)}`);
-  const sessions = payload.sessions || [];
-  projectSessionsByPath.set(repoPath, sessions);
+  const sessions = await fetchProjectSessions(repoPath);
   const storedSessionId = localStorage.getItem(lastSessionStorageKey(repoPath)) || "";
   const selectedSessionId = preferredSessionId || currentSessionId || storedSessionId;
   renderSessionOptions(sessions);
@@ -16160,6 +16179,15 @@ async function loadSession(sessionId) {
   // the last card above the composer.
   await restorePendingDecision(payload.tasks || [], current);
   if (!current()) return;
+  // Spec 110 Task 3: work this window still streams for the session shows
+  // its progress again, and what a turn returned while the user was away
+  // waits in the composer.
+  reattachLiveTurns(currentSessionId);
+  const held = heldComposerText.get(currentSessionId);
+  if (held) {
+    heldComposerText.delete(currentSessionId);
+    refillComposer(held);
+  }
   // Last: the strip and a worker's approval card follow what was just drawn.
   syncWorkerView();
 }
@@ -16248,17 +16276,7 @@ async function streamResumeChecksRequest(data, handlers) {
 // A refused request answers JSON (`{"error": …, "code": …}`); the user reads
 // its message, never the JSON (spec 110 Task 1c).
 async function streamRequestError(response) {
-  const text = await response.text();
-  let payload = null;
-  try {
-    payload = JSON.parse(text);
-  } catch {
-    payload = null;
-  }
-  const error = new Error(payload?.error || payload?.message || text || response.statusText);
-  error.payload = payload || {};
-  error.status = response.status;
-  return error;
+  return refusalError(response, await response.text());
 }
 
 // Every turn stream running in this window, so a message sent while one works
@@ -16447,31 +16465,41 @@ function settleTurnNotes(stream) {
   for (const note of left) note.message?.message.remove();
   const text = left.map((note) => note.text).join("\n\n");
   if (stream.outcome === "completed" || stream.outcome === "failed") {
-    whenTurnsIdle(async () => {
+    whenTurnsIdle(stream.sessionId, async () => {
       if (stream.sessionId !== currentSessionId || !(await sendChatPrompt({ prompt: text }))) {
-        refillComposer(text);
+        refillComposer(text, stream.sessionId);
       }
     });
   } else {
     // Stopped: the user asked the work to stop, so nothing is sent for them.
-    refillComposer(text);
+    refillComposer(text, stream.sessionId);
   }
 }
 
-function refillComposer(text) {
+// Returned messages of a session the user has left, by session id: they go
+// into that session's composer when the user returns, never into another
+// session's (spec 110 Task 3).
+const heldComposerText = new Map();
+
+function refillComposer(text, sessionId = currentSessionId) {
+  if (sessionId && sessionId !== currentSessionId) {
+    const held = heldComposerText.get(sessionId);
+    heldComposerText.set(sessionId, held ? `${held}\n\n${text}` : text);
+    return;
+  }
   const field = $("chat-prompt");
   const draft = field.value.trim();
   field.value = draft ? `${text}\n\n${draft}` : text;
   autoGrowPrompt();
 }
 
-// Runs `then` once no turn is running in this window: a returned message is
-// the next turn, so it waits for the one that just ended to finish its own
-// bookkeeping.
-function whenTurnsIdle(then) {
+// Runs `then` once no turn of `sessionId` is running in this window: a
+// returned message is the next turn, so it waits for the one that just ended
+// to finish its own bookkeeping. Another session's turn does not hold it up.
+function whenTurnsIdle(sessionId, then) {
   const started = Date.now();
   const check = () => {
-    if (!chatSubmitting && !runningTurnStreams.size) {
+    if (!windowTurnFor(sessionId) && !runningTurnStream(sessionId)) {
       void then();
     } else if (Date.now() - started < 30000) {
       setTimeout(check, 50);
@@ -16562,7 +16590,9 @@ function processSseEvent(raw, handlers, turn = null) {
   if (event === "phase" && handlers.phase) handlers.phase(payload);
   if (event === "plan" && handlers.plan) handlers.plan(payload);
   if (event === "web_diagnostic" && handlers.webDiagnostic) handlers.webDiagnostic(payload);
-  if (event === "context") {
+  // A turn whose session the user has left does not repoint the open
+  // session's context panel (spec 110 Task 3).
+  if (event === "context" && (!turn?.sessionId || turn.sessionId === currentSessionId)) {
     // Handled here rather than per call site: every stream that assembles a
     // turn emits this, including a plain prompt and the verification repair.
     // A per-call handler left the default (no-pause) pre-send view invisible
@@ -17007,15 +17037,102 @@ async function proposePatchFromChat(prompt, assistantMessage) {
   );
 }
 
-// The turn currently in flight, so Stop (button or Escape) can reach its
-// AbortController. Null whenever nothing is running, which is what keeps a late
-// Stop from aborting the *next* turn.
-let currentTurn = null;
+// Turns this window has sent or resumed, from the click until the stream's own
+// bookkeeping ends, one record each, so Stop (button or Escape) can reach a
+// turn's AbortController. Keyed by session (spec 110 Task 3): a turn running in
+// one session leaves another session's composer free, and its Stop never
+// reaches a session it does not belong to. An ended record is gone, which is
+// what keeps a late Stop from aborting the *next* turn.
+const windowTurns = new Set();
 
-function stopCurrentTurn() {
-  if (!currentTurn) return;
-  currentTurn.stopped = true;
-  currentTurn.controller.abort();
+function beginWindowTurn() {
+  const sessionAtStart = currentSessionId;
+  let adopted = "";
+  const turn = {
+    controller: null,
+    stopped: false,
+    action: null,
+    get sessionId() {
+      return adopted || turn.action?.sessionId || sessionAtStart;
+    },
+    adoptSession(sessionId) {
+      if (!sessionId) return;
+      adopted = sessionId;
+      turn.action?.adoptSession(sessionId);
+    },
+    end() {
+      windowTurns.delete(turn);
+    },
+  };
+  windowTurns.add(turn);
+  return turn;
+}
+
+function windowTurnFor(sessionId) {
+  for (const turn of windowTurns) {
+    if (turn.sessionId === sessionId) return turn;
+  }
+  return null;
+}
+
+// Whether this window is sending or streaming a turn for the open session.
+function sessionSubmitting() {
+  return Boolean(windowTurnFor(currentSessionId));
+}
+
+// The main composer turn's Stop: aborts that turn's stream.
+function stopWindowTurn(turn) {
+  if (!turn?.controller) return;
+  turn.stopped = true;
+  turn.controller.abort();
+}
+
+// A stream names its session (a first turn's `session` event, every `done`).
+// The window follows it only while it still shows that turn's session; once
+// the user has moved to another session, the turn updates its own record and
+// leaves the window alone (spec 110 Task 3). `owner` is the turn's window
+// record or running action; without one the window follows, as before.
+function followTurnSession(owner, sessionId) {
+  if (!sessionId) return false;
+  const shown = !owner || owner.sessionId === currentSessionId;
+  owner?.adoptSession(sessionId);
+  if (shown) {
+    currentSessionId = sessionId;
+    localStorage.setItem(lastSessionStorageKey(), sessionId);
+  }
+  return shown;
+}
+
+// Whether a live turn's bubble is in the open conversation. A turn whose
+// session the user left streams into a detached bubble; whatever it would add
+// to the window (a pending decision, a waiting row) is drawn from the log when
+// the user returns instead.
+function liveTurnShown(target) {
+  return Boolean(target?.message?.isConnected);
+}
+
+// Spec 110 Task 3: a turn this window streams for a session the user left and
+// came back to is still running. Its bubble — what has streamed so far and its
+// status row — goes back below the reloaded conversation, so the row, the
+// composer slot and the Stop show the work again.
+function reattachLiveTurns(sessionId) {
+  if (!sessionId) return;
+  const log = $("chat-log");
+  for (const action of runningActions) {
+    const bubble = action.liveMessage;
+    if (action.sessionId !== sessionId || !bubble || bubble.isConnected) continue;
+    log.append(bubble);
+    // In view, as a live turn keeps itself, before the homes are observed so
+    // the slot starts from where the row now is.
+    bubble.scrollIntoView({ block: "nearest" });
+    for (const home of action.homes) observeStatusHome(home);
+  }
+  // Messages sent into the turn that it has not read yet stay shown as waiting.
+  for (const note of waitingNotes) {
+    const element = note.message?.message;
+    if (note.sessionId === sessionId && element && !element.isConnected) log.append(element);
+  }
+  syncComposerStatus();
 }
 
 // Spec 109 D7: one running state for every action this window runs — a turn
@@ -17035,11 +17152,20 @@ function beginRunningAction({ label = "Starting", stop = null } = {}) {
   // A first turn learns its session from its `session` event; until then the
   // action follows the window's current session.
   const sessionAtStart = currentSessionId;
+  let adopted = "";
   const now = Date.now();
   const action = {
     get sessionId() {
-      return sessionAtStart || currentSessionId || "";
+      return adopted || sessionAtStart || currentSessionId || "";
     },
+    // The `session` event names a first turn's new session, which the action
+    // keeps even after the window moves to another one (spec 110 Task 3).
+    adoptSession(sessionId) {
+      if (sessionId) adopted = sessionId;
+    },
+    // The bubble a turn streams into (`startTurnIndicator`), put back by
+    // `reattachLiveTurns` when the user returns to the session.
+    liveMessage: null,
     label,
     startedAt: now,
     stepStartedAt: now,
@@ -17155,10 +17281,13 @@ function createRunningRow(action, { stopLabel = "Cancel" } = {}) {
 // be stopped; `reason` then says why, as the disabled button's title.
 function composerStopTarget() {
   if (workerView) return null;
-  if (currentTurn) {
-    const action = currentTurn.action;
+  // Only this session's turn: a turn this window streams for another session
+  // keeps running there (spec 110 Task 3).
+  const turn = windowTurnFor(currentSessionId);
+  if (turn?.controller) {
+    const action = turn.action;
     if (action?.stopRequested) return { reason: "Stopping…" };
-    return { stop: () => (action ? action.stop() : stopCurrentTurn()) };
+    return { stop: () => (action ? action.stop() : stopWindowTurn(turn)) };
   }
   const action = runningActionFor(currentSessionId);
   if (action) {
@@ -17176,7 +17305,7 @@ function composerStopTarget() {
     return { stop: () => void stopWorkFromComposer(sessionId) };
   }
   // Sent, but the stream has not begun: nothing exists to stop yet.
-  if (chatSubmitting) return { reason: "Starting — nothing to stop yet" };
+  if (sessionSubmitting()) return { reason: "Starting — nothing to stop yet" };
   return null;
 }
 
@@ -17237,9 +17366,9 @@ function syncComposerStop() {
 }
 
 function setComposerBusy() {
-  // "Fix selected" and the repo bar's action follow `chatSubmitting`, which
-  // callers set before this. The slot keeps the composer's Stop and the
-  // question lock in step.
+  // "Fix selected" and the repo bar's action follow `sessionSubmitting()`,
+  // whose window turn callers begin or end before this. The slot keeps the
+  // composer's Stop and the question lock in step.
   renderFindingsPanel();
   syncComposerStatus();
 }
@@ -17272,6 +17401,8 @@ async function sendChatPrompt(options = {}) {
   let assistantMessage = null;
   let indicator = null;
   let prompt = "";
+  let turn = null;
+  let chatRepo = "";
   const promptOverride = (options.prompt || "").trim();
   const restoreSubmittedPrompt = options.restorePrompt !== false && !promptOverride;
   // A worker's turns run in its own process (requirement 4): its composer
@@ -17291,14 +17422,14 @@ async function sendChatPrompt(options = {}) {
     toast("Damaian is still working on this session — wait for it to finish or stop it.");
     return false;
   }
-  if (chatSubmitting) return false;
+  if (sessionSubmitting()) return false;
   try {
     prompt = promptOverride || $("chat-prompt").value.trim();
     if (!prompt) throw new Error("Prompt is required");
-    chatSubmitting = true;
+    turn = beginWindowTurn();
     setComposerBusy();
     await ensureDesktopApiReady();
-    const chatRepo = requireRepo();
+    chatRepo = requireRepo();
     const userMessage = appendChatMessage("user", prompt);
     assistantMessage = appendChatMessage("assistant", "");
     // Cleared here rather than after success: the prompt is already echoed in
@@ -17317,9 +17448,10 @@ async function sendChatPrompt(options = {}) {
     }
 
     const controller = new AbortController();
-    currentTurn = { controller, stopped: false };
-    indicator = startTurnIndicator(assistantMessage, stopCurrentTurn);
-    currentTurn.action = indicator.action;
+    const thisTurn = turn;
+    turn.controller = controller;
+    indicator = startTurnIndicator(assistantMessage, () => stopWindowTurn(thisTurn));
+    turn.action = indicator.action;
 
     let assistantText = "";
 
@@ -17339,7 +17471,7 @@ async function sendChatPrompt(options = {}) {
         // identifiable — without it, stopping a brand-new session's first turn
         // would leave a session the UI cannot name.
         session(sessionId) {
-          if (sessionId) currentSessionId = sessionId;
+          followTurnSession(turn, sessionId);
         },
         phase(payload) {
           if (indicator) indicator.phase(payload);
@@ -17357,9 +17489,9 @@ async function sendChatPrompt(options = {}) {
           if (indicator) indicator.streaming();
         },
         async done(payload) {
-          currentSessionId = payload.sessionId;
-          localStorage.setItem(lastSessionStorageKey(), currentSessionId);
-          persistPinnedContextForSession(currentSessionId);
+          if (followTurnSession(turn, payload.sessionId)) {
+            persistPinnedContextForSession(currentSessionId);
+          }
           if (payload.taskId) assistantMessage.message.dataset.taskId = payload.taskId;
           if (payload.response && payload.response !== assistantText) {
             assistantText = payload.response;
@@ -17371,7 +17503,7 @@ async function sendChatPrompt(options = {}) {
           appendContextDisclosure(assistantMessage.body, payload.contextFiles || []);
           appendTurnNotes(assistantMessage.body, payload.turnNotes);
           markMessageUsage(assistantMessage, payload.usage, liveTurnDurationMs(payload, indicator));
-          void refreshMemoryProposals(currentSessionId);
+          if (liveTurnShown(assistantMessage)) void refreshMemoryProposals(currentSessionId);
           if (payload.cancelled) {
             if (indicator) indicator.finish("stopped");
             return;
@@ -17386,6 +17518,9 @@ async function sendChatPrompt(options = {}) {
       controller.signal,
     );
     if (streamError) throw streamError;
+    // The user moved to another session while this one worked: its sidebar row
+    // is refreshed in `finally`, and the rest is drawn from the log on return.
+    if (!liveTurnShown(assistantMessage)) return true;
     dismissContextChips();
     // The checkpoint for this turn exists now, so the turn just sent becomes
     // rewindable without waiting for a session reload. This turn's own: the
@@ -17405,51 +17540,61 @@ async function sendChatPrompt(options = {}) {
   } catch (error) {
     // A stop is not a failure. Without this every Stop would toast "Failed"
     // and write an error into the bubble the user just chose to keep.
-    if (currentTurn?.stopped || error.name === "AbortError") {
+    // A turn the user has left keeps its outcome to itself: the prompt goes
+    // back only into its own composer, and its session's sidebar dot says it
+    // failed (spec 110 Task 3).
+    const shown = !assistantMessage || liveTurnShown(assistantMessage);
+    if (turn?.stopped || error.name === "AbortError") {
       if (indicator) indicator.finish("stopped");
-      if (restoreSubmittedPrompt) restorePrompt(prompt);
-      await loadSessions(currentSessionId, false);
-      await refreshFindings();
+      if (shown) {
+        if (restoreSubmittedPrompt) restorePrompt(prompt);
+        await loadSessions(currentSessionId, false);
+        await refreshFindings();
+      }
     } else {
       if (indicator) indicator.finish("failed");
-      toast(error.message);
       renderChatMessageError(assistantMessage, error);
-      if (restoreSubmittedPrompt) restorePrompt(prompt);
+      if (shown) {
+        toast(error.message);
+        if (restoreSubmittedPrompt) restorePrompt(prompt);
+      }
     }
     return false;
   } finally {
-    chatSubmitting = false;
-    currentTurn = null;
+    turn?.end();
     setComposerBusy();
     // Whatever the outcome, the session's sidebar state may have changed (a
     // failure reloads nothing else), and a short turn can end between polls.
-    if (repo()) void refreshSessionStates([repo()]);
+    // The turn's own project: the user may have switched to another.
+    const turnRepo = chatRepo || repo();
+    if (turnRepo) void refreshSessionStates([turnRepo]);
     // Whatever the outcome, an agentic turn may have changed files.
     void refreshRepoBar();
   }
 }
 
 async function askAgainFromExhausted(sessionId, taskId) {
-  if (chatSubmitting) throw new Error("A turn is already running");
+  if (sessionSubmitting()) throw new Error("A turn is already running");
   if (!sessionId && !currentSessionId) throw new Error("No session selected");
   if (!taskId) throw new Error("This turn has nothing to re-ask");
   if (sessionId && sessionId !== currentSessionId) {
     await loadSession(sessionId);
   }
-  chatSubmitting = true;
+  const turn = beginWindowTurn();
   setComposerBusy();
   await ensureDesktopApiReady();
-  const chatRepo = requireRepo();
+  const askRepo = requireRepo();
   const assistantMessage = appendChatMessage("assistant", "");
-  const indicator = startTurnIndicator(assistantMessage, stopCurrentTurn);
+  const indicator = startTurnIndicator(assistantMessage, () => stopWindowTurn(turn));
   const controller = new AbortController();
-  currentTurn = { controller, stopped: false, action: indicator.action };
+  turn.controller = controller;
+  turn.action = indicator.action;
   let assistantText = "";
   let streamError = null;
   try {
     await streamChatRequest(
       {
-        repo: chatRepo,
+        repo: askRepo,
         session_id: sessionId || currentSessionId,
         ask_again_task_id: taskId,
         context_files: pinnedContextFiles.join("\n"),
@@ -17457,7 +17602,7 @@ async function askAgainFromExhausted(sessionId, taskId) {
       },
       {
         session(newSessionId) {
-          if (newSessionId) currentSessionId = newSessionId;
+          followTurnSession(turn, newSessionId);
         },
         phase(payload) {
           indicator.phase(payload);
@@ -17475,18 +17620,18 @@ async function askAgainFromExhausted(sessionId, taskId) {
           indicator.streaming();
         },
         async done(payload) {
-          currentSessionId = payload.sessionId;
-          localStorage.setItem(lastSessionStorageKey(), currentSessionId);
-          persistPinnedContextForSession(currentSessionId);
+          if (followTurnSession(turn, payload.sessionId)) {
+            persistPinnedContextForSession(currentSessionId);
+          }
           if (payload.response && payload.response !== assistantText) {
             assistantText = payload.response;
           }
           await finalizeChatMessage(assistantMessage, assistantText);
-          appendProposals(assistantMessage, payload, chatRepo);
+          appendProposals(assistantMessage, payload, askRepo);
           appendContextDisclosure(assistantMessage.body, payload.contextFiles || []);
           appendTurnNotes(assistantMessage.body, payload.turnNotes);
           markMessageUsage(assistantMessage, payload.usage, liveTurnDurationMs(payload, indicator));
-          void refreshMemoryProposals(currentSessionId);
+          if (liveTurnShown(assistantMessage)) void refreshMemoryProposals(currentSessionId);
           if (payload.cancelled) {
             indicator.finish("stopped");
             return;
@@ -17501,27 +17646,31 @@ async function askAgainFromExhausted(sessionId, taskId) {
       controller.signal,
     );
     if (streamError) throw streamError;
-    dismissContextChips();
-    await loadSessionCheckpoints(currentSessionId);
-    await loadSessions(currentSessionId, false);
-    await refreshFindings();
-  } catch (error) {
-    if (currentTurn?.stopped || error.name === "AbortError") {
-      indicator.finish("stopped");
+    if (liveTurnShown(assistantMessage)) {
+      dismissContextChips();
+      await loadSessionCheckpoints(currentSessionId);
       await loadSessions(currentSessionId, false);
       await refreshFindings();
+    }
+  } catch (error) {
+    const shown = liveTurnShown(assistantMessage);
+    if (turn.stopped || error.name === "AbortError") {
+      indicator.finish("stopped");
+      if (shown) {
+        await loadSessions(currentSessionId, false);
+        await refreshFindings();
+      }
     } else {
       indicator.finish("failed");
-      toast(error.message);
+      if (shown) toast(error.message);
       renderChatMessageError(assistantMessage, error);
     }
   } finally {
-    chatSubmitting = false;
-    currentTurn = null;
+    turn.end();
     setComposerBusy();
     // Whatever the outcome, the session's sidebar state may have changed (a
     // failure reloads nothing else), and a short turn can end between polls.
-    if (repo()) void refreshSessionStates([repo()]);
+    if (askRepo) void refreshSessionStates([askRepo]);
     void refreshRepoBar();
   }
 }

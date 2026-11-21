@@ -2028,6 +2028,202 @@ fn app_js_shows_the_commit_review_as_a_full_panel_with_expanded_diffs() {
     }
 }
 
+/// Spec 110 Task 3: a refused request — a 409 from any route included — shows
+/// the route's own message. `api`, a refused stream and the export download
+/// all read the body through one parser and throw its `error`, never the
+/// JSON text.
+#[test]
+fn app_js_shows_a_refusals_message_never_its_json() {
+    let parse = app_js_function("parseApiPayload");
+    assert!(parse.contains("return { error: text };"), "{parse}");
+    assert!(parse.contains("!Array.isArray(payload)"), "{parse}");
+    let refusal = app_js_function("refusalError");
+    assert!(refusal.contains("parseApiPayload(text)"), "{refusal}");
+    assert!(refusal.contains("payload.error.trim()"), "{refusal}");
+    assert!(
+        refusal.contains("error.status = response.status;"),
+        "{refusal}"
+    );
+    assert!(
+        !refusal.contains("new Error(text"),
+        "the body is never the message: {refusal}"
+    );
+    assert!(app_js_function("api").contains("throw refusalError(response, text);"));
+    assert!(
+        app_js_function("streamRequestError")
+            .contains("return refusalError(response, await response.text());")
+    );
+    assert!(
+        app_js_function("exportSessionDownload")
+            .contains("throw refusalError(response, await response.text());")
+    );
+    assert!(
+        !super::APP_JS.contains("throw new Error(text || response.statusText)"),
+        "no route throws its raw body"
+    );
+}
+
+/// Spec 110 Task 3: sidebar actions during a turn update the sidebar at
+/// once. Sidebar fetches overlap while sessions work (the working-set
+/// refresh, a turn's end, an archive, a rename); an answer older than one
+/// already applied is dropped, so a list read before an archive never puts
+/// the session back. Renaming another session keeps the open one open, and
+/// an action on another project fetches its list even while a load of it is
+/// in flight.
+#[test]
+fn app_js_sidebar_actions_during_a_turn_update_the_sidebar_at_once() {
+    let fetch = app_js_function("fetchProjectSessions");
+    assert!(
+        fetch.contains("const fetchNumber = ++projectSessionsFetches;"),
+        "{fetch}"
+    );
+    assert!(
+        fetch.contains("if (fetchNumber > (projectSessionsApplied.get(projectPath) || 0))"),
+        "{fetch}"
+    );
+    assert!(
+        fetch.contains("projectSessionsByPath.set(projectPath, payload.sessions || []);"),
+        "{fetch}"
+    );
+    for reader in [
+        "loadSessions",
+        "loadProjectSessions",
+        "refreshSessionStates",
+    ] {
+        let body = app_js_function(reader);
+        assert!(body.contains("fetchProjectSessions("), "{reader}: {body}");
+        assert!(
+            !body.contains("projectSessionsByPath.set("),
+            "{reader} writes the list only through the ordered fetch: {body}"
+        );
+    }
+    let rename = app_js_function("renameSessionForProject");
+    assert!(
+        rename.contains("await loadSessions(currentSessionId || \"\", false);"),
+        "renaming another session must not select it: {rename}"
+    );
+    for action in [
+        "setSessionArchived",
+        "renameSessionForProject",
+        "deleteSessionForProject",
+    ] {
+        let body = app_js_function(action);
+        assert!(body.contains("fetchProjectSessions("), "{action}: {body}");
+        assert!(!body.contains("loadProjectSessions("), "{action}: {body}");
+        assert!(body.contains("renderProjectList();"), "{action}: {body}");
+    }
+}
+
+/// Spec 110 Task 3: switching to another session while one works leaves the
+/// first running, and returning shows its progress again. This window's turns
+/// are tracked per session, so another session's composer is free and its
+/// Stop never reaches the first; a stream names its session to the window
+/// only while the window still shows it; a turn whose bubble left the page
+/// draws no cards or decision into the open session, and returns its notes to
+/// its own composer; loading the session puts its live bubble back.
+#[test]
+fn app_js_a_session_left_mid_turn_keeps_working_and_shows_it_on_return() {
+    let app = super::APP_JS;
+    for gone in ["chatSubmitting", "currentTurn", "stopCurrentTurn"] {
+        assert!(!app.contains(gone), "app.js still names {gone}");
+    }
+    assert!(
+        !app.contains("currentSessionId = payload.sessionId;"),
+        "a turn's done must not take the window to its session"
+    );
+    assert!(
+        app_js_function("sessionSubmitting").contains("windowTurnFor(currentSessionId)"),
+        "busy means this session's turn"
+    );
+    let target = app_js_function("composerStopTarget");
+    assert!(
+        target.contains("const turn = windowTurnFor(currentSessionId);"),
+        "{target}"
+    );
+
+    let follow = app_js_function("followTurnSession");
+    assert!(
+        follow.contains("const shown = !owner || owner.sessionId === currentSessionId;"),
+        "{follow}"
+    );
+    assert!(
+        follow.contains("owner?.adoptSession(sessionId);"),
+        "{follow}"
+    );
+    assert!(follow.contains("if (shown) {"), "{follow}");
+    // Every resume flow's `done` and the composer's `session` / `done` go
+    // through it.
+    assert!(
+        app.matches("followTurnSession(indicator?.action, payload.sessionId);")
+            .count()
+            >= 7
+    );
+    for flow in ["sendChatPrompt", "askAgainFromExhausted"] {
+        let body = app_js_function(flow);
+        assert!(body.contains("beginWindowTurn()"), "{flow}");
+        assert!(body.contains("followTurnSession(turn, "), "{flow}");
+        assert!(
+            body.contains("turn?.end()") || body.contains("turn.end()"),
+            "{flow}"
+        );
+        assert!(body.contains("liveTurnShown(assistantMessage)"), "{flow}");
+    }
+    let send = app_js_function("sendChatPrompt");
+    assert!(
+        send.contains("if (!liveTurnShown(assistantMessage)) return true;"),
+        "{send}"
+    );
+    assert!(
+        send.contains("void refreshSessionStates([turnRepo]);"),
+        "the left session's sidebar row follows its outcome: {send}"
+    );
+
+    let proposals = app_js_function("appendProposals");
+    let guard = proposals
+        .find("if (!liveTurnShown(message)) return;")
+        .expect("a left turn draws nothing into the open session");
+    assert!(guard < proposals.find("noteContextPayload(").unwrap());
+    assert!(guard < proposals.find("setPendingDecision(").unwrap());
+
+    let action = app_js_function("beginRunningAction");
+    assert!(
+        action.contains("return adopted || sessionAtStart"),
+        "{action}"
+    );
+    assert!(
+        app_js_function("startTurnIndicator").contains("running.liveMessage = target.message;")
+    );
+    let reattach = app_js_function("reattachLiveTurns");
+    assert!(reattach.contains("log.append(bubble);"), "{reattach}");
+    assert!(reattach.contains("observeStatusHome(home)"), "{reattach}");
+    assert!(reattach.contains("waitingNotes"), "{reattach}");
+    let load = app_js_function("loadSession");
+    let restore = load.find("restorePendingDecision(").unwrap();
+    let back = load
+        .find("reattachLiveTurns(currentSessionId);")
+        .expect("loading a session shows its running work again");
+    assert!(restore < back, "{load}");
+    assert!(
+        load.contains("heldComposerText.get(currentSessionId)"),
+        "{load}"
+    );
+
+    let refill = app_js_function("refillComposer");
+    assert!(
+        refill.contains("if (sessionId && sessionId !== currentSessionId)"),
+        "{refill}"
+    );
+    assert!(
+        app_js_function("whenTurnsIdle")
+            .contains("!windowTurnFor(sessionId) && !runningTurnStream(sessionId)"),
+        "another session's turn does not hold up a returned note"
+    );
+    assert!(
+        app_js_function("processSseEvent").contains("turn.sessionId === currentSessionId"),
+        "a left turn does not repoint the context panel"
+    );
+}
+
 /// Observation 103: a session can be busy on work this window never
 /// streamed (a crash-recovered command's own resumed turn). The poller
 /// is the one thing that still says so, the banner shows it, and Send
@@ -2130,7 +2326,9 @@ fn app_js_gives_every_running_action_one_state_and_a_stop() {
 #[test]
 fn app_js_has_one_stop_in_the_composer() {
     let target = app_js_function("composerStopTarget");
-    let stream = target.find("if (currentTurn)").expect("stream first");
+    let stream = target
+        .find("windowTurnFor(currentSessionId)")
+        .expect("this session's stream first");
     let action = target
         .find("runningActionFor(currentSessionId)")
         .expect("then the running action");
@@ -2161,12 +2359,12 @@ fn app_js_has_one_stop_in_the_composer() {
     assert_eq!(app.matches("stopFromComposer();").count(), 1, "Escape");
     assert!(app.contains("if (stopFromComposer()) return;"), "click");
     assert_eq!(
-        app.matches("stopCurrentTurn();").count(),
+        app.matches("stopWindowTurn(turn);").count(),
         0,
         "nothing calls the stream's abort directly"
     );
     assert!(
-        target.contains("action ? action.stop() : stopCurrentTurn()"),
+        target.contains("action ? action.stop() : stopWindowTurn(turn)"),
         "{target}"
     );
     // The question answer and fetch decision streams have running actions
@@ -2622,7 +2820,8 @@ fn app_js_draws_session_state_dots_in_the_sidebar() {
         "{poll}"
     );
     let refresh = app_js_function("refreshSessionStates");
-    assert!(refresh.contains("/api/sessions?repo="), "{refresh}");
+    assert!(refresh.contains("fetchProjectSessions(path)"), "{refresh}");
+    assert!(app_js_function("fetchProjectSessions").contains("/api/sessions?repo="));
     assert!(
         refresh.contains("if (changed.some(Boolean)) renderProjectList();"),
         "{refresh}"
@@ -2630,8 +2829,11 @@ fn app_js_draws_session_state_dots_in_the_sidebar() {
     for turn in ["sendChatPrompt", "askAgainFromExhausted"] {
         let body = app_js_function(turn);
         let finally = &body[body.rfind("} finally {").expect(turn)..];
+        // The turn's own project (spec 110 Task 3): the user may have
+        // switched to another while it ran.
         assert!(
-            finally.contains("void refreshSessionStates([repo()]);"),
+            finally.contains("void refreshSessionStates([turnRepo]);")
+                || finally.contains("void refreshSessionStates([askRepo]);"),
             "{turn}: {finally}"
         );
     }
@@ -2745,7 +2947,7 @@ fn app_js_composer_names_the_pending_decision_and_yields_to_a_question() {
         entry.contains("question ? \"Answer\" : \"Show\""),
         "{entry}"
     );
-    assert!(app_js_function("pendingDecisionApplies").contains("!chatSubmitting"));
+    assert!(app_js_function("pendingDecisionApplies").contains("!sessionSubmitting()"));
     let lock = app_js_function("syncComposerQuestionLock");
     assert!(lock.contains("pendingDecisionApplies()"), "{lock}");
     assert!(
@@ -3657,7 +3859,10 @@ fn worker_session_explains_task_outcomes_and_stale_progress() {
         .nth(1)
         .and_then(|rest| rest.split("\nfunction ").next())
         .expect("sendChatPrompt");
-    assert!(send.contains("if (chatSubmitting) return false;"), "{send}");
+    assert!(
+        send.contains("if (sessionSubmitting()) return false;"),
+        "{send}"
+    );
     assert!(send.contains("return true;"), "{send}");
     assert!(send.contains("return false;"), "{send}");
 }
