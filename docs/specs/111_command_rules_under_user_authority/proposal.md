@@ -2,7 +2,8 @@
 
 Status: In progress (specified 2026-11-12; started 2026-11-12, Tasks 1–3
 done: the parser, the rules beside the old policy, the migration of the old
-keys; Tasks 1–6 in [tasks.md](tasks.md))
+keys; Task 3b (shell special parameters, D11) added 2026-11-21; tasks in
+[tasks.md](tasks.md))
 Order: 111 of 111
 Plan: none. Written from the owner's design discussion on 2026-11-12 (spec 109
 D5 "Approve for this session", and a comparison with OpenCode's permission
@@ -58,6 +59,10 @@ out of dogfooding and design (2026-11-11/12):
    asks). A command that cannot be analysed safely (`$VAR`, `$(…)`, backticks,
    an unquoted glob the shell would expand, here-docs) is `ask`, and no `allow`
    ever covers it.
+   *(2026-11-21, context D11: the special parameters `$?` `$#` `$$` `$!` `$-`
+   and the positional `$@` `$*` `$1`–`$9` are analysable as argument words.
+   `$0`, `$_` and `$IFS` are too once the user enables them with
+   `command_shell_parameters`, which a repository can only narrow.)*
 5. **Options in any spelling.** For programs Damaian knows (context D3), short
    flags combined or apart and their long forms are the same option, in any
    order: `rm -rf`, `rm -fr`, `rm -r -f` and `rm --recursive --force` are one

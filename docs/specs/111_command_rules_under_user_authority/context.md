@@ -207,3 +207,34 @@
     instead of being blocked; and the allowlist branch kept
     `require_approval_for_all_commands`, so an `allow` from a migrated
     entry must still ask when that key is on.
+- **D11 — shell special parameters (decided by the owner, 2026-11-21).**
+  D3 made every `$` unanalysable, so any command using one asked and no rule
+  could cover it. Agents' commands use special parameters all the time
+  (`cargo test; echo "exit $?"`, `"$@"`, `$1`), so that blocked ordinary work.
+  - *Accepted by default*, as an opaque **argument** word: `$?`, `$#`, `$$`,
+    `$!` and `$-` (they expand to digits or shell option letters only), and
+    the positional parameters `$@`, `$*` and `$1`–`$9` (in the one-line
+    command Damaian runs they are the launching shell's arguments). The forms
+    are bare, double-quoted (`"$@"`) and braced (`${1}`, `${#}`), also
+    embedded in a word (`/tmp/run-$$`).
+  - *Accepted only when the user turns them on:* `$0` (the shell's name),
+    `$_` (the previous command's last argument, which hides a path) and
+    `$IFS` (which changes how the rest of the line is split). The key is
+    `command_shell_parameters = $0 $_ $IFS` (any subset), set in `user.conf`
+    or by an admin. A repository or permission profile may only remove
+    entries from it (spec 34, D2). The overlay classification records the
+    key as restrict-only, exhaustively like every other key.
+  - *Where they may stand.* An accepted parameter is never the program word
+    of a command part, never a redirection target and never the argument of
+    `cd`. Any of those keeps the command unanalysable. Every other `$` form
+    (`$NAME`, `${NAME}`, `${…:-…}`, `$((…))`, `$(…)`) stays unanalysable, as
+    D3 says.
+  - *Matching.* An accepted parameter is matched as written. `rm -rf
+    /tmp/$$` is the path `/tmp/$$`: a rule naming `/tmp/*` covers it, and
+    `allow rm -rf /tmp/build` does not. A command that no rule covers asks,
+    as any other does.
+  - *What this changes.* The shared tokenizer that the parser and the spec 64
+    read-only boundary both use. A read-only command such as `ls; echo $?` is
+    therefore admitted as read-only. The equivalence corpus of Task 3 gains
+    cases for these forms. Task 3b lands it before Task 4 switches the live
+    policy.
