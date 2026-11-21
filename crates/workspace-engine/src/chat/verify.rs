@@ -615,7 +615,7 @@ impl ChatOrchestrator {
                 proposal_id: batch_id.clone(),
             }],
         );
-        let task = self.session_store.await_approval(
+        let task = self.await_approval(
             &task,
             &PendingApprovalRef {
                 kind: "checks".to_string(),
@@ -1783,7 +1783,7 @@ impl ChatOrchestrator {
                 proposal_id: batch_id.clone(),
             }],
         );
-        let task = self.session_store.await_approval(
+        let task = self.await_approval(
             &task,
             &PendingApprovalRef {
                 kind: "checks".to_string(),

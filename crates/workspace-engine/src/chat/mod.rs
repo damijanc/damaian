@@ -134,6 +134,7 @@ mod formatting;
 use formatting::*;
 mod memory_recall;
 mod pending;
+pub(crate) use pending::take_superseded_paused_turn;
 pub use pending::*;
 mod plan_flow;
 use plan_flow::*;
@@ -309,6 +310,32 @@ impl ChatOrchestrator {
     /// proposal has that id and nothing runs (spec 50 `context.md` §2).
     pub fn has_pending_chat_command(&self, proposal_id: &str) -> bool {
         self.pending_commands.has(proposal_id) && !self.pending_commands.is_question(proposal_id)
+    }
+
+    /// Pauses `task` on an approval and settles every older pause of its
+    /// session, so the session waits on one decision (spec 113 D3). Every chat
+    /// pause on an approval goes through here.
+    fn await_approval(&self, task: &Task, pending: &PendingApprovalRef) -> Result<Task> {
+        let task = self.session_store.await_approval(task, pending)?;
+        crate::pending_decisions::settle_older_pending_decisions(
+            &self.session_store,
+            &self.audit_log,
+            &task.session_id,
+            &task.id,
+        )?;
+        Ok(task)
+    }
+
+    /// [`Self::await_approval`] for a pause on the user's answer to a question.
+    fn await_answer(&self, task: &Task, question: &PendingQuestionRef) -> Result<Task> {
+        let task = self.session_store.await_answer(task, question)?;
+        crate::pending_decisions::settle_older_pending_decisions(
+            &self.session_store,
+            &self.audit_log,
+            &task.session_id,
+            &task.id,
+        )?;
+        Ok(task)
     }
 
     /// Refuses a pause of the wrong kind and puts its file back, so the resume

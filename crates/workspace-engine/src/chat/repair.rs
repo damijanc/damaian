@@ -73,7 +73,7 @@ impl ChatOrchestrator {
             context_review: None,
         })?;
         self.note_pending_approvals(&session, &task, Vec::new());
-        let task = self.session_store.await_answer(&task, &question)?;
+        let task = self.await_answer(&task, &question)?;
         self.audit_log.record(
             "verification_uncertain_repair_question",
             &[

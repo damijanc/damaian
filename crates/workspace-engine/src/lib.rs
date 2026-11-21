@@ -41,6 +41,7 @@ pub mod model;
 pub mod navigation;
 pub mod patch_engine;
 pub mod path_policy;
+pub mod pending_decisions;
 pub mod plan;
 pub mod pre_task_tree;
 pub mod process_registry;
@@ -220,6 +221,9 @@ pub use patch_engine::{
     ProposedFilePatch, ProposedPatch, parse_hunk_selection,
 };
 pub use path_policy::PathPolicy;
+pub use pending_decisions::{
+    SupersededDecision, keep_newest_pending_decision, settle_older_pending_decisions,
+};
 pub use plan::{
     Evidence, PLANNED_CHECK_VERSION, PatchedFile, PlanReport, PlanStep, PlannedCheck, ReportedStep,
     StepOutcome, StepStatus, TaskPhase, TaskPlan, normalize_planned_check_directory,

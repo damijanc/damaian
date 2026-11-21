@@ -2637,10 +2637,10 @@ impl ChatOrchestrator {
 
         let mut completion_verification = false;
         st.task = match (&pending, &pending_question) {
-            (Some(pending), None) => self.session_store.await_approval(&st.task, pending)?,
+            (Some(pending), None) => self.await_approval(&st.task, pending)?,
             // A question link goes under its own status key through
             // `await_answer`; never through `await_approval` (spec 50 §5.2).
-            (None, Some(question)) => self.session_store.await_answer(&st.task, question)?,
+            (None, Some(question)) => self.await_answer(&st.task, question)?,
             (None, None) => {
                 match &stop_reason {
                     // Spec 101: an answer is settled through the engine gate, so

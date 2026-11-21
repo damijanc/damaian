@@ -421,7 +421,7 @@ impl ChatOrchestrator {
                 proposal_id: proposal_id.clone(),
             }],
         );
-        let task = self.session_store.await_approval(
+        let task = self.await_approval(
             &task,
             &crate::session::PendingApprovalRef {
                 kind: "provider_fallback".to_string(),
@@ -567,7 +567,7 @@ impl ChatOrchestrator {
                 proposal_id: proposal_id.clone(),
             }],
         );
-        let task = self.session_store.await_approval(
+        let task = self.await_approval(
             &task,
             &crate::session::PendingApprovalRef {
                 kind: "round_budget".to_string(),

@@ -578,6 +578,11 @@ pub fn reattach_pending_approvals(
     if store.has_live_worker(session_id)? {
         return Ok(Vec::new());
     }
+    // Spec 113 D4: a session that piled up several pending decisions before
+    // that was settled keeps only its newest. The others are cancelled before
+    // anything is reattached, so the sweep offers one card per session. A
+    // worker session is left alone inside the call (spec 57).
+    crate::pending_decisions::keep_newest_pending_decision(store, audit, session_id)?;
     let mut reattached = Vec::new();
     for (task_id, raw_status) in store.read_task_statuses(session_id)? {
         if TaskStatus::parse(&raw_status) != Some(TaskStatus::WaitingForApproval) {

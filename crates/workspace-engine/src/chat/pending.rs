@@ -1173,6 +1173,15 @@ impl PausedTurns {
     }
 }
 
+/// Takes a paused turn off disk without resuming it, for a pause that was
+/// settled because a newer decision replaced it (spec 113 D3). Goes through
+/// [`PendingCommandStore::take`], the method the resume routes use, so there
+/// is one way a paused turn leaves the disk. Returns whether one was taken: a
+/// patch pause saves no paused turn, and a file a resume already took is gone.
+pub(crate) fn take_superseded_paused_turn(data_dir: &Path, proposal_id: &str) -> bool {
+    PendingCommandStore::new(data_dir).take(proposal_id).is_ok()
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct PendingCommandStore {
     pub(super) data_dir: PathBuf,

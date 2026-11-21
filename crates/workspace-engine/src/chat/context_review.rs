@@ -73,7 +73,7 @@ impl ChatOrchestrator {
                 proposal_id: proposal_id.clone(),
             }],
         );
-        let task = self.session_store.await_approval(
+        let task = self.await_approval(
             &task,
             &crate::session::PendingApprovalRef {
                 kind: "context_review".to_string(),

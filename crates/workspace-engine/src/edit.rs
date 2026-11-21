@@ -776,6 +776,12 @@ impl EditOrchestrator {
                 proposal_id: patch.id.clone(),
             },
         )?;
+        crate::pending_decisions::settle_older_pending_decisions(
+            &self.session_store,
+            &self.audit_log,
+            &session.id,
+            &task.id,
+        )?;
         self.audit_log.record(
             "edit_patch_ready_for_approval",
             &[

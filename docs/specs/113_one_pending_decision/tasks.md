@@ -1,6 +1,6 @@
 # Spec 113 tasks
 
-**Started:** not yet
+**Started:** 2026-11-21
 
 Implementation plan for [`proposal.md`](proposal.md). The evidence, the code
 survey and the decisions are in [`context.md`](context.md).
@@ -18,23 +18,23 @@ survey and the decisions are in [`context.md`](context.md).
 
 | Task | State | Durable result |
 |---|---|---|
-| 1 · One pending decision per session (req 3, D3, D4) | Not started | |
+| 1 · One pending decision per session (req 3, D3, D4) | Done 2026-11-21 | New `workspace-engine/src/pending_decisions.rs`: `settle_older_pending_decisions` (every other `WaitingForApproval` task of the session: paused turn taken through `PendingCommandStore::take` via `chat::take_superseded_paused_turn`, status `Cancelled`, audit `pending_decision_superseded` with `sessionId`, `taskId`, `supersededBy`, `kind` — the approval kind, `question`, or `unknown` for a link-less pause — and `pausedTurnTaken`) and `keep_newest_pending_decision` (newest by creation order). Both return early for a session with a worker record (spec 57). **Hook:** not inside `SessionStore::await_approval`/`await_answer`, which hold no `AuditLog`; instead `ChatOrchestrator::await_approval`/`await_answer` wrap them and every chat pause site calls those (agentic turn, context review, repair question, fallback and round budget, both check batches), plus the one engine pause outside chat (`edit.rs`, the CLI edit patch). A new pause site must use the wrapper. The sweep: `reattach_pending_approvals` calls `keep_newest_pending_decision` first, so the shell's `run_sweep` needed no change. **Deviations:** "older" is implemented as every other waiting task of the session (the pause just raised is by definition the newest decision). A patch pause saves no paused turn, so its proposal stays in the patch store as history (`pausedTurnTaken: false`); a paused-turn file that no longer parses as `PendingChatTurn` is left on disk by `take` (orphaned, never reattached, since its task is `Cancelled`). **Readers of `WaitingForApproval`**, checked: sidebar `json::session_state` keys on the newest task's status, and `cancelled` maps to no state; `/api/pending-card` (`read_pending_approval`) and `/api/session`'s `pendingDecision` (`TaskControlService::pending_decision`) return nothing unless waiting; crash classification skips terminal `Cancelled`; the sweep reattaches only waiting tasks. A settled task drops out of each. **Tests** (`tests/one_pending_decision.rs`, 3): the live incident shape (A's plan review settled when B pauses: A `Cancelled`, file gone, audit names B, `reattach` returns only B, approving A's review afterwards errors), a three-pause pile keeps the newest after the sweep (another session's pause untouched; a second sweep settles nothing), and a worker session left alone; each asserts nothing was approved, written or run. Mutation-checked: disabling the settle fails the first two, dropping the worker guard fails the third. **Checks:** `cargo clippy -p workspace-engine --all-targets --locked -- -D warnings` clean; `cargo nextest run -p workspace-engine --locked` 2729 run, all pass (the 25 loopback-binding tests in `external_reference`/`foundation` rerun outside the sandbox); `cargo nextest run -p desktop-shell --locked` 353 passed; `scripts/quality-gate.sh fmt node lint typos deny` ok; deterministic eval tier 65/65 pass. Desktop-shell code is unchanged. Workspace clippy and tests left to CI. |
 | 2 · What typing does while a decision waits (req 1, 2, D1, D2) | Not started | |
 | 3 · The model asks choices with `ask_user` (req 4, D5) | Not started | |
 | 4 · Documentation and close-out | Not started | |
 
 ## Task 1 · One pending decision per session (req 3, D3, D4)
 
-- [ ] When a task's status becomes `WaitingForApproval` with its pending link,
+- [x] When a task's status becomes `WaitingForApproval` with its pending link,
       settle every older `WaitingForApproval` task of the same session: take
       its pending turn through the store, set it `Cancelled`, audit
       `pending_decision_superseded` (`taskId`, `supersededBy`, `kind`).
       Exclude worker sessions.
-- [ ] The startup sweep applies the same rule to a session with several pending
+- [x] The startup sweep applies the same rule to a session with several pending
       decisions before reattaching (keep the newest).
-- [ ] Engine tests: the two acceptance criteria for requirement 3, plus a
+- [x] Engine tests: the two acceptance criteria for requirement 3, plus a
       worker session left alone and nothing approved or run.
-- [ ] Check what reads `WaitingForApproval` (sidebar state, `/api/pending-card`,
+- [x] Check what reads `WaitingForApproval` (sidebar state, `/api/pending-card`,
       recovery) and record that a settled task drops out of each.
 
 Files: `crates/workspace-engine/src/` (session store, recovery, the pause
