@@ -14019,8 +14019,10 @@ function resetPendingDecision() {
 }
 
 // Reload: the engine reports the decision in `/api/session`; the card is the
-// reloaded question or, after a restart, the reattached approval (spec 45).
-function restorePendingDecision(tasks) {
+// reloaded question, after a restart the reattached approval (spec 45), and
+// otherwise the live card redrawn from `/api/pending-card`. `isCurrent` says
+// whether this session load is still the one on screen after that read.
+async function restorePendingDecision(tasks, isCurrent = () => true) {
   if (isWorkerSession(currentSessionId)) return;
   const task = tasks.findLast((entry) => entry.turnPresentation?.pendingDecision);
   if (!task) return;
@@ -14044,8 +14046,38 @@ function restorePendingDecision(tasks) {
     (entry) => entry.dataset.taskId === task.id,
   );
   const body = bubble?.querySelector(".message-body");
-  setPendingDecision(body ? { body } : null, card || null, decision);
+  const live = card ? null : await loadPendingCard(task.id, decision);
+  if (!isCurrent()) return;
+  if (live) {
+    // A decision raised while the app runs: its paused turn is resumable, so
+    // the card is the one the live turn drew and answers through the same
+    // route, never the recovery close-out a reattached card uses.
+    appendProposals(body ? { body } : {}, live, repo());
+  } else {
+    setPendingDecision(body ? { body } : null, card || null, decision);
+  }
   if (body) restoreWaitingIndicator(body, decision.statusLabel || "Waiting for you");
+}
+
+// The live turn's `done` payload for one waiting task's card, rebuilt from the
+// engine's side-effect-free read, or null when there is none to draw (a
+// question has its transcript card; an unreadable proposal draws nothing).
+async function loadPendingCard(taskId, decision) {
+  const field = PENDING_DECISION_FIELDS[decision.kind];
+  if (!field || decision.kind === "question") return null;
+  let card = null;
+  try {
+    const query = `session_id=${encodeURIComponent(currentSessionId)}&task_id=${encodeURIComponent(taskId)}`;
+    ({ card } = await api(`/api/pending-card?${query}`));
+  } catch {
+    // The composer slot still names the decision; a card that cannot be read
+    // is no reason to stop the session from opening.
+    return null;
+  }
+  const payload = card?.payload;
+  // The card must answer the decision the engine reports, not some other one.
+  if (!payload || (payload.proposalId ?? payload.patchId) !== decision.cardId) return null;
+  return { taskId, turnPresentation: { pendingDecision: decision }, [field]: payload };
 }
 
 function focusPendingDecision() {
@@ -16126,7 +16158,8 @@ async function loadSession(sessionId) {
   if (!current()) return;
   // Spec 107: after everything else, so the decision the session waits on is
   // the last card above the composer.
-  restorePendingDecision(payload.tasks || []);
+  await restorePendingDecision(payload.tasks || [], current);
+  if (!current()) return;
   // Last: the strip and a worker's approval card follow what was just drawn.
   syncWorkerView();
 }

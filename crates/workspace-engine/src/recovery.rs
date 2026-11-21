@@ -583,183 +583,281 @@ pub fn reattach_pending_approvals(
         if TaskStatus::parse(&raw_status) != Some(TaskStatus::WaitingForApproval) {
             continue;
         }
-
-        let pending = store.pending_decision_for(session_id, &task_id)?;
-        if let Some(PendingDecision::Approval(PendingApprovalRef { kind, proposal_id })) = &pending
-            && kind == "patch"
-            && patch_already_decided(store, patches, session_id, &task_id, proposal_id)?
-        {
-            // Applied or rejected file by file before the process stopped. The
-            // task's status still says it waits, but there is nothing to
-            // review, and a card would offer a patch whose files may now match
-            // its base again, after a reset (spec 93).
-            continue;
-        }
-        let outcome = match &pending {
-            // Written by a version that recorded the status but not the link.
-            // There is nothing to reattach and nothing to guess from.
-            None => Err("the task records no pending proposal".to_string()),
-            Some(PendingDecision::Approval(PendingApprovalRef { kind, proposal_id }))
-                if kind == "command" =>
-            {
-                commands
-                    .load_proposal(proposal_id)
-                    .map(|proposal| ReattachedApproval::Command {
-                        task_id: task_id.clone(),
-                        proposal,
-                    })
-                    .map_err(|error| {
-                        format!("command proposal {proposal_id} is unreadable: {error:?}")
-                    })
-            }
-            Some(PendingDecision::Approval(PendingApprovalRef { kind, proposal_id }))
-                if kind == "patch" =>
-            {
-                reattach_patch(store, audit, patches, session_id, &task_id, proposal_id)
-            }
-            Some(PendingDecision::Approval(PendingApprovalRef { kind, proposal_id }))
-                if kind == "plan" =>
-            {
-                reattach_plan(store, paused, session_id, &task_id, proposal_id)
-            }
-            Some(PendingDecision::Approval(PendingApprovalRef { kind, proposal_id }))
-                if kind == "provider_fallback" =>
-            {
-                paused
-                    .provider_fallback_target(proposal_id)
-                    .map(|fallback_provider| ReattachedApproval::ProviderFallback {
-                        task_id: task_id.clone(),
-                        proposal_id: proposal_id.clone(),
-                        fallback_provider,
-                    })
-                    .ok_or_else(|| {
-                        format!("the paused turn behind fallback offer {proposal_id} is gone")
-                    })
-            }
-            Some(PendingDecision::Approval(PendingApprovalRef { kind, proposal_id }))
-                if kind == "round_budget" =>
-            {
-                paused
-                    .round_budget_pause(proposal_id)
-                    .map(|pause| ReattachedApproval::RoundBudget {
-                        task_id: task_id.clone(),
-                        proposal_id: proposal_id.clone(),
-                        rounds_used: pause.rounds_used,
-                        rounds_granted: pause.rounds_granted,
-                    })
-                    .ok_or_else(|| {
-                        format!("the paused turn behind round-budget pause {proposal_id} is gone")
-                    })
-            }
-            Some(PendingDecision::Approval(PendingApprovalRef { kind, proposal_id }))
-                if kind == "context_review" =>
-            {
-                paused
-                    .context_review_manifest(proposal_id)
-                    .map(|manifest| ReattachedApproval::ContextReview {
-                        task_id: task_id.clone(),
-                        proposal_id: proposal_id.clone(),
-                        manifest,
-                    })
-                    .ok_or_else(|| {
-                        format!("the paused turn behind context review {proposal_id} is gone")
-                    })
-            }
-            Some(PendingDecision::Approval(PendingApprovalRef { kind, proposal_id }))
-                if kind == "fetch" =>
-            {
-                paused
-                    .fetch_call(proposal_id)
-                    .map(|call| ReattachedApproval::Fetch {
-                        task_id: task_id.clone(),
-                        proposal_id: proposal_id.clone(),
-                        call,
-                    })
-                    .ok_or_else(|| {
-                        format!("the paused turn behind fetch approval {proposal_id} is gone")
-                    })
-            }
-            Some(PendingDecision::Approval(PendingApprovalRef { kind, proposal_id }))
-                if kind == "checks" =>
-            {
-                paused
-                    .check_batch_proposals(proposal_id)
-                    .filter(|checks| !checks.is_empty())
-                    .map(|checks| ReattachedApproval::CheckBatch {
-                        task_id: task_id.clone(),
-                        proposal_id: proposal_id.clone(),
-                        checks,
-                    })
-                    .ok_or_else(|| {
-                        format!("the paused turn behind check batch {proposal_id} is gone or empty")
-                    })
-            }
-            Some(PendingDecision::Approval(PendingApprovalRef { kind, .. })) => {
-                Err(format!("unknown pending approval kind {kind}"))
-            }
-            // The question and its answer live in the log, not in a paused-turn
-            // file: a question link with no `question_asked` event has nothing
-            // to show and nothing to answer, so it is failed like any other
-            // unrecoverable link (§5.5).
-            Some(PendingDecision::Question(question)) => {
-                match store.question_state(session_id, question.question_id()) {
-                    Ok(Some(state)) => Ok(ReattachedApproval::Question {
-                        task_id: task_id.clone(),
-                        question_id: state.question_id,
-                        question: state.question,
-                        options: state.options,
-                        allow_free_text: state.allow_free_text,
-                        answered: state.answer,
-                    }),
-                    Ok(None) => Err(format!(
-                        "question {} has no recorded state",
-                        question.question_id()
-                    )),
-                    Err(error) => Err(format!(
-                        "question {} is unreadable: {error:?}",
-                        question.question_id()
-                    )),
+        let reason =
+            match read_task_pending(store, commands, patches, paused, session_id, &task_id)? {
+                PendingRead::Nothing => continue,
+                PendingRead::Ready(value) => {
+                    reattached.push(*value);
+                    continue;
                 }
-            }
-        };
-
-        match outcome {
-            Ok(value) => reattached.push(value),
-            Err(reason) => {
-                fail_task(store, audit, session_id, &task_id, &reason)?;
-                reattached.push(ReattachedApproval::Unavailable { task_id, reason });
-            }
-        }
+                PendingRead::Unrestorable {
+                    reason,
+                    protected: false,
+                } => reason,
+                PendingRead::Unrestorable {
+                    reason,
+                    protected: true,
+                } => match record_protected_path_recovery_refusal(
+                    store, audit, session_id, &task_id, &reason,
+                ) {
+                    Ok(()) => reason,
+                    Err(error) => format!("could not record the protected-path refusal: {error:?}"),
+                },
+            };
+        fail_task(store, audit, session_id, &task_id, &reason)?;
+        reattached.push(ReattachedApproval::Unavailable { task_id, reason });
     }
     Ok(reattached)
 }
 
-/// Reattaches one pending patch, refusing it when a remaining file became
-/// protected after the card was written (spec 98).
+/// The card payload of the decision one task is waiting on, read without
+/// writing anything.
+///
+/// The launch sweep ([`reattach_pending_approvals`]) is the only reader that
+/// may act on what it finds: it fails a task whose proposal is gone and audits
+/// it, which is why it runs once per process. This read is for redrawing the
+/// card of a pause raised while the process runs, on every session reload:
+/// `None` when the task is not waiting, when a live worker owns the session's
+/// approvals (spec 57 C12), when a patch was already decided file by file, or
+/// when the proposal cannot be re-presented. Nothing is failed or recorded
+/// then; the next launch's sweep is what closes an unrestorable task.
+pub fn read_pending_approval(
+    store: &SessionStore,
+    commands: &CommandStore,
+    patches: &PatchStore,
+    paused: &PausedTurns,
+    session_id: &str,
+    task_id: &str,
+) -> Result<Option<ReattachedApproval>> {
+    if store.has_live_worker(session_id)? {
+        return Ok(None);
+    }
+    let waiting = store
+        .read_task_statuses(session_id)?
+        .get(task_id)
+        .and_then(|status| TaskStatus::parse(status))
+        == Some(TaskStatus::WaitingForApproval);
+    if !waiting {
+        return Ok(None);
+    }
+    Ok(
+        match read_task_pending(store, commands, patches, paused, session_id, task_id)? {
+            PendingRead::Ready(value) => Some(*value),
+            PendingRead::Nothing | PendingRead::Unrestorable { .. } => None,
+        },
+    )
+}
+
+/// What one waiting task's pause link resolves to.
+enum PendingRead {
+    /// Nothing to offer: a patch already decided file by file.
+    Nothing,
+    Ready(Box<ReattachedApproval>),
+    /// The proposal cannot be re-presented. `protected` marks a patch refused
+    /// because a remaining file became protected after the card was written
+    /// (spec 98), which the sweep records as its own refusal.
+    Unrestorable {
+        reason: String,
+        protected: bool,
+    },
+}
+
+/// Resolves one waiting task's pause link to its payload. Reads only: the
+/// caller decides what an unrestorable link means.
+fn read_task_pending(
+    store: &SessionStore,
+    commands: &CommandStore,
+    patches: &PatchStore,
+    paused: &PausedTurns,
+    session_id: &str,
+    task_id: &str,
+) -> Result<PendingRead> {
+    let task_id = task_id.to_string();
+    let pending = store.pending_decision_for(session_id, &task_id)?;
+    if let Some(PendingDecision::Approval(PendingApprovalRef { kind, proposal_id })) = &pending
+        && kind == "patch"
+        && patch_already_decided(store, patches, session_id, &task_id, proposal_id)?
+    {
+        // Applied or rejected file by file before the process stopped. The
+        // task's status still says it waits, but there is nothing to
+        // review, and a card would offer a patch whose files may now match
+        // its base again, after a reset (spec 93).
+        return Ok(PendingRead::Nothing);
+    }
+    let outcome = match &pending {
+        // Written by a version that recorded the status but not the link.
+        // There is nothing to reattach and nothing to guess from.
+        None => Err("the task records no pending proposal".to_string()),
+        Some(PendingDecision::Approval(PendingApprovalRef { kind, proposal_id }))
+            if kind == "command" =>
+        {
+            commands
+                .load_proposal(proposal_id)
+                .map(|proposal| ReattachedApproval::Command {
+                    task_id: task_id.clone(),
+                    proposal,
+                })
+                .map_err(|error| format!("command proposal {proposal_id} is unreadable: {error:?}"))
+        }
+        Some(PendingDecision::Approval(PendingApprovalRef { kind, proposal_id }))
+            if kind == "patch" =>
+        {
+            return Ok(
+                match read_patch(store, patches, session_id, &task_id, proposal_id) {
+                    Ok(value) => PendingRead::Ready(Box::new(value)),
+                    Err((reason, protected)) => PendingRead::Unrestorable { reason, protected },
+                },
+            );
+        }
+        Some(PendingDecision::Approval(PendingApprovalRef { kind, proposal_id }))
+            if kind == "plan" =>
+        {
+            reattach_plan(store, paused, session_id, &task_id, proposal_id)
+        }
+        Some(PendingDecision::Approval(PendingApprovalRef { kind, proposal_id }))
+            if kind == "provider_fallback" =>
+        {
+            paused
+                .provider_fallback_target(proposal_id)
+                .map(|fallback_provider| ReattachedApproval::ProviderFallback {
+                    task_id: task_id.clone(),
+                    proposal_id: proposal_id.clone(),
+                    fallback_provider,
+                })
+                .ok_or_else(|| {
+                    format!("the paused turn behind fallback offer {proposal_id} is gone")
+                })
+        }
+        Some(PendingDecision::Approval(PendingApprovalRef { kind, proposal_id }))
+            if kind == "round_budget" =>
+        {
+            paused
+                .round_budget_pause(proposal_id)
+                .map(|pause| ReattachedApproval::RoundBudget {
+                    task_id: task_id.clone(),
+                    proposal_id: proposal_id.clone(),
+                    rounds_used: pause.rounds_used,
+                    rounds_granted: pause.rounds_granted,
+                })
+                .ok_or_else(|| {
+                    format!("the paused turn behind round-budget pause {proposal_id} is gone")
+                })
+        }
+        Some(PendingDecision::Approval(PendingApprovalRef { kind, proposal_id }))
+            if kind == "context_review" =>
+        {
+            paused
+                .context_review_manifest(proposal_id)
+                .map(|manifest| ReattachedApproval::ContextReview {
+                    task_id: task_id.clone(),
+                    proposal_id: proposal_id.clone(),
+                    manifest,
+                })
+                .ok_or_else(|| {
+                    format!("the paused turn behind context review {proposal_id} is gone")
+                })
+        }
+        Some(PendingDecision::Approval(PendingApprovalRef { kind, proposal_id }))
+            if kind == "fetch" =>
+        {
+            paused
+                .fetch_call(proposal_id)
+                .map(|call| ReattachedApproval::Fetch {
+                    task_id: task_id.clone(),
+                    proposal_id: proposal_id.clone(),
+                    call,
+                })
+                .ok_or_else(|| {
+                    format!("the paused turn behind fetch approval {proposal_id} is gone")
+                })
+        }
+        Some(PendingDecision::Approval(PendingApprovalRef { kind, proposal_id }))
+            if kind == "checks" =>
+        {
+            paused
+                .check_batch_proposals(proposal_id)
+                .filter(|checks| !checks.is_empty())
+                .map(|checks| ReattachedApproval::CheckBatch {
+                    task_id: task_id.clone(),
+                    proposal_id: proposal_id.clone(),
+                    checks,
+                })
+                .ok_or_else(|| {
+                    format!("the paused turn behind check batch {proposal_id} is gone or empty")
+                })
+        }
+        Some(PendingDecision::Approval(PendingApprovalRef { kind, .. })) => {
+            Err(format!("unknown pending approval kind {kind}"))
+        }
+        // The question and its answer live in the log, not in a paused-turn
+        // file: a question link with no `question_asked` event has nothing
+        // to show and nothing to answer, so it is failed like any other
+        // unrecoverable link (§5.5).
+        Some(PendingDecision::Question(question)) => {
+            match store.question_state(session_id, question.question_id()) {
+                Ok(Some(state)) => Ok(ReattachedApproval::Question {
+                    task_id: task_id.clone(),
+                    question_id: state.question_id,
+                    question: state.question,
+                    options: state.options,
+                    allow_free_text: state.allow_free_text,
+                    answered: state.answer,
+                }),
+                Ok(None) => Err(format!(
+                    "question {} has no recorded state",
+                    question.question_id()
+                )),
+                Err(error) => Err(format!(
+                    "question {} is unreadable: {error:?}",
+                    question.question_id()
+                )),
+            }
+        }
+    };
+    Ok(match outcome {
+        Ok(value) => PendingRead::Ready(Box::new(value)),
+        Err(reason) => PendingRead::Unrestorable {
+            reason,
+            protected: false,
+        },
+    })
+}
+
+/// Reads one pending patch, refusing it when a remaining file became
+/// protected after the card was written (spec 98). The error's flag is set
+/// for that refusal, which the sweep records; an unreadable patch is not.
 ///
 /// Only files without a decision are still actionable, so an already-decided
 /// protected file must not turn a harmless remaining review into a refusal.
-fn reattach_patch(
+fn read_patch(
     store: &SessionStore,
-    audit: &AuditLog,
     patches: &PatchStore,
     session_id: &str,
     task_id: &str,
     proposal_id: &str,
-) -> std::result::Result<ReattachedApproval, String> {
+) -> std::result::Result<ReattachedApproval, (String, bool)> {
+    let unreadable = |reason: String| (reason, false);
     let patch = patches
         .load(proposal_id)
-        .map_err(|error| format!("patch {proposal_id} is unreadable: {error:?}"))?;
+        .map_err(|error| unreadable(format!("patch {proposal_id} is unreadable: {error:?}")))?;
     let decided: std::collections::BTreeSet<String> = store
         .read_patch_file_decisions(session_id, task_id)
-        .map_err(|error| format!("patch decisions for {proposal_id} are unreadable: {error:?}"))?
+        .map_err(|error| {
+            unreadable(format!(
+                "patch decisions for {proposal_id} are unreadable: {error:?}"
+            ))
+        })?
         .into_iter()
         .filter(|decision| decision.patch_id == proposal_id)
         .flat_map(|decision| decision.paths)
         .collect();
     let active = store
         .task_protected_paths(session_id, task_id)
-        .map_err(|error| format!("protected paths for {task_id} are unreadable: {error:?}"))?;
+        .map_err(|error| {
+            unreadable(format!(
+                "protected paths for {task_id} are unreadable: {error:?}"
+            ))
+        })?;
     let mut protected: Vec<String> = Vec::new();
     for file in patch
         .files
@@ -778,13 +876,13 @@ fn reattach_patch(
             patch,
         });
     }
-    let reason = format!(
-        "Patch would modify protected task path: {}",
-        protected.join(", ")
-    );
-    record_protected_path_recovery_refusal(store, audit, session_id, task_id, &reason)
-        .map_err(|error| format!("could not record the protected-path refusal: {error:?}"))?;
-    Err(reason)
+    Err((
+        format!(
+            "Patch would modify protected task path: {}",
+            protected.join(", ")
+        ),
+        true,
+    ))
 }
 
 /// The plan a task paused to have reviewed, and the action that review is

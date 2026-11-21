@@ -36,6 +36,15 @@ pub(crate) fn handle_recovery(stream: &mut TcpStream, request: &Request) -> Resu
     write_response(stream, request, 200, "application/json", &payload)
 }
 
+/// The pending card of one waiting task, read without side effects, so a
+/// reload can redraw a decision raised while the app runs.
+pub(crate) fn handle_pending_card(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let session_id = required_param(request, "session_id")?;
+    let task_id = required_param(request, "task_id")?;
+    let payload = recovery::pending_card_json(&session_id, &task_id)?;
+    write_response(stream, request, 200, "application/json", &payload)
+}
+
 pub(crate) fn handle_recovery_decision(
     stream: &mut TcpStream,
     request: &Request,

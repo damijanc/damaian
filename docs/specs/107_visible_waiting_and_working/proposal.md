@@ -57,6 +57,22 @@ not matter.
    scrolled out of view; a question reads "Needs your answer". The question
    lock (D2) is unchanged, with the placeholder "Answer the question" (no
    direction).
+
+   *Note 2026-11-20:* a reload (switching sessions, or the reload when work
+   elsewhere ends) redraws the card for every pending kind, not only a
+   question or a decision the startup recovery sweep reattached. When the
+   page has neither, `restorePendingDecision` reads the card from
+   `GET /api/pending-card?session_id=&task_id=`, which uses the engine's
+   `read_pending_approval`. That is the sweep's per-task reader, which only
+   reads: it never fails a task or writes audit events, so an unrestorable
+   proposal draws no card and is left for the next launch's sweep. The
+   payload goes to `appendProposals` as a live `done` payload, so the card is
+   the live one and answers through the live resume route, never the
+   recovery close-out. Command, patch, plan, fetch and context-review
+   payloads have the live shape. Round-budget, fallback and check-batch
+   payloads have the thinner reattached shape (no `roundsMore`, fallback
+   model or refusal code, or baseline title and note), which the same cards
+   already render.
 3. **The status line never goes blank while a turn is alive.** It shows the
    waiting state ("Waiting for your answer", "Waiting for your review",
    "Running baseline: cargo test (repository root) · 1m 12s") instead of being

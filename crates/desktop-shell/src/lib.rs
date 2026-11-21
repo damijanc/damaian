@@ -456,6 +456,7 @@ fn dispatch(
         // runs once per process; every call after the first serves the same
         // snapshot, minus tasks the user has since dealt with.
         Route::Recovery => handle_recovery(stream, request),
+        Route::PendingCard => handle_pending_card(stream, request),
         // Resume, mark failed, or abandon one recovered task. The decision is
         // re-classified server-side: see `recovery::decide`.
         Route::RecoveryDecision => handle_recovery_decision(stream, request),

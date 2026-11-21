@@ -2322,7 +2322,7 @@ fn app_js_draws_a_reattached_question_answerable_once() {
         .find("await renderRecoveryPrompts(currentSessionId, generation);")
         .unwrap();
     let pending = load
-        .find("restorePendingDecision(payload.tasks || []);")
+        .find("await restorePendingDecision(payload.tasks || [], current);")
         .unwrap();
     assert!(sweep < pending, "{load}");
 
@@ -2512,6 +2512,55 @@ fn app_js_reads_busy_elsewhere_only_from_a_poll_sent_after_local_work_ended() {
     );
 }
 
+/// Spec 107 note 2026-11-20: a reload drew no card for a command, patch or
+/// plan paused while the app runs — only a question or a decision the
+/// startup sweep reattached had one. With neither on the page, the card is
+/// read from `/api/pending-card` and drawn by `appendProposals`, the live
+/// turn's own builder, so it answers through the live resume route and never
+/// the recovery close-out (`resolveReattachedApproval`, `detached`).
+#[test]
+fn app_js_redraws_a_live_pending_card_on_reload() {
+    let restore = app_js_function("restorePendingDecision");
+    let found = restore.find("const card =").expect("the page's own card");
+    let read = restore
+        .find("card ? null : await loadPendingCard(task.id, decision)")
+        .expect("the card is read only when the page has none");
+    assert!(found < read, "{restore}");
+    assert!(
+        restore.contains("if (!isCurrent()) return;"),
+        "a load overtaken during the read draws nothing: {restore}"
+    );
+    assert!(
+        restore.contains("appendProposals(body ? { body } : {}, live, repo());"),
+        "the live builder draws it: {restore}"
+    );
+    for recovery_route in [
+        "resolveReattachedApproval",
+        "detached",
+        "createReattachedApprovalCard",
+    ] {
+        assert!(
+            !restore.contains(recovery_route),
+            "{recovery_route}: {restore}"
+        );
+    }
+
+    let load = app_js_function("loadPendingCard");
+    assert!(load.contains("/api/pending-card?"), "{load}");
+    assert!(
+        load.contains(r#"decision.kind === "question""#),
+        "a question keeps its transcript card: {load}"
+    );
+    assert!(
+        load.contains("(payload.proposalId ?? payload.patchId) !== decision.cardId"),
+        "the card must answer the decision the engine reports: {load}"
+    );
+    assert!(
+        load.contains("turnPresentation: { pendingDecision: decision }, [field]: payload"),
+        "shaped like the live turn's `done` payload: {load}"
+    );
+}
+
 fn app_js_function(name: &str) -> &'static str {
     let app = super::APP_JS;
     let start = app
@@ -2669,7 +2718,7 @@ fn app_js_restores_the_pending_decision_last_on_reload() {
         .find("await refreshMemoryProposals(currentSessionId)")
         .unwrap();
     let restore = load
-        .find("restorePendingDecision(payload.tasks || [])")
+        .find("restorePendingDecision(payload.tasks || [], current)")
         .expect("loadSession restores the pending decision");
     let recovery = load.find("await renderRecoveryPrompts(").unwrap();
     assert!(recovery < restore && memory < restore);

@@ -45,6 +45,7 @@ pub(crate) enum Route {
     CancelSessionWork,
     SessionNote,
     Recovery,
+    PendingCard,
     RecoveryDecision,
     RecoveryApprovalResolved,
     Checkpoints,
@@ -189,6 +190,7 @@ pub(crate) const ROUTES: &[(&str, &str, Route)] = &[
     ("POST", "/api/session-work-cancel", Route::CancelSessionWork),
     ("POST", "/api/session-note", Route::SessionNote),
     ("GET", "/api/recovery", Route::Recovery),
+    ("GET", "/api/pending-card", Route::PendingCard),
     ("POST", "/api/recovery-decision", Route::RecoveryDecision),
     (
         "POST",
@@ -442,6 +444,8 @@ impl Route {
             // Reaches the running turn's queue; never claims the lane (D7).
             | Route::SessionNote
             | Route::Recovery
+            // Reads one waiting task's card; writes nothing.
+            | Route::PendingCard
             | Route::Checkpoints
             | Route::Session
             | Route::SessionCreate
@@ -605,6 +609,7 @@ mod tests {
             "/api/working-sessions",
             "/api/session-work-cancel",
             "/api/session-note",
+            "/api/pending-card",
         ] {
             assert!(!session_work.contains(ui), "{ui} must stay a UI route");
         }

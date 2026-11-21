@@ -13,7 +13,8 @@ use workspace_engine::{
     AgentFetchProposal, CommandProposal, PausedTurns, PendingVerification, ProposedPatch,
     QUESTION_WAITING_HEADLINE, ReattachedApproval, RecoveredTask, TaskStatus, WorkspaceEngine,
     allow_always_eligible, classify_session, command_approval_prompt, headline,
-    pending_verifications, reattach_pending_approvals, resume_allowed, resume_blocked_reason,
+    pending_verifications, read_pending_approval, reattach_pending_approvals, resume_allowed,
+    resume_blocked_reason,
 };
 
 use crate::{escape_json, fetch_proposal_json, patch_payload_json, plan_json};
@@ -391,6 +392,43 @@ fn forget(session_id: &str, task_id: &str) -> Result<(), String> {
         .approvals
         .retain(|approval| approval.session_id != session_id || approval.task_id != task_id);
     Ok(())
+}
+
+/// The card payload of the decision one task is waiting on, for redrawing the
+/// card when a session is reloaded (spec 107 requirement 1, note 2026-11-20).
+///
+/// `{"card":null}` when there is nothing to draw. Unlike the sweep this runs on
+/// every reload, so it only reads: an unrestorable proposal draws no card and is
+/// failed by the next launch's sweep, not here. The payload is the same one the
+/// reattached card gets, which for a command, patch, plan, fetch or context
+/// review is the live turn's shape, so the shell draws the live card and
+/// answers through the live resume route.
+pub fn pending_card_json(session_id: &str, task_id: &str) -> Result<String, String> {
+    let engine = crate::default_engine()?;
+    pending_card_payload(&engine, session_id, task_id)
+}
+
+fn pending_card_payload(
+    engine: &WorkspaceEngine,
+    session_id: &str,
+    task_id: &str,
+) -> Result<String, String> {
+    let approval = read_pending_approval(
+        &engine.session_store,
+        &engine.command_store,
+        &engine.patch_store,
+        &PausedTurns::new(&engine.config.data_dir),
+        session_id,
+        task_id,
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(format!(
+        "{{\"card\":{}}}",
+        approval.map_or_else(
+            || "null".to_string(),
+            |approval| approval_json(&describe_approval(engine, session_id, approval))
+        )
+    ))
 }
 
 fn sweep_once(engine: &WorkspaceEngine) -> Result<&'static Mutex<Sweep>, String> {
@@ -950,7 +988,7 @@ fn approval_json(approval: &Approval) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Sweep, apply_decision, run_sweep, sweep_payload};
+    use super::{Sweep, apply_decision, pending_card_payload, run_sweep, sweep_payload};
     use std::collections::HashMap;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -2003,6 +2041,246 @@ mod tests {
                 .get(&task.id)
                 .map(String::as_str),
             Some("failed")
+        );
+    }
+
+    /// A task paused on `kind` while the app runs, its paused turn written as
+    /// `pending` (none for a command or patch, whose proposal is stored).
+    fn paused_on(
+        engine: &WorkspaceEngine,
+        dir: &Path,
+        kind: &str,
+        proposal_id: &str,
+        pending: Option<&str>,
+    ) -> (String, Task) {
+        let session = engine
+            .session_store
+            .create_session("repo_1", "Reload")
+            .unwrap();
+        let task = engine
+            .session_store
+            .create_task(&session.id, "do the work", "mock", "m")
+            .unwrap();
+        if let Some(pending) = pending {
+            let folder = dir.join("chat").join("pending");
+            fs::create_dir_all(&folder).unwrap();
+            fs::write(folder.join(format!("{proposal_id}.json")), pending).unwrap();
+        }
+        engine
+            .session_store
+            .await_approval(
+                &task,
+                &PendingApprovalRef {
+                    kind: kind.to_string(),
+                    proposal_id: proposal_id.to_string(),
+                },
+            )
+            .unwrap();
+        (session.id, task)
+    }
+
+    fn pending_card(
+        engine: &WorkspaceEngine,
+        session_id: &str,
+        task_id: &str,
+    ) -> serde_json::Value {
+        let payload = pending_card_payload(engine, session_id, task_id).expect("the read succeeds");
+        serde_json::from_str(&payload).expect("the card is JSON")
+    }
+
+    /// Spec 107 note 2026-11-20: a reload redraws the card of a decision
+    /// raised while the app runs, for every kind the startup sweep can
+    /// reattach, with the payload the card builders take and the proposal id
+    /// the engine's `pendingDecision.cardId` names.
+    #[test]
+    fn a_reload_reads_the_pending_card_of_every_decision_kind() {
+        let (engine, dir) = engine("pending-card-kinds");
+        let command = engine
+            .validation_orchestrator
+            .propose_command(&dir, "cargo build", "Desktop command proposal")
+            .unwrap();
+        let check = engine
+            .validation_orchestrator
+            .propose_command(&dir, "cargo test", "Desktop command proposal")
+            .unwrap();
+        let patch = workspace_engine::ProposedPatch {
+            id: "patch_live".to_string(),
+            session_id: String::new(),
+            origin_session_id: String::new(),
+            task_id: None,
+            summary: "Rename the helper".to_string(),
+            status: "pending".to_string(),
+            created_at_ms: 1,
+            repair_scope: None,
+            files: vec![workspace_engine::ProposedFilePatch {
+                path: "src/a.rs".to_string(),
+                status: "modified".to_string(),
+                base_hash: None,
+                new_hash: String::new(),
+                diff: String::new(),
+                hunks: Vec::new(),
+                new_content: "pub fn b() {}\n".to_string(),
+            }],
+        };
+        engine.patch_store.save(&patch).unwrap();
+        let check_batch = format!(
+            r#"{{"proposal_id":"checks_1","check_batch":{{"checks":[{{"proposal_id":"{}"}}]}}}}"#,
+            check.id
+        );
+        let cases: Vec<(&str, &str, Option<&str>, &str, &str)> = vec![
+            ("command", &command.id, None, "proposalId", "cargo build"),
+            ("patch", "patch_live", None, "patchId", "Rename the helper"),
+            (
+                "provider_fallback",
+                "fallback_1",
+                Some(
+                    r#"{"proposal_id":"fallback_1","provider_fallback":{"fallback_provider":"openai"}}"#,
+                ),
+                "proposalId",
+                "openai",
+            ),
+            (
+                "round_budget",
+                "rounds_1",
+                Some(
+                    r#"{"proposal_id":"rounds_1","round_budget":{"rounds_used":16,"rounds_granted":16}}"#,
+                ),
+                "proposalId",
+                "\"roundsUsed\":16",
+            ),
+            (
+                "fetch",
+                "fetch_1",
+                Some(concat!(
+                    r#"{"proposal_id":"fetch_1","fetch_call":{"host":"docs.example.com","#,
+                    r#""url":"https://docs.example.com/a","approval_key":"docs.example.com","#,
+                    r#""long_components":[],"query":null,"fragment":null}}"#,
+                )),
+                "proposalId",
+                "https://docs.example.com/a",
+            ),
+            (
+                "checks",
+                "checks_1",
+                Some(&check_batch),
+                "proposalId",
+                "cargo test",
+            ),
+        ];
+        for (kind, proposal_id, pending, id_field, shown) in cases {
+            let (session_id, task) = paused_on(&engine, &dir, kind, proposal_id, pending);
+            let card = pending_card(&engine, &session_id, &task.id)["card"].clone();
+            assert_eq!(card["kind"], kind, "{kind}: {card}");
+            assert_eq!(card["taskId"], task.id.as_str(), "{kind}: {card}");
+            assert_eq!(card["payload"][id_field], proposal_id, "{kind}: {card}");
+            assert!(card.to_string().contains(shown), "{kind}: {card}");
+        }
+    }
+
+    /// The plan review is the kind the owner met (2026-11-20): the card needs
+    /// the plan from the log and the deferred action from the paused turn, in
+    /// `plan_proposal_json`'s shape.
+    #[test]
+    fn a_reload_reads_a_pending_plan_review_in_the_live_shape() {
+        let (engine, dir) = engine("pending-card-plan");
+        let (session_id, task) = paused_on(
+            &engine,
+            &dir,
+            "plan",
+            "planprop_live",
+            Some(
+                r#"{"proposal_id":"planprop_live","plan_review":{"deferred_action":"apply a patch"}}"#,
+            ),
+        );
+        let mut plan = TaskPlan::new(&task.id, 1);
+        plan.steps.push(PlanStep {
+            id: "step_1".to_string(),
+            title: "Add a retry helper".to_string(),
+            detail: None,
+            status: StepStatus::Pending,
+            depends_on: Vec::new(),
+            started_at_ms: None,
+            completed_at_ms: None,
+            evidence: Vec::new(),
+            check: None,
+            build: None,
+        });
+        engine.session_store.create_plan(&task, &plan).unwrap();
+
+        let card = pending_card(&engine, &session_id, &task.id)["card"].clone();
+
+        assert_eq!(card["kind"], "plan", "{card}");
+        assert_eq!(card["payload"]["proposalId"], "planprop_live", "{card}");
+        assert_eq!(card["payload"]["deferredAction"], "apply a patch", "{card}");
+        assert!(card.to_string().contains("Add a retry helper"), "{card}");
+    }
+
+    /// The read runs on every reload, so unlike the sweep it must never act on
+    /// what it finds: an unrestorable pause draws no card and stays waiting,
+    /// with nothing audited, for the next launch's sweep to close.
+    #[test]
+    fn reading_a_pending_card_writes_nothing() {
+        let (engine, dir) = engine("pending-card-pure");
+        let (session_id, task) = paused_on(&engine, &dir, "plan", "planprop_gone", None);
+        let command = engine
+            .validation_orchestrator
+            .propose_command(&dir, "ls -la", "Desktop command proposal")
+            .unwrap();
+        let (command_session, command_task) =
+            paused_on(&engine, &dir, "command", &command.id, None);
+        let audit_before = audit_text(&dir);
+
+        for _ in 0..2 {
+            assert_eq!(
+                pending_card(&engine, &session_id, &task.id)["card"],
+                serde_json::Value::Null
+            );
+            assert_eq!(
+                pending_card(&engine, &command_session, &command_task.id)["card"]["kind"],
+                "command"
+            );
+        }
+
+        assert_eq!(audit_text(&dir), audit_before, "the read audited something");
+        assert_eq!(
+            engine
+                .session_store
+                .read_task_statuses(&session_id)
+                .unwrap()
+                .get(&task.id)
+                .map(String::as_str),
+            Some("waiting_for_approval"),
+            "the read failed the task"
+        );
+        assert_eq!(
+            engine
+                .command_store
+                .load_proposal(&command.id)
+                .unwrap()
+                .status,
+            "pending",
+            "the read decided the command"
+        );
+    }
+
+    /// A task that is not waiting has no card, even when its old pause link is
+    /// still in the log.
+    #[test]
+    fn a_settled_task_has_no_pending_card() {
+        let (engine, dir) = engine("pending-card-settled");
+        let command = engine
+            .validation_orchestrator
+            .propose_command(&dir, "ls -la", "Desktop command proposal")
+            .unwrap();
+        let (session_id, task) = paused_on(&engine, &dir, "command", &command.id, None);
+        engine
+            .session_store
+            .update_task_status(&task, TaskStatus::Complete, None)
+            .unwrap();
+
+        assert_eq!(
+            pending_card(&engine, &session_id, &task.id)["card"],
+            serde_json::Value::Null
         );
     }
 }
