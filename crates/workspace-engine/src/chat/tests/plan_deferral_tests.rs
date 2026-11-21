@@ -39,3 +39,20 @@ fn a_planned_check_with_a_dot_prefix_defers_the_normalized_discovered_check() {
         "`./crates/foo` and `crates/foo` are the same check directory"
     );
 }
+
+/// Spec 113 requirement 4: the review offers only what the card can do —
+/// approve, or decline and say what to change. Spec 108 removed the step
+/// editor, so reordering or retitling is no longer offered.
+#[test]
+fn the_plan_review_text_offers_approve_or_decline_with_changes() {
+    let response = plan_review_response(&plan_with_check(""), "edit src/lib.rs");
+    assert!(response.contains("1. Validate the change"), "{response}");
+    assert!(response.contains("(edit src/lib.rs)"), "{response}");
+    assert!(
+        response.ends_with("You can approve the plan, or decline it and say what to change."),
+        "{response}"
+    );
+    for removed in ["reorder", "retitle", "remove any"] {
+        assert!(!response.contains(removed), "{removed}: {response}");
+    }
+}

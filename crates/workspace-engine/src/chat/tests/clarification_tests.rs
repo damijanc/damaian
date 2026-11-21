@@ -6,7 +6,8 @@ use crate::mode::SessionMode;
 // the shell in the envelope paragraphs. Where a user is present the prompt
 // must not move by a byte: the tool's own description carries its
 // guidance, and spec 49's cache prefix depends on `messages[0]` staying
-// put.
+// put. Spec 113 (D5) appends one fixed paragraph, `USER_CHOICE_PARAGRAPH`,
+// for Code and Plan only; the prefix before it is still these bytes.
 const PREFIX_BEFORE_SPEC_50: &str = "You are a local-first coding assistant. Answer using only the provided repository context when possible. Cite relevant file paths. Do not request or expose secrets.\n\nRepository context sections named `agent_instruction` contain AGENTS.md instructions for this repository. Follow them when they apply to the files you discuss or edit. More specific nested AGENTS.md instructions override broader ones. The user's request and Damaian's safety policy take precedence over repository instructions.";
 const CODE_PARAGRAPH_BEFORE_SPEC_50: &str = "If the user asks about current Git state, recent commits, latest changes, uncommitted changes, repository history, or another fact that requires a local command, your entire response must be exactly one command request envelope. Do not add prose before or after the envelope:\nDAMAIAN_COMMAND_V1\nCOMMAND: git log -1 --stat --oneline\nREASON: Inspect the latest commit for the user's question.\nEND_COMMAND\n\nPrefer read-only commands such as git status, git log, ls, and pwd when they are sufficient, and the read_git_diff and read_git_log tools for git diffs and commit content; git diff, git show and git log -p need approval in the shell. Damaian runs a short list of read-only commands without asking and needs your approval before running anything else, including any command that uses shell control. Commands run in zsh -lc. Quote glob patterns such as '*.rs'; zsh fails a command whose unquoted glob matches nothing. When the user's task requires a command with side effects, network access, Docker access, shell control, or unknown risk, request the command and Damaian will pause for user approval before running it.";
 const READ_ONLY_PARAGRAPH_BEFORE_SPEC_50: &str = "If the user asks about current Git state, recent commits, latest changes, uncommitted changes, repository history, or another fact that requires a local command, your entire response must be exactly one command request envelope. Do not add prose before or after the envelope:\nDAMAIAN_COMMAND_V1\nCOMMAND: git log -1 --stat --oneline\nREASON: Inspect the latest commit for the user's question.\nEND_COMMAND\n\nPrefer read-only commands such as git status, git log, ls, and pwd when they are sufficient, and the read_git_diff and read_git_log tools for git diffs and commit content; git diff, git show and git log -p need approval in the shell. Damaian runs a short list of read-only commands without asking and refuses every other command outright in this mode, including any command that uses shell control. Commands run in zsh -lc. Quote glob patterns such as '*.rs'; zsh fails a command whose unquoted glob matches nothing. In this mode only read-only commands that need no approval are available; a command with side effects, network access, Docker access, shell control, or unknown risk is refused outright, not queued for approval. Do not request one.";
@@ -31,12 +32,49 @@ const ALL_MODES: [SessionMode; 4] = [
 ];
 
 #[test]
-fn with_a_user_present_every_modes_prompt_is_byte_identical_to_before() {
+fn with_a_user_present_only_code_and_plan_gain_the_choice_paragraph() {
     for mode in ALL_MODES {
-        assert_eq!(
-            system_prompt(mode, true, "/bin/zsh"),
-            prompt_before_spec_50(mode),
-            "{mode:?}"
+        let expected = match mode {
+            SessionMode::Code | SessionMode::Plan => {
+                format!("{}\n\n{USER_CHOICE_PARAGRAPH}", prompt_before_spec_50(mode))
+            }
+            SessionMode::Ask | SessionMode::Review => prompt_before_spec_50(mode),
+        };
+        assert_eq!(system_prompt(mode, true, "/bin/zsh"), expected, "{mode:?}");
+    }
+}
+
+/// Spec 113 requirement 4: a choice is asked with `ask_user` before a plan,
+/// never written as options into a plan or an answer.
+#[test]
+fn the_choice_guidance_sends_choices_to_ask_user() {
+    assert!(USER_CHOICE_PARAGRAPH.contains("`ask_user`"));
+    assert!(USER_CHOICE_PARAGRAPH.contains("2 to 4"));
+    assert!(USER_CHOICE_PARAGRAPH.contains("before proposing a plan"));
+    assert!(USER_CHOICE_PARAGRAPH.contains("Never write options"));
+    assert!(USER_CHOICE_PARAGRAPH.contains("into a plan or an answer"));
+
+    let plan = propose_plan_tool_definition().description;
+    assert!(
+        plan.contains("Ask a choice the user must make with `ask_user` before proposing"),
+        "{plan}"
+    );
+    assert!(plan.contains("never as options in a plan"));
+
+    let ask = ask_user_tool_definition().description;
+    assert!(
+        ask.contains("Ask a choice the user must make here, before any plan"),
+        "{ask}"
+    );
+    assert!(ask.contains("never as options in a plan or an answer"));
+
+    // Without a user present nobody can pick an option, so neither the
+    // headless nor the worker prompt carries the paragraph.
+    for mode in ALL_MODES {
+        assert!(!system_prompt(mode, false, "/bin/zsh").contains(USER_CHOICE_PARAGRAPH));
+        assert!(
+            !system_prompt_with_capabilities(mode, true, false, "/bin/zsh")
+                .contains(USER_CHOICE_PARAGRAPH)
         );
     }
 }

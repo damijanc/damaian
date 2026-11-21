@@ -4,7 +4,11 @@ tier = "deterministic"
 prompt = "Read the upload notes, then reread the one you compacted."
 worker_record = true
 plan_decision = "approve_budget"
-context_window = 60000
+context_window = 61000
+# Was 60000 until spec 113 lengthened the `propose_plan` and `ask_user`
+# descriptions by one sentence each: the tool schemas are part of the fixed
+# request overhead, and at 60000 the eighth compaction could no longer fit
+# (`task_compaction_cannot_fit`). 61000 restores the same ten compactions.
 
 # Spec 103 acceptance 4 and requirement 7: a planned, budgeted worker's long
 # read history compacts before it crosses the configured request-window share,

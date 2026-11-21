@@ -1,6 +1,6 @@
 # Feature Spec: One Pending Decision, and What Typing Does While It Waits
 
-Status: In progress (specified 2026-11-21; started 2026-11-21, Tasks 1 and 2
+Status: In progress (specified 2026-11-21; started 2026-11-21, Tasks 1–3
 done; four tasks in [tasks.md](tasks.md))
 Order: 113 of 113
 Plan: none. Written from the owner's use of Damaian on a Snake game repository

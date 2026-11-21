@@ -1139,7 +1139,7 @@ pub(super) fn plan_review_response(plan: &TaskPlan, deferred_action: &str) -> St
         text.push_str(&format!("{}. {}\n", index + 1, step.title));
     }
     text.push_str(&format!(
-        "\nWaiting for your review before the first step that changes anything ({deferred_action}). You can reorder the steps, retitle them, remove any you do not want, or approve the plan as it stands."
+        "\nWaiting for your review before the first step that changes anything ({deferred_action}). You can approve the plan, or decline it and say what to change."
     ));
     text
 }

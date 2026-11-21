@@ -27,6 +27,10 @@ pub(super) fn system_prompt(mode: SessionMode, user_present: bool, shell: &str) 
     system_prompt_with_capabilities(mode, user_present, user_present, shell)
 }
 
+/// Spec 113 requirement 4: a choice written into a plan or an answer reaches
+/// the user as prose, and typing an answer to it starts a new task.
+pub(super) const USER_CHOICE_PARAGRAPH: &str = "When the user must make a choice before you can go on, ask it with `ask_user` (2 to 4 short options) before proposing a plan. Never write options for the user to pick from into a plan or an answer.";
+
 pub(super) fn system_prompt_with_capabilities(
     mode: SessionMode,
     question_route: bool,
@@ -35,7 +39,12 @@ pub(super) fn system_prompt_with_capabilities(
 ) -> String {
     let prompt = mode_system_prompt(mode, shell);
     if synchronous_user_present {
-        prompt
+        // Only the modes that propose plans need telling how to ask a choice
+        // instead of writing options into one (spec 113 requirement 4).
+        match mode {
+            SessionMode::Code | SessionMode::Plan => format!("{prompt}\n\n{USER_CHOICE_PARAGRAPH}"),
+            SessionMode::Ask | SessionMode::Review => prompt,
+        }
     } else if question_route {
         format!("{prompt}\n\n{WORKER_QUESTION_PARAGRAPH}")
     } else {
