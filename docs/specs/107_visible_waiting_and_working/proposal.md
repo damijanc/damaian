@@ -73,6 +73,16 @@ not matter.
    payloads have the thinner reattached shape (no `roundsMore`, fallback
    model or refusal code, or baseline title and note), which the same cards
    already render.
+
+   *Note 2026-11-21 ([spec 113](../113_one_pending_decision/proposal.md)):*
+   D2's lock now covers every pending kind except a plan. A command, patch,
+   check batch, fetch, round-budget, provider-fallback or context-review
+   decision disables `#chat-prompt` and Send with a placeholder naming it
+   ("Approve or reject the command first"); the question keeps "Answer the
+   question". A pending plan review leaves the composer usable with the
+   placeholder "Describe changes to the plan", and what is sent there is the
+   plan's decline with that text as the changes, through the card's own
+   route (spec 108 D6). It never approves.
 3. **The status line never goes blank while a turn is alive.** It shows the
    waiting state ("Waiting for your answer", "Waiting for your review",
    "Running baseline: cargo test (repository root) · 1m 12s") instead of being

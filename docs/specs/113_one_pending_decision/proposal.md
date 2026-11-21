@@ -1,7 +1,7 @@
 # Feature Spec: One Pending Decision, and What Typing Does While It Waits
 
-Status: In progress (specified 2026-11-21; started 2026-11-21, Tasks 1–3
-done; four tasks in [tasks.md](tasks.md))
+Status: Done 2026-11-21 (specified and started 2026-11-21; four tasks in
+[tasks.md](tasks.md))
 Order: 113 of 113
 Plan: none. Written from the owner's use of Damaian on a Snake game repository
 on 2026-11-20. The evidence, the code survey and the decisions are in
@@ -12,7 +12,7 @@ decisions and the composer lock for a question),
 a plan asks how to change it), [#110](../110_responsive_shell_during_work/proposal.md)
 (D7: notes reach only a running turn) and
 [#112](../112_status_in_one_place/proposal.md) (the composer status slot) —
-all built where this spec needs them. **Ready to start.**
+all built where this spec needs them.
 
 ## 1. Motivation
 

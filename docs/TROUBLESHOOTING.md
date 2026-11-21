@@ -37,6 +37,7 @@ coding agents are in [AGENTS.md](../AGENTS.md).
 | Damaian looks stopped: nothing seems to happen, or a baseline runs for minutes | [Damaian looks stopped](#damaian-looks-stopped) |
 | A turn stopped early, or asks *Answer now* / *Continue* | [A turn stopped early](#a-turn-stopped-early-which-budget-ran-out) |
 | A worker stopped on its task budget, a full request, or no progress | [A worker stopped on its approved task budget](#a-worker-stopped-on-its-approved-task-budget-a-full-request-or-no-progress) |
+| An older decision card disappeared, or a waiting task became cancelled | [An older decision card is gone](#an-older-decision-card-is-gone) |
 | A crash-recovery card, or a task marked unknown outcome | [After a crash: what recovery decided](#after-a-crash-what-recovery-decided) |
 | Processes left over after a crash | [After a crash: what was still running](#after-a-crash-what-was-still-running) |
 | A worker won't start | [A worker will not start](#a-worker-will-not-start) |
@@ -922,6 +923,7 @@ Event types grouped by what they tell you:
 | Round budget | `round_budget_paused`, `round_budget_decision`, `turn_budget_extended`, `ordinary_continuation`, `ordinary_continuation_declined` |
 | Worker suggestion | `worker_suggested` |
 | Plan review | `plan_review_decision` |
+| Pending decisions | `pending_decision_superseded` ([An older decision card is gone](#an-older-decision-card-is-gone)) |
 | Patches | `patch_proposed`, `edit_patch_ready_for_approval`, `edit_failed`, `patch_applied`, `patch_hunks_rejected`, `patch_rollback_started`, `patch_rolled_back`, `stored_patch_applied`, `stored_patch_files_rejected`, `stored_patch_rejected`, `stored_patch_rolled_back` |
 | Commands | `command_proposed`, `command_proposal_stored`, `command_executed`, `stored_command_executed`, `stored_command_rejected`, `command_allowlisted`, `repository_allowlist_migrated` |
 | Files & repo | `file_read`, `file_modified`, `file_restored`, `directory_listed`, `content_searched`, `repository_indexed`, `repository_map_rebuilt`, `symbol_index_rebuilt`, `git_status_read`, `git_diff_read`, `git_log_read`, `git_worktrees_listed` |
@@ -2098,6 +2100,50 @@ the fact half cannot be written, the request uses the window with the elision
 notice. Nothing is lost from storage in either case — the full transcript is
 still in the session, and rewinding past the boundary restores the model's view
 of every message.
+
+### An older decision card is gone
+
+A session waits on one decision at a time
+([spec 113](specs/113_one_pending_decision/proposal.md)). When a task pauses on
+a decision — a question, a plan review, a command, a patch, checks, a fetch,
+the round-limit offer, a provider fallback or a context review — every
+**other** task of the same session still waiting on a decision is settled:
+
+- its paused turn is taken off disk (`chat/pending/<proposal-id>.json`, through
+  the same store method the resume routes use);
+- its task status becomes `cancelled`, so the sidebar's **Needs you**, the
+  reload card and the startup sweep no longer treat it as waiting;
+- the audit log records `pending_decision_superseded`.
+
+Nothing is approved, run or resumed. The startup sweep applies the same rule
+before it reattaches anything: a session that already held several pending
+decisions keeps only the newest, by creation order. A worker's own session is
+left alone; its pauses belong to the worker
+([spec 57](specs/57_worker_sessions/proposal.md)).
+
+The audit event carries `sessionId`, `taskId` (the settled task),
+`supersededBy` (the newer task that is now the session's decision), `kind`
+(the approval kind such as `plan`, `command`, `patch` or `fetch`; `question`;
+or `unknown` for an old pause that recorded no link) and `pausedTurnTaken`.
+`pausedTurnTaken` is `"false"` for a patch, whose proposal stays in the patch
+store as history, and for a pause whose file was already gone:
+
+```bash
+jq -r 'select(.eventType=="pending_decision_superseded")
+  | "\(.timestampMs|tonumber/1000|strftime("%F %T")) \(.sessionId) \(.kind) \(.taskId) -> \(.supersededBy) taken=\(.pausedTurnTaken)"' \
+  "$DATA_DIR/audit/events.jsonl"
+```
+
+The session log shows the same task moving to `cancelled` in a
+`task_status_updated` event. To answer what the older card asked, use the
+newer decision: decline a plan with what you want changed, or say it in your
+next message once the newer decision is answered. The way this usually
+happens — a typed message starting a new task while a card waits — no longer
+can: typing over a pending plan declines it with your text as the changes, and
+every other pending decision disables the prompt box
+([User guide](USER_GUIDE.md#when-damaian-is-waiting-for-you)). A pile can still
+form when a card failed to load and the message box was therefore not locked;
+the newer pause then settles the older one as above.
 
 ### After a crash: what recovery decided
 

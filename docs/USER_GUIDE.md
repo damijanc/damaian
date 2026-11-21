@@ -807,7 +807,13 @@ A decision the turn is waiting on — a question, a patch to review, checks or a
 
 While a decision is pending and its card is scrolled out of view, the status slot above the prompt box names it — "Needs your answer", "Review the patch", "Approve 2 checks", "Approve 1 baseline check", "Approve the command", "Review the plan", "Choose whether to continue", "Choose whether to use the fallback provider" — with **Show**, which scrolls to the card and focuses it (**Answer** for a question, which focuses its answer field). The line is hidden while the card is in view and while a turn is running, and it is not shown in a worker's session, whose composer belongs to the worker.
 
-While a **question** is pending, the prompt box and **Send** are disabled and read "Answer the question": the card's own field is the only place to answer it, so a message typed in the prompt box is never mistaken for an answer. Any other pending decision leaves the prompt box usable.
+**What typing does while a decision waits.** The prompt box never starts a new task while a decision is pending, and it never approves anything:
+
+- **A plan review:** the prompt box reads "Describe changes to the plan". What you type and send (**Send** or Enter) is the plan's **Decline** with your text as the changes, exactly as if you had typed it into the card's **How should the plan be changed?** field: the assistant gets your answer and proposes a revised plan, which comes back as a new review card. The card's own **Approve** and **Decline** work as before.
+- **A question:** the prompt box and **Send** are disabled and read "Answer the question": the card's own field is the only place to answer it, so a message typed in the prompt box is never mistaken for an answer.
+- **Any other decision** — a command, a patch, checks or a baseline, a fetch, the round-limit offer, a provider fallback or a context review: the prompt box and **Send** are disabled, and the prompt box names what is waiting, such as "Approve or reject the command first" or "Apply or reject the patch first". Answer the card (**Show** in the status slot leads to it), and the prompt box comes back.
+
+**One decision at a time.** A session waits on one decision at a time. If a newer task in the same session stops on a decision while an older one is still unanswered — for example after a reload lost the older card — the older one is cancelled: its card goes away, nothing it asked for is approved or run, and its task reads as cancelled. Only the newest decision is the one to answer. A session that already held several unanswered decisions when Damaian quit keeps only the newest when it starts again. A [worker's](#worker-sessions) own session is not affected; its decisions belong to the worker. [Troubleshooting](TROUBLESHOOTING.md#an-older-decision-card-is-gone) shows how to find what was cancelled.
 
 The plan panel tells the same story: the step whose task is waiting reads **waiting for you**, not **running**, live and after a reload. A reload puts the pending card back at the end of the conversation and restores the waiting status line under its message. Within one app run, a reloaded patch, check or command decision may have no card to move; the line above the prompt box still names it, without **Show**.
 
@@ -858,6 +864,9 @@ result says so rather than reading as the whole file.
 question in the middle of a turn and carry on with your answer; it changes
 nothing by itself, and it is available only where a user can answer (see
 [When the assistant asks you a question](#when-the-assistant-asks-you-a-question)).
+When you must choose before it can go on, the assistant is told to ask with a
+question card (two to four short options) before it proposes a plan, rather than
+writing options for you to pick from into a plan or an answer.
 
 The agent can also read the repository's git worktrees without asking.
 `list_worktrees` lists every worktree git has registered for the repository —
@@ -983,6 +992,10 @@ already read.
   before it is recorded and sent back to the model. Your own prompt to Damaian
   is still stored and sent as you typed it, as before.
 - **A question appears in an interactive desktop conversation and in a worker.** The command-line tool, the evaluation harness and any unattended run have no answer route, so `ask_user` is not offered there at all and the assistant stops on material ambiguity rather than guessing. A worker does have an answer route: its question pauses the task, shows **Needs your answer** on the board and in its strip, and resumes in the worker's own process when you answer its card.
+- **Choices come as questions, not as options in a plan.** When you must choose
+  before the work can go on, the assistant is told to ask on this card before
+  it proposes a plan, instead of writing "option A / option B" into a plan or an
+  answer for you to pick by typing.
 - **Asking is bounded.** Two questions per turn by default
   (`agent_max_questions_per_turn`, ceiling 4), and each one uses a tool round. A
   third question in the same turn is refused, and the assistant is told so and
@@ -1491,7 +1504,10 @@ the action the plan is waiting to take. It asks one thing at a time:
   changes. **Decline without changes** declines the plan as it is: nothing
   changes, its steps are marked skipped, and the turn explains. Nothing is sent
   until you press one of the two, so the card stays the decision waiting for
-  you. In a worker's own session, **Decline** declines at once.
+  you. In a worker's own session, **Decline** declines at once. While the
+  review waits, typing in the prompt box does the same as this field: what
+  you send is the plan's decline with your text as the changes (see
+  [When Damaian is waiting for you](#when-damaian-is-waiting-for-you)).
 
 When the plan changes code and Worker sessions are on, **Approve** is followed
 by the one-time [worker suggestion](#while-a-turn-runs-and-how-it-ended): the
