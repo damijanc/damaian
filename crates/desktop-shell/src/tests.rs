@@ -2948,18 +2948,17 @@ fn app_js_composer_names_the_pending_decision_and_yields_to_a_question() {
         "{entry}"
     );
     assert!(app_js_function("pendingDecisionApplies").contains("!sessionSubmitting()"));
-    let lock = app_js_function("syncComposerQuestionLock");
+    let lock = app_js_function("syncComposerLock");
     assert!(lock.contains("pendingDecisionApplies()"), "{lock}");
     assert!(
         !lock.contains("statusHome"),
         "the lock does not follow the card's visibility: {lock}"
     );
-    assert!(lock.contains("current.decision.kind === \"question\""));
-    assert!(lock.contains("field.disabled = true"));
-    assert!(lock.contains("field.placeholder = \"Answer the question\";"));
-    assert!(lock.contains("button.disabled = true"));
+    assert!(lock.contains("field.disabled = state.locked"), "{lock}");
+    assert!(lock.contains("button.disabled = state.locked"), "{lock}");
+    assert!(super::APP_JS.contains("question: \"Answer the question\","));
     assert!(!super::APP_JS.contains("Answer the question above"));
-    assert!(app_js_function("syncComposerStatus").contains("syncComposerQuestionLock();"));
+    assert!(app_js_function("syncComposerStatus").contains("syncComposerLock();"));
     let focus = app_js_function("focusPendingDecision");
     assert!(focus.contains(".question-card-free-text input:not(:disabled)"));
     assert!(
@@ -2967,6 +2966,129 @@ fn app_js_composer_names_the_pending_decision_and_yields_to_a_question() {
             "$(\"composer-status-btn\").addEventListener(\"click\", focusPendingDecision)"
         )
     );
+}
+
+/// Spec 113 requirement 1 and D1: with a plan review pending, Send (button or
+/// Enter, both through `sendChatPrompt`) sends the composer's text as that
+/// plan's decline with changes, through the card's own `decide` — the one
+/// `/api/resume-plan-stream` call with `approved=false` — and never posts
+/// `/api/ask-stream`. It never approves: the hook passes `false`. A worker's
+/// card has no such hook, and a steering note is still checked first.
+#[test]
+fn app_js_typing_over_a_pending_plan_declines_it_with_changes() {
+    let send = app_js_function("sendChatPrompt");
+    let steering = send
+        .find("return sendSteeringNote(working.sessionId)")
+        .expect("steering notes go first");
+    let worker = send.find("await sendWorkerComposer(").unwrap();
+    let pending = send
+        .find("const pending = pendingDecisionApplies();")
+        .expect("sendChatPrompt reads the pending decision");
+    let ask = send.find("\"/api/ask-stream\"").unwrap();
+    assert!(
+        worker < steering && steering < pending && pending < ask,
+        "{send}"
+    );
+    // Only the composer's own text: a prompt a button supplies is not typing.
+    assert!(send.contains("if (!promptOverride) {"), "{send}");
+    assert!(send.contains("if (state?.locked) return false;"), "{send}");
+    assert!(
+        send.contains("return declinePendingPlanWithChanges(planDeclineFor(pending));"),
+        "{send}"
+    );
+
+    let decline = app_js_function("declinePendingPlanWithChanges");
+    assert!(decline.contains("field.value = \"\";"), "{decline}");
+    assert!(decline.contains("await decline(text)"), "{decline}");
+    assert!(!decline.contains("/api/"), "no route of its own: {decline}");
+
+    let review = app_js_function("createPlanReview");
+    let hook = &review[review
+        .find("planReviewDeclines.set(wrapper,")
+        .expect("the plan card registers its decline")..];
+    let hook = &hook[..hook.find("});").unwrap()];
+    assert!(hook.contains("decide(false, text)"), "{hook}");
+    assert!(
+        !hook.contains("decide(true"),
+        "typing never approves: {hook}"
+    );
+    assert!(hook.contains("changesInput.value = text;"), "{hook}");
+    assert!(review.contains("if (!decideInWorker) {"), "{review}");
+    // `decide` is the card's Decline → Send: one route, `approved` false with
+    // the typed changes.
+    assert!(review.contains("approved: approved ? \"true\" : \"false\","));
+    assert!(review.contains("changes: approved ? \"\" : changesText,"));
+    assert!(app_js_function("streamResumePlanRequest").contains("\"/api/resume-plan-stream\""));
+
+    let state = app_js_function("composerDecisionState");
+    assert!(
+        state.contains("if (!current?.frame) return null;"),
+        "{state}"
+    );
+    assert!(
+        state.contains("{ placeholder: PLAN_CHANGES_PLACEHOLDER, locked: false }"),
+        "{state}"
+    );
+    assert!(
+        super::APP_JS
+            .contains("const PLAN_CHANGES_PLACEHOLDER = \"Describe changes to the plan\";")
+    );
+    // After a restart the plan review sits inside its recovery card.
+    assert!(app_js_function("planDeclineFor").contains("querySelectorAll(\".plan-review\")"));
+}
+
+/// Spec 113 requirement 2 and D2: every pending kind but a plan disables the
+/// composer and Send, with a placeholder naming the decision; a kind the
+/// table does not know still locks. Answering the card settles the decision,
+/// which runs `syncComposerStatus` and so unlocks the composer.
+#[test]
+fn app_js_other_pending_decisions_lock_the_composer() {
+    let app = super::APP_JS;
+    let table = &app[app
+        .find("const COMPOSER_LOCK_PLACEHOLDERS = {")
+        .expect("the table")..];
+    let table = &table[..table.find("};").unwrap()];
+    for line in [
+        r#"question: "Answer the question","#,
+        r#"command: "Approve or reject the command first","#,
+        r#"patch: "Apply or reject the patch first","#,
+        r#"checks: "Decide the checks first","#,
+        r#"fetch: "Allow or decline the fetch first","#,
+        r#"round_budget: "Answer the round budget first","#,
+        r#"fallback: "Answer the provider fallback first","#,
+        r#"context_review: "Send or decline the context first","#,
+    ] {
+        assert!(table.contains(line), "missing {line}: {table}");
+    }
+    assert!(!table.contains("plan:"), "a plan does not lock: {table}");
+    // Every kind a card can be pending for is either in the table or a plan.
+    let fields = &app[app.find("const PENDING_DECISION_FIELDS = {").unwrap()..];
+    let fields = &fields[..fields.find("};").unwrap()];
+    for line in fields.lines().skip(1) {
+        let Some((kind, _)) = line.trim().split_once(':') else {
+            continue;
+        };
+        assert!(
+            kind == "plan" || table.contains(&format!("{kind}: ")),
+            "{kind} has no lock placeholder"
+        );
+    }
+    let state = app_js_function("composerDecisionState");
+    assert!(
+        state.contains("COMPOSER_LOCK_PLACEHOLDERS[kind] || \"Answer the card above first\""),
+        "{state}"
+    );
+    assert!(
+        state.contains("return { placeholder, locked: true };"),
+        "{state}"
+    );
+    let lock = app_js_function("syncComposerLock");
+    assert!(
+        lock.contains("field.placeholder = composerDecisionLock;"),
+        "{lock}"
+    );
+    assert!(lock.contains("field.disabled = false;"), "{lock}");
+    assert!(app_js_function("settlePendingDecision").contains("syncComposerStatus();"));
 }
 
 /// Spec 112 requirements 1, 2 and 5: the three composer boxes are one slot,

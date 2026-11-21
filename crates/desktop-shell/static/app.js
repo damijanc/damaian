@@ -13982,8 +13982,8 @@ function appendProposals(message, payload, repo) {
 // decided card stays where it is in the history (context D5).
 // `{ decision, card, frame }`.
 let pendingDecision = null;
-// The composer's own placeholder while a pending question has taken it over.
-let composerQuestionLock = null;
+// The composer's own placeholder while a pending decision has taken it over.
+let composerDecisionLock = null;
 
 // Which proposal of a turn's payload carries the card for each kind. A failed
 // check's baseline (spec 109) is a check card like any other.
@@ -14278,7 +14278,7 @@ function syncComposerStatus() {
     composerStatusTicker = null;
   }
   syncComposerStop();
-  syncComposerQuestionLock();
+  syncComposerLock();
   const busy = Boolean(busyElsewhereWork());
   const wasBusy = busyElsewhereApplied;
   busyElsewhereApplied = busy;
@@ -14290,26 +14290,72 @@ function syncComposerStatus() {
   }
 }
 
-// D2's lock: while a question is pending the main composer does not compete
-// with the card's answer field, because a typed message is not an answer. It
-// holds whether or not the card is in view.
-function syncComposerQuestionLock() {
-  const current = pendingDecisionApplies();
+// Spec 113 D2: what the locked composer says while each kind of decision is
+// pending. A kind not listed here still locks, with the generic line.
+const COMPOSER_LOCK_PLACEHOLDERS = {
+  question: "Answer the question",
+  command: "Approve or reject the command first",
+  patch: "Apply or reject the patch first",
+  checks: "Decide the checks first",
+  fetch: "Allow or decline the fetch first",
+  round_budget: "Answer the round budget first",
+  fallback: "Answer the provider fallback first",
+  context_review: "Send or decline the context first",
+};
+
+// Spec 113 requirement 1: what typing over a pending plan does. Typed text is
+// the plan's decline with changes, so the composer stays usable and says so.
+const PLAN_CHANGES_PLACEHOLDER = "Describe changes to the plan";
+
+// The composer's state for the decision the session waits on: `null` (no card
+// to answer, so the composer is left alone), `{ placeholder, locked: false }`
+// for a plan, or `{ placeholder, locked: true }` for every other kind.
+function composerDecisionState(current) {
+  if (!current?.frame) return null;
+  const kind = current.decision.kind;
+  if (kind === "plan") {
+    return planDeclineFor(current)
+      ? { placeholder: PLAN_CHANGES_PLACEHOLDER, locked: false }
+      : null;
+  }
+  const placeholder = COMPOSER_LOCK_PLACEHOLDERS[kind] || "Answer the card above first";
+  return { placeholder, locked: true };
+}
+
+// Spec 107 D2, extended by spec 113 D2: while a decision is pending the main
+// composer does not compete with its card, because a typed message is not an
+// answer and never approves. A question, command, patch, check batch, fetch,
+// round budget, fallback or context review disables the composer; a plan only
+// changes its placeholder, since typing there declines it with changes
+// (`sendChatPrompt`). It holds whether or not the card is in view.
+function syncComposerLock() {
+  const state = composerDecisionState(pendingDecisionApplies());
   const field = $("chat-prompt");
   const button = $("ask-btn");
-  const lock = Boolean(current) && current.decision.kind === "question" && Boolean(current.frame);
-  if (lock) {
-    if (composerQuestionLock === null) composerQuestionLock = field.placeholder;
-    field.disabled = true;
-    field.placeholder = "Answer the question";
+  if (state) {
+    if (composerDecisionLock === null) composerDecisionLock = field.placeholder;
+    field.disabled = state.locked;
+    field.placeholder = state.placeholder;
     // A Stop for work elsewhere in the session stays usable (spec 112).
-    if (!composerStopShown) button.disabled = true;
-  } else if (composerQuestionLock !== null) {
+    if (!composerStopShown) button.disabled = state.locked;
+  } else if (composerDecisionLock !== null) {
     field.disabled = false;
-    field.placeholder = composerQuestionLock;
-    composerQuestionLock = null;
+    field.placeholder = composerDecisionLock;
+    composerDecisionLock = null;
     if (!composerStopShown) button.disabled = false;
   }
+}
+
+// The decline-with-changes of the pending plan review's card, or null. The
+// card is the plan review itself, or the recovery card that wraps it after a
+// restart.
+function planDeclineFor(current) {
+  if (current?.decision.kind !== "plan" || !current.card) return null;
+  const card = current.card;
+  const review = planReviewDeclines.has(card)
+    ? card
+    : [...card.querySelectorAll(".plan-review")].find((entry) => planReviewDeclines.has(entry));
+  return review ? planReviewDeclines.get(review) : null;
 }
 
 // What a refusal code means, for the fallback offer's heading. An unknown code
@@ -14842,6 +14888,9 @@ function planBuildTitle(build) {
   return `Build check: ${checkLabel(build)}`;
 }
 
+// Plan review card → its decline with changes (spec 113 requirement 1).
+const planReviewDeclines = new WeakMap();
+
 function createPlanReview(
   proposal,
   proposalRepo,
@@ -15167,6 +15216,21 @@ function createPlanReview(
   if (next) wrapper.append(next);
   if (budgetSection) wrapper.append(budgetSection);
   wrapper.append(list, actions, changes, output);
+  // Spec 113 requirement 1: the composer's Send over this pending plan is
+  // this card's Decline → Send, through `decide` and its one route. The text
+  // is shown in the card's own answer field, so the card records what was
+  // asked, and stays there if the request fails. A worker's card is answered
+  // in its own process and offers no such path.
+  if (!decideInWorker) {
+    wrapper.classList.add("plan-review");
+    planReviewDeclines.set(wrapper, (text) => {
+      if (approveButton.disabled) return Promise.resolve(false);
+      declineButton.hidden = true;
+      changes.hidden = false;
+      changesInput.value = text;
+      return decide(false, text).then(() => true);
+    });
+  }
   return wrapper;
 }
 
@@ -17361,8 +17425,8 @@ function syncComposerStop() {
   button.setAttribute("aria-label", "Send message");
   button.title = "";
   button.disabled = false;
-  // A pending question takes the button back once nothing runs.
-  syncComposerQuestionLock();
+  // A pending decision takes the button back once nothing runs.
+  syncComposerLock();
 }
 
 function setComposerBusy() {
@@ -17394,6 +17458,26 @@ function restorePrompt(text) {
   autoGrowPrompt();
 }
 
+// Spec 113 requirement 1: the composer's text goes to the pending plan's own
+// Decline → Send, never to `/api/ask-stream`. The card shows the text and
+// keeps it if the request fails, so the composer is cleared either way.
+async function declinePendingPlanWithChanges(decline) {
+  const field = $("chat-prompt");
+  const text = field.value.trim();
+  if (!text) return false;
+  field.value = "";
+  autoGrowPrompt();
+  try {
+    // `false`: the card is already sending an answer, so nothing went out.
+    const sent = await decline(text);
+    if (!sent) restorePrompt(text);
+    return sent;
+  } catch (error) {
+    toast(error.message);
+    return false;
+  }
+}
+
 async function sendChatPrompt(options = {}) {
   let streamError = null;
   // Hoisted out of the `try` so the `catch` can write the failure into the
@@ -17423,6 +17507,16 @@ async function sendChatPrompt(options = {}) {
     return false;
   }
   if (sessionSubmitting()) return false;
+  // Spec 113: typing while a decision waits never starts a turn of its own.
+  // Over a plan it is that plan's decline with changes, which authorises
+  // nothing (spec 108 D6); any other kind locks the composer, and this guard
+  // keeps a Send that slips past the lock from going out as a new turn.
+  if (!promptOverride) {
+    const pending = pendingDecisionApplies();
+    const state = composerDecisionState(pending);
+    if (state?.locked) return false;
+    if (state) return declinePendingPlanWithChanges(planDeclineFor(pending));
+  }
   try {
     prompt = promptOverride || $("chat-prompt").value.trim();
     if (!prompt) throw new Error("Prompt is required");
