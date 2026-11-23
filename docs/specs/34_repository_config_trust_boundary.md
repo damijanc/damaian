@@ -525,3 +525,19 @@ replaces it, and never deletes the user's line. It uses the same
 warning-after-write shape as the repository-scope refusal above. Tests live in
 `crates/damaian-cli/tests/provider_switch_warning.rs`; each runs with a
 throwaway `DAMAIAN_DATA_DIR`.
+
+**Command rules, 2026-11-23 (spec 111).** Two keys joined the overlay
+classification, both restrict-only:
+[`command_rule`](111_command_rules_under_user_authority/proposal.md) (a
+repository or profile may add `ask` and `deny` rules; its `allow` is refused
+as `restrict_only` with its line in `RejectedConfigKey::line`, and listed in
+Settings → Commands) and `command_shell_parameters` (repository and profile
+keep only the intersection with the user's set). A repository `deny` or `ask`
+cannot soften a built-in block or a user `deny`, and the user's own `allow`
+still decides over a repository's rule. `command_blocklist` entries are now
+read as `deny <entry> *` rules with the source that set them (a repository's
+entries are still added to the user's, never replacing them), and
+`command_allowlist` stays never-honoured from repository config. *Always
+allow* now writes a user `command_rule` naming the directory, falling back to
+`command_allowlist.<repository_id>` only for a directory a rule line cannot
+name.

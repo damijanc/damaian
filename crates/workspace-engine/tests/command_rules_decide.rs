@@ -316,6 +316,29 @@ fn always_allow_is_not_offered_for_a_command_a_rule_cannot_say_exactly() {
     }
 }
 
+/// Acceptance §4 through the live policy: a chain runs without asking when
+/// every part is allowed and asks when one is not; a command substitution is
+/// never covered by an `allow`, however broad.
+#[test]
+fn a_chain_runs_only_when_every_part_is_allowed() {
+    let fixture = Fixture::new(
+        "chain",
+        "command_rule=allow cargo fmt --check\ncommand_rule=allow cargo clippy *\n\
+         command_rule=allow echo *\ncommand_rule=allow rm *\n",
+        "",
+    );
+    let both = fixture.propose("cargo fmt --check && cargo clippy");
+    assert!(!both.requires_approval && !both.blocked, "{both:?}");
+    assert_eq!(both.rule.map(|rule| rule.source).as_deref(), Some("user"));
+
+    let one = fixture.propose("cargo fmt --check && cargo test");
+    assert!(one.requires_approval && !one.blocked, "{one:?}");
+
+    let substitution = fixture.propose("echo $(rm -rf /)");
+    assert!(substitution.requires_approval, "{substitution:?}");
+    assert!(substitution.rule.is_none(), "{substitution:?}");
+}
+
 /// Spec 111 D11 (Task 3b) still holds now that the rules decide: which shell
 /// special parameters a command may use, where, and that the opt-in reaches
 /// the rules only.

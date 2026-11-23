@@ -133,6 +133,7 @@ Because that file arrives with a clone, a repository can only make Damaian *more
 - `shell`, `command_path_from_interactive_shell`, `data_dir`, `allowed_roots`, `secret_patterns`, `audit_enabled`, `block_generated_secrets`, `enable_worker_sessions`, `checkpoint_retention_days`, `checkpoint_max_total_bytes`, `checkpoint_census_max_paths`, `semantic_search_max_chunks`, `memory_retention_days`, every `language_server.<language>` key, and every `model_*` key are ignored in repository config. Damaian tells you once, per repository, when a repository tried to set one, and records it in the audit log.
 - `restricted_patterns`, `ignore_patterns`, and `command_blocklist` are added to yours rather than replacing them.
 - The `require_approval_for_*` flags can be turned on by a repository, not off. MCP and individual MCP servers can be turned off, not on.
+- A repository's `command_rule` lines may `ask` or `deny`, never `allow`; an `allow` is refused and named by its line in **Settings → Commands**. `command_shell_parameters` can only be narrowed. See [Command rules](#command-rules).
 - `command_allowlist` is never taken from repository config; *Allow Always* writes to your own config instead. See [Allow Always](#allow-always).
 - Budgets and preferences — `max_file_bytes`, `max_command_output_bytes`, `audit_retention_days`, `enable_semantic_search`, `agent_max_tool_rounds`, and the root overrides `project_roots_added` and `project_roots_removed` ([Repository Roots](#repository-roots)) — apply as written.
 - The caps on what one agent tool returns — `max_read_lines` (400), `max_list_entries` (200), `max_search_matches` (50), and `max_match_line_chars` (500) — and the repository map's `repository_map_max_tokens` (800) can be lowered by a repository but never raised. The same holds for `command_timeout_secs`, `agent_max_task_tokens`, `agent_max_turn_messages`, `agent_max_exploration_rounds`, `worker_preplan_exploration_rounds`, `agent_max_turn_notes_chars`, `memory_max_entries`, and every `worker_task_budget_*` setting. The first three bound how much one request may carry; `agent_max_exploration_rounds` bounds how many read-only rounds a turn may take; `worker_preplan_exploration_rounds` bounds a worker's pre-plan discovery; `agent_max_turn_notes_chars` bounds how much the assistant's notes add to every later request. Raising one would widen what leaves your machine or how long a turn may run. A repository that tries is told to you like any other rejected key.
@@ -1660,10 +1661,10 @@ nothing happens. In Plan and Review, a command that would need your approval is
 refused outright rather than shown as an approval card, because approving it
 would let you click your way out of the mode you chose.
 
-**An allowlisted command is still refused in Ask, Plan and Review.** An
-allowlisted `npm run build` ([Allow Always](#allow-always)) runs without a
+**An allowed command is still refused in Ask, Plan and Review.** An
+`npm run build` your [command rule](#command-rules) allows runs without a
 prompt in Code and is refused in the other three modes. Plan and Review decide
-what counts as read-only from the command itself, never from your allowlist.
+what counts as read-only from the command itself, never from your rules.
 
 MCP tools are read-only only when their server says so. Most servers don't mark
 their tools at all, and an unmarked tool counts as able to change things, so it
@@ -1910,7 +1911,10 @@ When the assistant needs a local command result, it asks Damaian to run the comm
 A command runs without asking only when Damaian can prove it is read-only. A
 shell tokenizer splits it into words with no expansion — no `$`, no backtick, no
 unquoted `*`, `?`, `[`, `{` or `~` — so what was checked is exactly what the
-shell will run. Each program then takes only a closed list of options, and every
+shell will run. The shell's special parameters are the one exception: `$?`,
+`$#`, `$$` and `$-` may stand in an argument, and `$!`, `$@`, `$*` and `$1`–`$9`
+as a whole argument, so `cargo test; echo "exit $?"` is still read-only
+([Shell parameters](#shell-parameters-in-commands)). Each program then takes only a closed list of options, and every
 path argument is checked against the repository. Anything outside that shape
 asks for approval.
 
@@ -1982,7 +1986,7 @@ without asking. `git status; rm x`, `git log > out.txt`, `ls | xargs cat` and
 `git log || true` do not: `rm`, a redirect to a file, a filter with a file
 argument and `||` are outside the admitted shape.
 
-Every other command appears as an approval card in the conversation. Its first line names why Damaian is asking — which shell-control characters, network keyword, restricted path, setting, or [hook](#hooks) — and the same reason appears on the card beside the risk badge. **Why this command** holds the full prompt with every reason, and, when the agent gave one, **The agent says: …** is the agent's own stated purpose for the command. Review the command, risk, working directory and both reasons, then select **Approve** or **Reject**. Destructive commands blocked by policy cannot be approved from the UI.
+Every other command appears as an approval card in the conversation. Its first line names why Damaian is asking — which shell-control characters, network keyword, restricted path, setting, or [hook](#hooks) — and the same reason appears on the card beside the risk badge. **Why this command** holds the full prompt with every reason, and, when the agent gave one, **The agent says: …** is the agent's own stated purpose for the command. Review the command, risk, working directory and both reasons, then select **Approve** or **Reject**. When a [command rule](#command-rules) decided, the card names it and where it comes from, such as "Asked by repository rule `ask cargo test *` (repository config)". A blocked command cannot be approved from the card; only a rule of your own can let it run.
 
 Docker commands, including `docker ps`, `docker compose ...`, and `docker-compose ...`, always ask for approval. They can inspect or change a privileged local daemon, use the network, start background services, mount host paths, expose ports, and mutate images or volumes, so Damaian never treats them as read-only.
 
@@ -1993,15 +1997,73 @@ never lengthen it.
 
 Which commands may run at all also depends on the session's [working mode](#working-modes) and the repository's [permission profile](#permission-profiles). A command can run in a directory inside the repository rather than the working folder; see [Where a command runs](#where-a-command-runs).
 
+### Command rules
+
+Whether a command runs without asking, asks you first, or is blocked is decided by **command rules**: one ordered list of `allow`, `ask` and `deny` rules. You see and edit them in **Settings → Commands**; in your user config each is one `command_rule` line:
+
+```text
+command_rule=allow cargo test *
+command_rule=allow rm -rf /tmp/build/**
+command_rule=deny git push --force *
+command_rule=ask npm publish * in ~/work/site
+```
+
+A rule is an effect, one command, and optionally `in <directory>`, which limits it to commands running in that directory (absolute or starting with `~`, no spaces). Rules are checked top to bottom and **the last one that matches decides**, so a general rule goes first and its exception after it (`deny cargo *`, then `allow cargo test *`).
+
+**What a pattern matches.** Damaian reads a command the way the shell will, without running anything, and compares the parsed command, not its text:
+
+- **Options in any spelling.** For programs Damaian knows (`rm`, `rmdir`, `mv`, `cp`, `ln`, `mkdir`, `touch`, `chmod`, `chown`, `chgrp`, `find`, `dd`, `curl`, `wget` and `git`), `rm -rf`, `rm -fr`, `rm -r -f` and `rm --recursive --force` are the same command. For any other program, options match as written.
+- **Paths are resolved first.** `.`, `..` and `~` are resolved against the directory the command runs in, so `rm -rf /tmp/..` is `rm -rf /`. In a pattern, `*` matches within one folder and `**` across folders; a last word of `*` matches any further arguments, or none.
+- **Exact means exact.** `allow rm -rf /tmp` covers `rm -rf /tmp` and nothing else: not `/tmp/x`, not `/tmpfiles`, not `/`. `allow rm -rf /tmp/**` covers everything below `/tmp`, but not `/tmp` itself, and not `/tmp/..`.
+- **Every part of a chain.** `cargo fmt --check && cargo clippy` runs without asking only when a rule allows each part. Any part a rule denies blocks the whole line; any part a rule asks about asks. A part no rule decides leaves the line to Damaian's defaults, which ask about `&&`.
+- **Wrappers are seen through.** In `sudo rm -rf /` the `rm` part is checked as well as `sudo`; `allow sudo *` covers only the `sudo` part.
+- **What cannot be analysed always asks.** A command using `$NAME`, `$(…)`, backticks, an unquoted glob such as `*.rs`, or a here-document could run something other than what was checked, so no `allow` ever covers it. `echo $(rm -rf /)` asks even under `allow echo *`. If a `deny` rule names its first words (`deny git push *` and `git push $REMOTE`), it is blocked instead.
+
+**Damaian's defaults** decide when no rule matches, and they are what Damaian did before rules existed: read-only commands run, commands it does not recognise ask, and a short list of destructive commands is blocked. **Settings → Commands** lists that list under *Damaian's defaults*:
+
+- recursive `rm` of `/`, your home directory, the repository root, a directory above it, or anything outside the repository (so `rm -rf /tmp` and `rm -rf /` are both blocked; `rm -rf target` inside the repository is not);
+- `git reset --hard`, and `git clean` with `-f` and `-d`;
+- `dd` writing to a device (`of=/dev/…`, other than `/dev/null` and the like);
+- `mkfs` and its variants, `shutdown` and `reboot`.
+
+**You have the final say.** Your `allow` overrides every default, including those blocks, and your `deny` overrides every default permission, including read-only commands. To let `rm -rf /tmp` run you write `allow rm -rf /tmp`; to let `rm -rf /` run you need its own `allow rm -rf /`, since neither rule covers the other. When your `allow` lifts a block, the command runs as you decided; if it shows a card, the card carries a warning ("Damaian would block this: recursive `rm` of `/tmp/build/cache`. Your rule `allow rm -rf /tmp/build/**` allows it."), and either way the audit log records a `command_rule_override`. `require_approval_for_all_commands` still asks before every command, allowed or not.
+
+**Where rules come from.** Settings lists every rule in force, in the order they are checked, with its source and the line it came from:
+
+| Shown as | Source | What it may do |
+|---|---|---|
+| *This repository's config* | The repository's `.damaian/config.conf` | `ask` and `deny` only: a repository can make a command ask or block it, never allow it. Its `allow` is refused, and the note at the top of the page names the line. |
+| *Permission profile* | The repository's [permission profile](#permission-profiles) | `ask` and `deny` only, like a repository. |
+| *Your rule* | Your `command_rule` lines in `user.conf` | `allow`, `ask` or `deny`; they decide over the two above and over Damaian's defaults. |
+| *Administrator config* | The administrator's config | The same authority as yours, checked after yours. |
+
+A rule read from one of the old keys (below) adds "read from an old command key". With no folder open, Settings lists only your `command_rule` lines, because the repository's rules and the old keys depend on the repository. A repository or profile rule only tightens: it can make a command Damaian would run ask or be blocked, but it cannot turn a default block into a question, and your own `allow` for the same command still decides.
+
+**Editing.** In **Settings → Commands**, *Add a rule* opens the form: the effect, the command, and optionally a directory. The ⋮ menu on each of *your* rules edits, moves or deletes it; other sources' rules are shown but cannot be edited there. Every change is one write to your user config, never to the repository's. If your rules changed since Settings read them (an *Always allow*, or an edit by hand), the save is refused rather than overwriting ("Your command rules changed since Settings read them. Reload the list and try again."), and a rule Damaian cannot read is reported as `Rule N: …` with the file left as it was.
+
+**Rules from the old keys.** Before command rules, the same decisions were the keys `command_allowlist`, `command_allowlist.<repository_id>` (older *Always allow* grants) and `command_blocklist`. Those keys still load, and their entries are read as rules with the same effect and source: an allowlist or *Always allow* entry is `allow <command> in <directory where it applied>`, and a blocklist entry is `deny <entry> *`, which blocks that command with any further arguments, in any part of a chain and behind a wrapper. An entry a rule cannot say exactly (one with `$`, `*` or shell control), or one that never ran (a blocklist entry or a destructive pattern blocked it), is not read; the note at the top of **Settings → Commands** names each old key in use and each entry it did not read, with the reason. The old keys will be removed in a later release, so move what you need into `command_rule` lines.
+
+### Shell parameters in commands
+
+The shell's special parameters do not make a command unanalysable. `$?`, `$#`, `$$` and `$-` always expand to digits or option letters, so they may stand anywhere in an argument (`/tmp/run-$$`). `$!`, `$@`, `$*` and `$1`–`$9` can expand to nothing in the one-line command Damaian runs, which would hide a shorter path, so they count only as a whole argument (`mytool "$1"`); inside a path (`rm -rf /tmp/$1`) the command asks. They may never be the program or `cd`'s directory. A parameter matches a rule as written: `allow rm -rf /tmp/*` covers `rm -rf /tmp/$$`, and `rm -rf /tmp/'$$'`, a file literally named `$$`, is a different command.
+
+`$0`, `$_` and `$IFS` are read only when you turn them on, because `$_` hides a path and `$IFS` changes how the rest of the line splits: add `command_shell_parameters = $0 $_ $IFS` (any of the three) to your user config. A repository or profile may remove entries, never add them. The setting applies to your command rules only; the read-only check (and so Plan mode) keeps the default set, so `ls $_` still asks.
+
 ### Allow Always
 
-**Always allow in this project**, in the approval card's ⋯ menu, runs the command and records it in your own config as `command_allowlist.<repository_id>`, so that command stops asking. The rest of this guide, and the policy view, call this grant *Allow Always*. It means "stop asking me about this exact command", not "this command is read-only".
+**Always allow in this project**, in the approval card's ⋯ menu, runs the command and adds a rule of the exact command, in the directory it ran in, to your user config, so that command stops asking:
 
-The allowance covers the exact command only: allowing `npm run test:unit` does not allow `npm run test:unit --watch`, and allowing `git push` does not allow `git push --force`. It applies to that working folder alone, and not to another clone of the same project at a different path. In a root other than the working folder it applies to that root only ([`Allow Always` in a root](#allow-always-in-a-root)). Remove an entry by editing the `command_allowlist.<repository_id>` line in `~/Library/Application Support/DamaianClient/config/user.conf`.
+```text
+command_rule=allow npm run test:unit in /Users/you/work/site
+```
+
+The rest of this guide, and the policy view, call this grant *Allow Always*. It means "stop asking me about this exact command", not "this command is read-only". It shows in **Settings → Commands** as one of your rules, where you can widen it (`allow npm run test:unit *`), move it or delete it.
+
+The allowance covers the exact command only: allowing `npm run test:unit` does not allow `npm run test:unit --watch`, and allowing `git push` does not allow `git push --force`. For a program Damaian knows, another spelling of the same options counts as the same command. It applies to that directory alone, and not to another clone of the same project at a different path ([`Allow Always` in a root](#allow-always-in-a-root)). For a directory a rule cannot name (one with a space or `*` in its path) Damaian writes the older `command_allowlist.<repository_id>` entry instead, which is read as the same rule.
 
 The decision is stored in your config rather than in the repository because Damaian could not otherwise tell a command you allowed from one that arrived with the clone. A `command_allowlist` in a repository's `.damaian/config.conf` is never honoured; if a repository you open already has one, Damaian shows the exact commands once and asks which to keep.
 
-*Allow Always* is not offered for commands blocked by policy, for commands containing shell control syntax such as `|`, `&&`, or `>`, when `require_approval_for_all_commands` is set, or on a [worker's](#worker-sessions) command card. In the first three cases an allowlist entry would have no effect, so the app does not offer to write one. An allowlisted command is still refused in Ask, Plan and Review modes ([Working Modes](#working-modes)).
+*Allow Always* is not offered for blocked commands, for commands containing shell control syntax such as `|`, `&&`, or `>`, for a command a rule cannot say exactly (one containing `*`, which a rule reads as a wildcard, or one that cannot be analysed, such as `echo $HOME`), when `require_approval_for_all_commands` is set, or on a [worker's](#worker-sessions) command card. To allow such a command, write the rule yourself in **Settings → Commands**. An allowed command is still refused in Ask, Plan and Review modes ([Working Modes](#working-modes)).
 
 ## Repository Roots
 
@@ -2083,12 +2145,12 @@ Only `sh`, `bash`, `zsh`, `ksh`, `dash` and `mksh` are asked; with another
 [*Allow Always*](#allow-always) on a command that runs in a root other than the working folder records the grant for that root only. For `npm test` in `packages/api`, your config gets:
 
 ```text
-command_allowlist.<repository_id>=cd packages/api && npm test
+command_rule=allow npm test in /Users/you/work/site/packages/api
 ```
 
-That entry lets `npm test` run unprompted in `packages/api` and nowhere else. `npm test` in `packages/web` may do something quite different, so it still asks. The entry cannot be matched by typing it as a command, because a command containing `&&` is never allowlisted.
+That rule lets `npm test` run unprompted in `packages/api` and nowhere else. `npm test` in `packages/web` may do something quite different, so it still asks. A rule you write yourself without `in <directory>` applies wherever the command runs.
 
-The reverse also holds. A plain `command_allowlist` entry, whether from *Allow Always* at the working folder or one you wrote yourself at user or admin scope, applies **only at the repository root**. Your machine-wide `command_allowlist=npm test` does not let `npm test` run unprompted in `packages/api`.
+Grants written before command rules took the form `command_allowlist.<repository_id>=cd packages/api && npm test`. They are read as the same rule, `allow npm test in <that root>`. A plain `command_allowlist` entry, whether from an older *Allow Always* at the working folder or one you wrote yourself at user or admin scope, is read as `allow <command> in <repository root>`, so it applies **only at the repository root**, as it always did: your machine-wide `command_allowlist=npm test` does not let `npm test` run unprompted in `packages/api`.
 
 ### The map the assistant sees
 

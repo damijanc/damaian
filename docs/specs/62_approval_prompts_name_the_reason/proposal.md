@@ -299,3 +299,13 @@ afterwards. Criteria 3, 4, 5, 6, 7 and 8 are covered by the tests recorded in
 The per-task record — including each deliberate deviation, the falsification
 behind every load-bearing test, and the scoped check results — is in
 [`tasks.md`](tasks.md). The live re-run is in §6 above.
+
+**Command rules, 2026-11-23 (spec 111).** The causes gained four variants:
+`RuleDenied { rule, source }`, `RuleAsks { rule, source }`,
+`BuiltInDefault { name, detail }` and `Unanalysable { reason }` (audit names
+`rule_denied`, `rule_asks`, `built_in_default`, `unanalysable`), and a
+`RuleAsks` cause leads the causes, before the defaults' own. New decisions no
+longer produce `Blocklisted` or `Destructive`; those stay only so proposals
+stored earlier read back. The card additionally names the deciding rule and
+its source, and warns when a user `allow` lifted a built-in block
+([spec 111](../111_command_rules_under_user_authority/proposal.md) D7, D13).

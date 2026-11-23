@@ -452,3 +452,15 @@ naming and zsh glob-quoting text is unchanged.
   `git show --stat`) as Low. `chat.rs`'s byte-identical prompt constants were
   re-pinned to the new paragraph, and a new test asserts the description and
   paragraphs name both tools. Each changed test names requirement 5.
+
+**Command rules, 2026-11-23 (spec 111).** The tokenizer here is shared with
+[spec 111](111_command_rules_under_user_authority/proposal.md)'s command
+parser (`scan_shell_line`; `shell_line` unchanged for this boundary). Since
+spec 111 D11 the boundary admits the shell's special parameters as argument
+text: `$?`, `$#`, `$$` and `$-` anywhere in a word, `$!`, `$@`, `$*` and
+`$1`–`$9` only as a whole word, so `ls; echo $?` is read-only. The user's
+`command_shell_parameters` opt-in (`$0`, `$_`, `$IFS`) does not reach this
+boundary, so Plan mode's check and Code's decide alike. Read-only admission
+is now a default under the command rules: a user `deny` overrides it, and a
+user `allow` runs a command without it but does not make it read-only for
+Plan, Review or Ask.

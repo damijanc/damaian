@@ -934,7 +934,7 @@ Event types grouped by what they tell you:
 | Plan review | `plan_review_decision` |
 | Pending decisions | `pending_decision_superseded` ([An older decision card is gone](#an-older-decision-card-is-gone)) |
 | Patches | `patch_proposed`, `edit_patch_ready_for_approval`, `edit_failed`, `patch_applied`, `patch_hunks_rejected`, `patch_rollback_started`, `patch_rolled_back`, `stored_patch_applied`, `stored_patch_files_rejected`, `stored_patch_rejected`, `stored_patch_rolled_back` |
-| Commands | `command_proposed`, `command_proposal_stored`, `command_executed`, `stored_command_executed`, `stored_command_rejected`, `command_allowlisted`, `repository_allowlist_migrated` |
+| Commands | `command_proposed`, `command_proposal_stored`, `command_executed`, `stored_command_executed`, `stored_command_rejected`, `command_allowlisted`, `command_rule_override`, `repository_allowlist_migrated` |
 | Files & repo | `file_read`, `file_modified`, `file_restored`, `directory_listed`, `content_searched`, `repository_indexed`, `repository_map_rebuilt`, `symbol_index_rebuilt`, `git_status_read`, `git_diff_read`, `git_log_read`, `git_worktrees_listed` |
 | Checkpoints | `checkpoint_created`, `checkpoint_creation_failed`, `checkpoint_files_skipped`, `checkpoint_paths_added`, `checkpoint_restored`, `checkpoint_conflicted`, `checkpoint_cleanup` |
 | MCP | `mcp_tools_listed`, `mcp_tool_called`, `mcp_tool_call_failed`, `mcp_discovery_failed` |
@@ -3143,8 +3143,24 @@ approval card shows the same line beside the risk badge. The shapes are:
   [`before_tool`](USER_GUIDE.md#hooks) hook returned `request_approval` for a
   command that would otherwise have run unasked. Its audit cause name is
   `hook_requested`. A hook can add this reason; it can never remove one.
-- **Blocked: …** — a `command_blocklist` rule, a destructive pattern, or the
-  permission profile's `command_access`. These offer no approval.
+- **Blocked by your rule `…` (user config)**, **Asks first: repository rule
+  `…` (repository config)** — a [command rule](USER_GUIDE.md#command-rules)
+  decided, named as written with its source (`user`, `admin`, `repository`,
+  `profile`, `session`). Audit cause names `rule_denied` and `rule_asks`. A
+  rule that asks leads the causes; the defaults' own reasons follow it.
+- **Blocked: Damaian would block this (recursive `rm` of `/`); no rule of
+  yours allows it** — one of Damaian's defaults (Settings → Commands →
+  *Damaian's defaults*), with what it saw. Audit cause `built_in_default`. Only
+  a rule of your own can let it run.
+- **Asks first: Damaian cannot analyse this command (it …), so no rule can
+  allow it** — `$NAME`, `$(…)`, backticks, an unquoted glob or a
+  here-document. Audit cause `unanalysable`. Usually another reason (shell
+  control, an unknown program) asks first and this one is not shown.
+- **Blocked: …** — the permission profile's `command_access`. These offer no
+  approval. Proposals stored before command rules may still read **Blocked:
+  matches *Commands that are always blocked*** or **Blocked: `…` can destroy
+  work** (causes `blocklisted`, `destructive`); new decisions use the rule
+  causes above.
 
 **The agent says: …**, when present, is the model's own stated purpose, not the
 policy's reason. **Why this command** keeps the full prompt, including every
@@ -3154,6 +3170,96 @@ For a session already logged, `command_proposal_stored` carries `causes`: the
 variant names in classifier order, comma-joined (for example
 `unknown,outside_repository`). That is the field to group or count when asking
 which reasons produce the most prompts.
+
+### Command rules: what decided, and why a rule did not apply
+
+Command rules ([user guide](USER_GUIDE.md#command-rules)) are listed, in the
+order they are checked and with their source and line, in **Settings →
+Commands**. Damaian's defaults are listed below them. The last matching rule
+decides; a repository or profile rule only tightens; your own rules decide over
+both and over the defaults.
+
+**Reading what decided.** The card's first reason line, or a separate rule
+line under it, names what decided:
+
+| Card says | Meaning |
+|---|---|
+| Asks first: repository rule `ask …` (repository config) | A repository or profile `ask` matched. Your own `allow` for the command would lift it. |
+| Blocked by your rule `deny …` (user config) | A `deny` matched one part; the whole line is blocked. |
+| Blocked: Damaian would block this (recursive `rm` of `/`); no rule of yours allows it | No rule matched and one of Damaian's defaults blocked it. Only your own `allow` can let it run. |
+| Allowed by your rule `allow …` (user config) | Every part matched an `allow` of yours (or the administrator's). An allowed command normally runs without a card; you see this line only when a card still shows, for example under *Ask before every command*. |
+| *(no rule named)* | No rule matched and nothing was blocked: the reason line (shell control, unknown program, network, a setting) is the default that asked. |
+
+A card warning such as "Damaian would block this: recursive `rm` of
+`/tmp/build/cache`. Your rule `allow rm -rf /tmp/build/**` allows it." means
+your `allow` lifted a default block. That is intended: the command runs as
+you decided.
+
+**In the audit log** (`audit/events.jsonl`), `command_proposal_stored`
+carries `causes` and, when a rule or default decided, `rule` (the rule as
+written, or what the default saw). A lifted default block also writes
+`command_rule_override` with `proposalId`, `rule`, `ruleSource`,
+`builtInDefault` (`recursive_remove`, `git_reset_hard`, `git_clean_force`,
+`dd_to_device`, `make_filesystem`, `shutdown`, `reboot`) and
+`workingDirectory`, never the command's output. An override that ran without
+asking showed no card, so the audit record is the only trace of it:
+
+```bash
+jq -c 'select(.eventType=="command_rule_override")' ~/Library/Application\ Support/DamaianClient/audit/events.jsonl
+```
+
+*Always allow* writes `command_allowlisted` with the `rule` it added.
+
+**A rule you wrote does not apply.** Check, in this order:
+
+- **Another rule after it matches.** The last match wins, so a broad rule
+  below a narrow one hides it. Move the narrow one down.
+- **The command has another part.** In a chain, `cd x && …`, or behind
+  `sudo`/`env`/`nice`/`time`/`command`, every part must be allowed. A part
+  no rule covers leaves the line to the defaults, which ask about `&&`.
+- **The pattern is exact.** `allow rm -rf /tmp` does not cover `/tmp/x`;
+  `allow rm -rf /tmp/**` does not cover `/tmp` itself; `allow cargo test`
+  does not cover `cargo test --lib` (end the pattern with ` *` for that).
+  Paths are compared after resolving `.`, `..` and `~` against the directory
+  the command runs in, and symlinks are not followed. For a program Damaian
+  does not know, options match as written, and `x` and `./x` differ.
+- **`in <directory>` is the command's directory**, not the repository's. A
+  command the assistant runs in `packages/api` is not covered by a rule `in`
+  the repository root.
+- **The card says Damaian cannot analyse the command.** `$NAME`, `${…}`,
+  `$(…)`, backticks, an unquoted glob such as `*.rs`, a here-document, a leading `NAME=value`, `xargs`, or a `cd` followed by
+  something other than `&&`: no `allow` covers these, ever. Ask the
+  assistant for the command written out. `$?`, `$#`, `$$`, `$-` and, as a
+  whole argument, `$!`, `$@`, `$*`, `$1`–`$9` are fine; `$0`, `$_` and `$IFS`
+  need `command_shell_parameters` (see
+  [Shell parameters](USER_GUIDE.md#shell-parameters-in-commands)), and that
+  setting never applies to the read-only check, so `ls $_` still asks.
+- **`require_approval_for_all_commands` is on.** Every command asks, allowed
+  or not; the card's reason names the setting.
+- **The session mode.** Ask, Plan and Review never run a command just because
+  a rule allows it (next section).
+
+**A repository's rule is not applied.** A repository's or profile's `allow`
+is refused at load; the note at the top of Settings → Commands reads "This
+repository's `allow` rule on line N is not applied: only your own rules can
+allow a command." That is the trust boundary, not a parse error. The same note
+lists each old key in use (`command_allowlist`, `command_blocklist`, older
+*Always allow* entries) and each entry it could not read as a rule, with the
+reason.
+
+**A rule cannot be saved in Settings.** "Your command rules changed since
+Settings read them. Reload the list and try again." means `user.conf`
+changed underneath (an *Always allow*, a hand edit); nothing was written.
+`Rule N: …` names a rule the parser refuses — a chain, an unanalysable
+pattern, a pattern naming `xargs`, or a directory that is not absolute, does
+not start with `~`, or contains a space — and the file is left as it was.
+
+**A blocklisted command now behaves differently.** Old `command_blocklist`
+entries are read as `deny <entry> *`. That blocks the command with any
+further arguments, in every part of a chain and behind a wrapper, which the
+old text prefix did not; but a prefix ending inside a word no longer matches
+(`docker` blocks `docker ps`, not `dockerx`). A blocklisted command written
+with `$…` or a glob is still blocked.
 
 ### The assistant was refused: the session mode, the permission profile, or the command policy?
 
@@ -3179,9 +3285,10 @@ Permission Profiles sections), and the wording tells them apart:
   command`, or `Command proposal is blocked by policy` at run time, and it
   happens in Code mode too.
 
-If a command you allowlisted with `Allow Always` is refused, that is a mode
-refusal and it is expected. The allowlist removes the prompt in Code. It does
-not make a command read-only in Plan or Review, and Ask runs no commands at all.
+If a command you allowed with `Allow Always` or a `command_rule` is refused,
+that is a mode refusal and it is expected. An `allow` removes the prompt in
+Code. It does not make a command read-only in Plan or Review, and Ask runs no
+commands at all.
 
 To see which mode a session was in, and when it changed, read its
 `session_mode_set` events (a session with none is in Code):

@@ -47,13 +47,23 @@ Damaian classifies every command before it runs, and the classification, not the
 
 - **Runs without asking:** commands Damaian recognises as read-only, such as `pwd`, `ls`, `echo`, `git status`, `git log` and the git listings (`git branch`, `git remote`, `git worktree list`, `git rev-parse`, …) with listed options; `cat`, `head`, `tail`, `wc`, `sed -n` and non-recursive `grep` reading files named on the line; and sequences of them joined by `&&`, `;` or a newline, filtered through `head`, `tail`, `wc`, `sort`, `uniq`, `cut` or `grep`, with output discarded only to `/dev/null`. They run in your login shell in the working folder, which is why the admitted set is a closed list of programs and options rather than a heuristic.
 - **Asks first:** everything else, including anything that writes, installs, reaches the network or uses shell control syntax. `git diff` and `git show` ask too, because they print file contents a command line cannot bound or keep restricted paths out of; the agent's `read_git_diff` tool does both. Every Docker command asks, `docker ps` included, because the daemon is privileged.
-- **Blocked:** commands matching `command_blocklist` or a destructive pattern are refused and cannot be approved from the UI.
+- **Blocked:** a command a `deny` rule names, or one of Damaian's destructive defaults when no rule of the user's allows it, is refused and cannot be approved from the card.
+
+Those three outcomes are Damaian's **defaults**. Over them sits one ordered list of **command rules** (`allow`, `ask`, `deny`; last match wins), and the authority to decide is the user's:
+
+- **The user has the final say.** A rule in user (or admin) config overrides every default: a user `allow` runs a command Damaian would block — recursive `rm` outside the repository, `git reset --hard`, `git clean -fd`, `dd` to a device, `mkfs`, `shutdown`, `reboot` — and a user `deny` blocks a command Damaian would admit as read-only. An `allow` that lifts a default block is not silent: a card that shows carries a warning, and the audit log records `command_rule_override` with the rule, its source and the default's name. `require_approval_for_all_commands` still asks before an allowed command.
+- **A repository can only tighten.** A repository's or permission profile's `command_rule` may `ask` or `deny`. Its `allow` is refused at load, audited as `repository_config_key_rejected`, and shown with its line in Settings → Commands. A repository or profile rule cannot soften a default block or a user `deny`.
+- **Rules match parsed commands, not text.** A command is split into its chain parts and wrapped commands (`sudo`, `env`, `nice`, `time`, `command`) with the same no-expansion tokenizer as the read-only boundary; every part must be allowed for the line to run. Options of known programs compare in any spelling, and path arguments are resolved lexically against the working directory before matching, so `rm -fr /`, `rm --recursive --force /` and `rm -rf /tmp/..` are all `rm -rf /`, and `allow rm -rf /tmp` covers neither `/` nor `/tmp/x`. Symlinks are not followed: a rule names the path as written and resolved, not what it points to.
+- **What cannot be analysed is never allowed.** A command with `$NAME`, `$(…)`, backticks, an unquoted glob, a here-document or `xargs` asks, and no `allow` of any source covers it; a `deny` whose words it starts with still blocks it. Only the shell's special parameters are analysable (`$?`, `$#`, `$$`, `$-` anywhere in an argument; `$!`, `$@`, `$*`, `$1`–`$9` only as a whole argument, since they may expand to nothing and hide a shorter path); `$0`, `$_` and `$IFS` only when the user lists them in `command_shell_parameters`, which a repository may only narrow and which does not reach the read-only boundary.
+
+*Always allow* writes a user rule of the exact command in the directory it ran in. It is not offered for a blocked command, for shell control, or for a command a rule cannot state exactly. The older `command_allowlist`, `command_allowlist.<repository_id>` and `command_blocklist` keys are read as rules with the same effect and source, and the entries that would change meaning are not read and are named in Settings.
 
 An approval's first line names the deciding cause — which shell-control construct, network keyword, path, setting or profile block — rather than a generic sentence, so the prompt can be judged instead of clicked through. The card shows that cause beside the risk badge and keeps every recorded reason in **Why this command**; the model's own stated purpose appears separately as *The agent says: …*. The same causes are recorded on the stored proposal and in the audit log.
 
 The read-only boundary is a tokenizer, not a prefix match. A command runs
 without asking only when a shell tokenizer splits it into words with no
-expansion — no `$`, no backtick, no unquoted `*`, `?`, `[`, `{` or `~` — every
+expansion — no `$` other than the default special parameters above, no
+backtick, no unquoted `*`, `?`, `[`, `{` or `~` — every
 program and option is from the closed list above, and every path argument
 resolves inside the repository and clear of `restricted_patterns`. What is
 checked is exactly what the login shell will run; anything the shell would
@@ -67,11 +77,10 @@ the model sees it, like any other command output.
 
 Two things the boundary deliberately does not cover:
 
-- **Allowlisted commands.** *Allow Always* records one exact command string the
-  user approved, and it keeps running without these checks. The allowlist is a
-  user decision about a specific command, not a claim that the command is
-  read-only; whether it should be held to the boundary is a separate question,
-  not this one.
+- **Commands a user rule allows.** An `allow` rule of the user's (written in
+  Settings, or by *Always allow*) runs its commands without these checks. It is
+  a user decision about specific commands, not a claim that they are
+  read-only, and it does not make them run in Plan, Review or Ask mode.
 - **`ls` listing restricted names.** A path argument is checked, but `ls` does
   not police the names it lists the way `list_directory` does. `ls secrets/`
   asks, because the path is restricted; `ls` of an admitted directory still
@@ -357,7 +366,7 @@ The eight `worker_task_budget_*` settings — the four values a worker plan revi
 
 Limits on how much one tool call, command or turn may read, run or spend may be lowered by a repository and never raised: `command_timeout_secs`, `max_read_lines`, `max_list_entries`, `max_search_matches`, `max_match_line_chars`, `repository_map_max_tokens`, `agent_max_task_tokens`, `agent_max_turn_messages`, `agent_max_exploration_rounds`, `agent_max_turn_notes_chars`, `allow_git_commits`, and `allow_git_branches`. Raising one would widen what leaves your machine or how long a command may run.
 
-`command_allowlist` is never taken from repository config. An `Allow Always` decision is the user's decision about a repository, so it is stored in user config as `command_allowlist.<repository_id>`, keyed per checkout. The repository's own file cannot grant its commands no-approval execution, and a `command_allowlist` already present in a repository file is offered once for itemised keep-or-discard rather than honoured. `web_domain_allowlist` follows the same rule for the same reason: *Allow always* on a fetch writes `web_domain_allowlist.<repository_id>` to user config, and a repository cannot pre-approve a host its own content names.
+A repository's `command_rule` lines may only `ask` or `deny`; an `allow` is refused as `restrict_only` with its line. `command_shell_parameters` may only lose entries from repository or profile config. `command_allowlist` is never taken from repository config. An `Allow Always` decision is the user's decision about a repository, so it is stored in user config, as a `command_rule` naming the exact command and the checkout directory it ran in (or, for a directory a rule line cannot name, as `command_allowlist.<repository_id>`, keyed per checkout). The repository's own file cannot grant its commands no-approval execution, and a `command_allowlist` already present in a repository file is offered once for itemised keep-or-discard rather than honoured. `web_domain_allowlist` follows the same rule for the same reason: *Allow always* on a fetch writes `web_domain_allowlist.<repository_id>` to user config, and a repository cannot pre-approve a host its own content names.
 
 `project_checks.<repository_id>` (spec 109 D9) — commands Damaian runs at task completion for one repository — is the user's too. A repository's config may only narrow it: it keeps the user's entries it also names, and an entry the user does not have is refused as `restrict_only` and audited by key, so a clone cannot make Damaian run a command of its choosing at the end of every task. A permission profile cannot carry it. Each check still runs through the ordinary command policy and asks where the policy asks.
 
