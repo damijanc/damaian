@@ -22,6 +22,11 @@ const SYNC_BUDGET: Duration = Duration::from_secs(2);
 /// dropped from memory past this (its file stays on disk).
 const CACHED_REPOSITORIES: usize = 4;
 
+/// How long the background fill holds a repository's vectors at a time. It
+/// lets go between slices so a search for that repository is never kept
+/// waiting for the whole fill.
+const BACKGROUND_SLICE: Duration = Duration::from_millis(500);
+
 /// `semantic_search_max_chunks` as a count this machine can index with.
 pub fn semantic_search_max_chunks(config: &crate::config::Config) -> usize {
     usize::try_from(config.semantic_search_max_chunks).unwrap_or(usize::MAX)
@@ -29,7 +34,7 @@ pub fn semantic_search_max_chunks(config: &crate::config::Config) -> usize {
 
 /// Turns chunk texts into vectors. [`EmbeddingModel`] in the app; tests
 /// substitute one that records what it was asked.
-pub trait ChunkEmbedder {
+pub trait ChunkEmbedder: Sync {
     fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>>;
 }
 
@@ -43,8 +48,10 @@ impl ChunkEmbedder for EmbeddingModel {
 enum SyncState {
     /// Every chunk has a current vector.
     Complete,
-    /// Chunks are still pending: the budget ran out, or the model failed.
+    /// Chunks are still pending because the budget ran out.
     Partial,
+    /// The model failed on a batch; the chunks before it were kept.
+    Failed,
     /// The repository has more chunks than `semantic_search_max_chunks`.
     OverCap { total_chunks: usize },
 }
@@ -143,7 +150,7 @@ impl VectorIndex {
             let texts: Vec<&str> = batch.iter().map(|(_, chunk)| chunk.text.as_str()).collect();
             let Ok(vectors) = embedder.embed_batch(&texts) else {
                 save(self);
-                return SyncState::Partial;
+                return SyncState::Failed;
             };
             for ((path, chunk), vector) in batch.iter().zip(vectors) {
                 self.entries.push(StoredChunkVector {
@@ -282,6 +289,81 @@ fn cached_index(data_dir: &Path, repository_id: &str) -> Arc<Mutex<CachedVectorI
     cached
 }
 
+/// Repositories whose vectors a background thread is filling in. One at most
+/// per repository: two would embed the same chunks and race on one file.
+static FILLING: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+
+fn filling() -> &'static Mutex<std::collections::HashSet<String>> {
+    FILLING.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
+fn is_filling(repository_id: &str) -> bool {
+    filling()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .contains(repository_id)
+}
+
+/// Removes the repository from [`FILLING`] however the fill ends, a panic
+/// included, so a later search can start another.
+struct FillingGuard(String);
+
+impl Drop for FillingGuard {
+    fn drop(&mut self) {
+        filling()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.0);
+    }
+}
+
+/// Finishes `index`'s vectors on a background thread, a slice at a time, so a
+/// large repository's first index completes in the time embedding takes
+/// rather than over dozens of searches each spending [`SYNC_BUDGET`].
+///
+/// Memory stays what one search's sync uses: the same batches, and the same
+/// saves. The thread owns a copy of the repository index for as long as it
+/// runs; that is the price of not holding the caller's. Returns `None` when a
+/// fill for this repository is already running.
+fn fill_in_background(
+    entry: Arc<Mutex<CachedVectorIndex>>,
+    index: RepositoryIndex,
+    embedder: &'static dyn ChunkEmbedder,
+    max_chunks: usize,
+) -> Option<std::thread::JoinHandle<()>> {
+    let repository_id = index.repository_id.clone();
+    if !filling()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(repository_id.clone())
+    {
+        return None;
+    }
+    let guard = FillingGuard(repository_id);
+    std::thread::Builder::new()
+        .name("vector-index-fill".to_string())
+        .spawn(move || {
+            let _guard = guard;
+            loop {
+                let mut cached = entry
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let CachedVectorIndex {
+                    index: vectors,
+                    path,
+                    ..
+                } = &mut *cached;
+                let mut save = |vectors: &VectorIndex| vectors.save(path);
+                let state = vectors.sync(&index, embedder, max_chunks, BACKGROUND_SLICE, &mut save);
+                drop(cached);
+                if state != SyncState::Partial {
+                    break;
+                }
+            }
+        })
+        .ok()
+}
+
 /// Real, embedding-based semantic search, backed by a process-wide cache of
 /// per-repository vectors (mirroring `IndexCache`'s pattern for
 /// `RepositoryIndex`). Falls back to `RepositoryIndex::semantic_search`'s
@@ -323,6 +405,11 @@ impl VectorIndexCache {
             return fallback();
         };
 
+        // A background fill is finishing this repository: answer by keyword
+        // now rather than wait for it to let go of the vectors.
+        if is_filling(&index.repository_id) {
+            return fallback();
+        }
         let entry = cached_index(data_dir, &index.repository_id);
         let mut cached = entry
             .lock()
@@ -335,7 +422,12 @@ impl VectorIndexCache {
         let mut save = |vectors: &VectorIndex| vectors.save(path);
         match vectors.sync(index, model, max_chunks, SYNC_BUDGET, &mut save) {
             SyncState::Complete => vectors.search(&query_vector, index, limit, allowed),
-            SyncState::Partial => fallback(),
+            SyncState::Partial => {
+                drop(cached);
+                fill_in_background(entry, index.clone(), model, max_chunks);
+                fallback()
+            }
+            SyncState::Failed => fallback(),
             SyncState::OverCap { total_chunks } => {
                 if !*over_cap_reported {
                     *over_cap_reported = true;
@@ -367,12 +459,11 @@ mod tests {
     use super::*;
     use crate::error::ClientError;
     use crate::indexer::FileRecord;
-    use std::cell::RefCell;
 
     /// Records the size of every batch it is asked to embed.
     #[derive(Default)]
     struct RecordingEmbedder {
-        batches: RefCell<Vec<usize>>,
+        batches: Mutex<Vec<usize>>,
         fail: bool,
     }
 
@@ -381,7 +472,7 @@ mod tests {
             if self.fail {
                 return Err(ClientError::Io("no model".to_string()));
             }
-            self.batches.borrow_mut().push(texts.len());
+            self.batches.lock().unwrap().push(texts.len());
             Ok(texts.iter().map(|_| vec![1.0, 0.0]).collect())
         }
     }
@@ -440,7 +531,7 @@ mod tests {
 
         assert_eq!(state, SyncState::Complete);
         assert_eq!(vectors.entries.len(), 1_000);
-        let batches = embedder.batches.borrow();
+        let batches = embedder.batches.lock().unwrap();
         assert!(
             batches.iter().all(|size| *size <= SYNC_BATCH_CHUNKS),
             "{batches:?}"
@@ -465,7 +556,7 @@ mod tests {
         assert_eq!(second, SyncState::Complete);
         assert_eq!(vectors.entries.len(), 100);
         assert_eq!(
-            embedder.batches.borrow().iter().sum::<usize>(),
+            embedder.batches.lock().unwrap().iter().sum::<usize>(),
             100,
             "chunks embedded before the budget ran out are not embedded again"
         );
@@ -489,12 +580,12 @@ mod tests {
         let embedder = RecordingEmbedder::default();
         let mut vectors = VectorIndex::default();
         sync(&mut vectors, &index, &embedder, 100, Duration::MAX);
-        embedder.batches.borrow_mut().clear();
+        embedder.batches.lock().unwrap().clear();
 
         let (state, saves) = sync(&mut vectors, &index, &embedder, 99, Duration::MAX);
 
         assert_eq!(state, SyncState::OverCap { total_chunks: 100 });
-        assert!(embedder.batches.borrow().is_empty());
+        assert!(embedder.batches.lock().unwrap().is_empty());
         assert!(vectors.entries.is_empty());
         assert_eq!(saves, 1, "the emptied index replaces the file");
     }
@@ -505,17 +596,17 @@ mod tests {
         let embedder = RecordingEmbedder::default();
         let mut vectors = VectorIndex::default();
         sync(&mut vectors, &index, &embedder, 100, Duration::MAX);
-        embedder.batches.borrow_mut().clear();
+        embedder.batches.lock().unwrap().clear();
 
         let (state, saves) = sync(&mut vectors, &index, &embedder, 100, Duration::MAX);
 
         assert_eq!(state, SyncState::Complete);
-        assert!(embedder.batches.borrow().is_empty());
+        assert!(embedder.batches.lock().unwrap().is_empty());
         assert_eq!(saves, 0);
     }
 
     #[test]
-    fn a_model_failure_keeps_earlier_vectors_and_reports_partial() {
+    fn a_model_failure_keeps_earlier_vectors_and_reports_it() {
         let index = repository(2, 2);
         let mut vectors = VectorIndex::default();
         let failing = RecordingEmbedder {
@@ -525,7 +616,7 @@ mod tests {
 
         let (state, _) = sync(&mut vectors, &index, &failing, 100, Duration::MAX);
 
-        assert_eq!(state, SyncState::Partial);
+        assert_eq!(state, SyncState::Failed);
         assert!(vectors.entries.is_empty());
     }
 
@@ -545,5 +636,156 @@ mod tests {
             .collect();
         assert!(loaded.len() <= CACHED_REPOSITORIES, "{loaded:?}");
         assert!(!loaded.contains(&"repo_evict_0".to_string()), "{loaded:?}");
+    }
+
+    fn leaked(embedder: RecordingEmbedder) -> &'static RecordingEmbedder {
+        Box::leak(Box::new(embedder))
+    }
+
+    fn entry_at(path: PathBuf) -> Arc<Mutex<CachedVectorIndex>> {
+        Arc::new(Mutex::new(CachedVectorIndex {
+            index: VectorIndex::default(),
+            path,
+            over_cap_reported: false,
+        }))
+    }
+
+    fn scratch_file(name: &str) -> PathBuf {
+        std::env::temp_dir()
+            .join(format!(
+                "damaian-vector-fill-{name}-{}-{}",
+                std::process::id(),
+                crate::hash::now_millis()
+            ))
+            .join("vectors.bin")
+    }
+
+    fn with_id(mut index: RepositoryIndex, id: &str) -> RepositoryIndex {
+        index.repository_id = id.to_string();
+        index
+    }
+
+    #[test]
+    fn a_background_fill_finishes_the_index_in_bounded_batches_and_saves_it() {
+        let index = with_id(repository(40, 10), "repo_fill_finishes");
+        let embedder = leaked(RecordingEmbedder::default());
+        let path = scratch_file("finishes");
+        let entry = entry_at(path.clone());
+
+        fill_in_background(entry.clone(), index, embedder, 100_000)
+            .expect("a fill starts")
+            .join()
+            .unwrap();
+
+        assert_eq!(entry.lock().unwrap().index.entries.len(), 400);
+        let batches = embedder.batches.lock().unwrap();
+        assert!(
+            batches.iter().all(|size| *size <= SYNC_BATCH_CHUNKS),
+            "{batches:?}"
+        );
+        assert_eq!(
+            VectorIndex::load(&path).entries.len(),
+            400,
+            "the finished index is on disk"
+        );
+        assert!(
+            !is_filling("repo_fill_finishes"),
+            "the repository is free for the next fill"
+        );
+    }
+
+    #[test]
+    fn only_one_fill_runs_per_repository() {
+        filling()
+            .lock()
+            .unwrap()
+            .insert("repo_fill_once".to_string());
+        let index = with_id(repository(2, 2), "repo_fill_once");
+        let embedder = leaked(RecordingEmbedder::default());
+
+        let second = fill_in_background(entry_at(scratch_file("once")), index, embedder, 100);
+
+        assert!(second.is_none());
+        assert!(embedder.batches.lock().unwrap().is_empty());
+        filling().lock().unwrap().remove("repo_fill_once");
+    }
+
+    #[test]
+    fn a_fill_whose_model_fails_stops_instead_of_retrying_forever() {
+        let index = with_id(repository(5, 5), "repo_fill_fails");
+        let embedder = leaked(RecordingEmbedder {
+            fail: true,
+            ..RecordingEmbedder::default()
+        });
+
+        fill_in_background(entry_at(scratch_file("fails")), index, embedder, 100)
+            .expect("a fill starts")
+            .join()
+            .unwrap();
+
+        assert!(!is_filling("repo_fill_fails"));
+    }
+
+    #[test]
+    fn a_fill_over_the_cap_embeds_nothing() {
+        let index = with_id(repository(5, 5), "repo_fill_cap");
+        let embedder = leaked(RecordingEmbedder::default());
+        let entry = entry_at(scratch_file("cap"));
+
+        fill_in_background(entry.clone(), index, embedder, 10)
+            .expect("a fill starts")
+            .join()
+            .unwrap();
+
+        assert!(embedder.batches.lock().unwrap().is_empty());
+        assert!(entry.lock().unwrap().index.entries.is_empty());
+    }
+
+    /// Measures a real background fill: the embedding model on 2,000
+    /// source-sized chunks, timed, with the process's peak memory.
+    /// `#[ignore]`d per `AGENTS.md` because it needs the model, which the first
+    /// run downloads from huggingface.co. Run it by hand:
+    ///
+    /// ```sh
+    /// cargo test -p workspace-engine --lib --release -- --ignored --nocapture \
+    ///   vector_index::tests::a_real_background_fill_stays_within_memory
+    /// ```
+    #[test]
+    #[ignore]
+    fn a_real_background_fill_stays_within_memory() {
+        let data_dir = std::env::temp_dir().join("damaian-test-embedding-cache");
+        let model = shared_model(&data_dir).expect("the embedding model loads");
+        let mut index = with_id(repository(200, 10), "repo_fill_real");
+        for file in &mut index.files {
+            for chunk in &mut file.chunks {
+                chunk.text = format!(
+                    "fn handler_{}_{}() {{ {} }}",
+                    file.path,
+                    chunk.ordinal,
+                    "let value = compute(input) + offset; ".repeat(60)
+                );
+            }
+        }
+        let entry = entry_at(scratch_file("real"));
+        let started = Instant::now();
+
+        fill_in_background(entry.clone(), index, model, 100_000)
+            .expect("a fill starts")
+            .join()
+            .unwrap();
+
+        let elapsed = started.elapsed();
+        let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+        // SAFETY: `usage` is a zeroed `rusage` that `getrusage` fills in.
+        unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) };
+        // macOS reports `ru_maxrss` in bytes.
+        let peak_mb = usage.ru_maxrss / (1024 * 1024);
+        let embedded = entry.lock().unwrap().index.entries.len();
+        println!(
+            "filled {embedded} chunks in {elapsed:?} ({:.0}/s); peak memory {peak_mb} MB",
+            embedded as f64 / elapsed.as_secs_f64()
+        );
+        assert_eq!(embedded, 2_000);
+        assert!(peak_mb < 1_500, "peak memory {peak_mb} MB");
     }
 }

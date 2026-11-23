@@ -3555,10 +3555,12 @@ through the GitHub copy.
 
 Two more reasons semantic results do not appear yet:
 
-- **The vectors are still being built.** Each search embeds for at most two
-  seconds and answers by keyword until every chunk has a vector. Progress is
-  kept in `vector-index/<repository_id>.bin` inside the data directory, which
-  grows as it fills; a few more searches finish it.
+- **The vectors are still being built.** The first search starts building them
+  and a background thread finishes, at roughly 75 chunks a second; search
+  answers by keyword until it is done. Progress is kept in
+  `vector-index/<repository_id>.bin` inside the data directory, which grows by
+  about 1.6 KB per chunk as it fills. Quitting Damaian stops the build; the next
+  search resumes it from the saved progress.
 - **The repository is over the cap.** A repository with more chunks than
   `semantic_search_max_chunks` (default 100,000) is never embedded and always
   answers by keyword. A desktop shell run from a terminal prints
