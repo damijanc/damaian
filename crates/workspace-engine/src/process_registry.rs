@@ -77,7 +77,25 @@ impl ProcessIdentity {
 /// Whether `pid` is a child of this process that has exited but not been
 /// reaped. `WNOWAIT` leaves the exit status in place, so whoever owns the
 /// `Child` still reaps it. A pid that is not our child is `ECHILD`: false.
+#[cfg(test)]
 fn exited_unreaped(pid: u32) -> bool {
+    child_state(pid) == ChildState::ExitedUnreaped
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChildState {
+    Running,
+    ExitedUnreaped,
+    NotOurChild,
+}
+
+/// How long `register` waits for a child of ours whose identity has gone but
+/// which is not yet waitable. That window is the kernel tearing the process
+/// down (observation 87): it closes in microseconds, so the bound only matters
+/// if something else ever makes a live child's identity unreadable.
+const EXITING_CHILD_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+
+fn child_state(pid: u32) -> ChildState {
     let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
     // SAFETY: `info` is a zeroed `siginfo_t` that `waitid` fills in; nothing
     // else is borrowed.
@@ -91,7 +109,44 @@ fn exited_unreaped(pid: u32) -> bool {
     };
     // With `WNOHANG`, a child that is still running also returns 0, with no
     // pid filled in.
-    result == 0 && info.si_pid == pid as libc::pid_t
+    if result != 0 {
+        ChildState::NotOurChild
+    } else if info.si_pid == pid as libc::pid_t {
+        ChildState::ExitedUnreaped
+    } else {
+        ChildState::Running
+    }
+}
+
+/// The identity to record for `pid`, `None` when the child already exited and
+/// there is nothing to record.
+///
+/// A child of ours that is exiting has a window in which `proc_pidinfo` no
+/// longer reads it but `waitid` does not yet report it exited. Failing there
+/// fails a command that ran fine (observation 87), so for our own child the
+/// two are polled until one answers. A pid that is not our child gets no such
+/// grace: unreadable means it cannot be recorded.
+fn identity_for_registration(
+    pid: u32,
+    identity_of: &dyn Fn(u32) -> Option<ProcessIdentity>,
+) -> Result<Option<ProcessIdentity>> {
+    let deadline = std::time::Instant::now() + EXITING_CHILD_WAIT;
+    loop {
+        if let Some(identity) = identity_of(pid) {
+            return Ok(Some(identity));
+        }
+        match child_state(pid) {
+            ChildState::ExitedUnreaped => return Ok(None),
+            ChildState::Running if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            ChildState::Running | ChildState::NotOurChild => {
+                return Err(ClientError::Io(format!(
+                    "process {pid} has no readable identity to record"
+                )));
+            }
+        }
+    }
 }
 
 /// The name an entry is written under before it is linked into place. It
@@ -232,17 +287,11 @@ impl ProcessRegistry {
         session_id: &str,
         pid: u32,
     ) -> Result<RegistrationHandle> {
-        let identity = match ProcessIdentity::of(pid) {
-            Some(identity) => identity,
-            // A fast child can exit between `spawn` and here. Unreaped, its pid
-            // cannot be reused and there is nothing left to sweep, so there is
-            // nothing to record — and failing would fail a command that ran.
-            None if exited_unreaped(pid) => return Ok(RegistrationHandle::none()),
-            None => {
-                return Err(ClientError::Io(format!(
-                    "process {pid} has no readable identity to record"
-                )));
-            }
+        // A fast child can exit between `spawn` and here. Unreaped, its pid
+        // cannot be reused and there is nothing left to sweep, so there is
+        // nothing to record — and failing would fail a command that ran.
+        let Some(identity) = identity_for_registration(pid, &ProcessIdentity::of)? else {
+            return Ok(RegistrationHandle::none());
         };
         // Read rather than assumed. Every spawn site puts the child in its own
         // group, so this should equal `pid`; where it does not, the sweep falls
@@ -891,6 +940,51 @@ mod tests {
             child.try_wait().unwrap().is_some(),
             "registering must leave the exit status for the owner to reap"
         );
+    }
+
+    /// Observation 87: a child caught mid-exit has lost its identity but is not
+    /// yet waitable. The unreadable identity is injected for the child's whole
+    /// life, which is that window held open; registration must wait it out.
+    #[test]
+    fn a_child_caught_while_exiting_is_waited_for_rather_than_failed() {
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("0.1")
+            .spawn()
+            .expect("sleep should spawn");
+
+        let identity = identity_for_registration(child.id(), &|_| None);
+
+        assert!(matches!(identity, Ok(None)), "{identity:?}");
+        assert!(
+            child.try_wait().unwrap().is_some(),
+            "the exit status stays for the owner to reap"
+        );
+    }
+
+    #[test]
+    fn a_running_child_whose_identity_never_appears_fails_after_the_wait() {
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("sleep should spawn");
+        let started = std::time::Instant::now();
+
+        let identity = identity_for_registration(child.id(), &|_| None);
+
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(identity.is_err(), "{identity:?}");
+        assert!(started.elapsed() >= EXITING_CHILD_WAIT);
+    }
+
+    #[test]
+    fn a_pid_that_is_not_our_child_fails_without_waiting() {
+        let started = std::time::Instant::now();
+
+        let identity = identity_for_registration(1, &|_| None);
+
+        assert!(identity.is_err(), "{identity:?}");
+        assert!(started.elapsed() < EXITING_CHILD_WAIT / 2);
     }
 
     #[test]

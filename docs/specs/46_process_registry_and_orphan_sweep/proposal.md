@@ -414,6 +414,17 @@ Added 2026-10-24 after two flakes. Both were real defects, not test artefacts.
   reap, and nothing is lost: an unreaped pid cannot be reused, and an exited
   child has nothing to sweep. Any other pid without an identity still fails,
   so a bare number is never recorded.
+- **A child caught mid-exit still failed (2026-11-23).** Between those two
+  states there is a window in which the exiting child has lost its identity
+  but `waitid` does not yet report it exited, so neither branch matched. It
+  failed CI several times under parallel load (OBSERVATIONS 87). For a pid
+  that is still our child, `register` now polls both reads every millisecond
+  for up to one second (`EXITING_CHILD_WAIT`) until one answers; a pid that
+  is not our child still fails at once.
+  `a_child_caught_while_exiting_is_waited_for_rather_than_failed` holds the
+  window open by injecting an unreadable identity, and fails on the old code;
+  `a_running_child_whose_identity_never_appears_fails_after_the_wait` and
+  `a_pid_that_is_not_our_child_fails_without_waiting` pin the two bounds.
 
 `a_reader_racing_registration_and_removal_never_sees_an_unreadable_entry`,
 `registering_a_child_that_already_exited_succeeds_and_records_nothing` and
