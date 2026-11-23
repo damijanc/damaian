@@ -130,6 +130,12 @@ pub(crate) enum ToolAction {
         tool_name: String,
         arguments_json: String,
     },
+    /// Spec 33 §5.1 stage 1: searches the MCP tool inventory by capability.
+    /// Calls no MCP tool; it may list a server whose cost is still unknown,
+    /// which is what records that server's inventory.
+    McpToolSearch {
+        query: String,
+    },
     /// One bounded question for the user (spec 50). Already validated against
     /// the bounds when it is decoded; not yet redacted.
     AskUser(AskUserInput),
@@ -219,6 +225,11 @@ pub(super) fn action_effect(action: &ToolAction) -> ActionEffect {
         // action. It is charged like notes so a round of reads plus one
         // suggestion is exploration, not an action round.
         ToolAction::TurnNotes { .. } | ToolAction::ProposeMemory { .. } => ActionEffect::Notes,
+        // A search reads the local inventory and calls no tool, so it is
+        // charged as exploration. It is not `ReadOnly` because it is never
+        // batched: it needs the turn's MCP runtime, which only the loop
+        // thread holds, to list a server of unknown cost.
+        ToolAction::McpToolSearch { .. } => ActionEffect::Notes,
     }
 }
 
@@ -337,6 +348,7 @@ pub(super) fn tool_event_payload(
         ToolAction::Command(_) => ("run_command", Vec::new()),
         ToolAction::WebDiagnostic(_) => ("web_diagnostic", Vec::new()),
         ToolAction::McpCall { .. } => ("mcp_call", Vec::new()),
+        ToolAction::McpToolSearch { .. } => ("mcp_tool_search", Vec::new()),
     };
     paths = paths
         .into_iter()
@@ -542,6 +554,9 @@ fn tool_action_marker_unscoped(
             format!("{server_id}/{tool_name}"),
             side_effecting,
         ),
+        // Empty for the reason `ask_user`'s is: the query is model-authored
+        // and not yet redacted when the marker is written.
+        ToolAction::McpToolSearch { .. } => ("mcp_tool_search", String::new(), side_effecting),
     }
 }
 
@@ -655,5 +670,6 @@ pub(super) fn tool_action_label(action: &ToolAction) -> String {
             tool_name,
             ..
         } => format!("Calling {tool_name} on {server_id}"),
+        ToolAction::McpToolSearch { .. } => "Searching MCP tools".to_string(),
     }
 }

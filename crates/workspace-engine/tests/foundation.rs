@@ -6687,13 +6687,35 @@ fn mcp_deferral_decision_reads_the_inventory_and_measures_the_saving() {
         "and must not write an inventory it did not list"
     );
 
-    // A turn lists every server today (Task 4 replaces that surface); each
-    // successful `tools/list` refreshes the inventory.
-    let mut adapter = MockModelAdapter::new("Done.");
+    // A turn that uses no MCP tool lists nothing (Task 4): every server is
+    // unknown cost and deferred, so it starts no server and records nothing.
+    let mut idle = MockModelAdapter::new("Done.");
     ask_with_cancel(
         &engine,
         &repo,
         "Which tools can you use?",
+        &mut idle,
+        &CancelToken::new(),
+        &mut |_token| {},
+    );
+    assert!(!McpToolInventory::directory(&data_dir, &repository_id).exists());
+    // A search lists each server of unknown cost — only those — and every
+    // successful `tools/list` refreshes the inventory.
+    let mut adapter = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![String::new(), "Done.".to_string()],
+        vec![
+            vec![ToolCall {
+                id: "call_1".to_string(),
+                name: "mcp_tool_search".to_string(),
+                arguments_json: "{\"query\":\"records\"}".to_string(),
+            }],
+            Vec::new(),
+        ],
+    );
+    ask_with_cancel(
+        &engine,
+        &repo,
+        "Find a tool that returns records.",
         &mut adapter,
         &CancelToken::new(),
         &mut |_token| {},
@@ -6728,19 +6750,39 @@ fn mcp_deferral_decision_reads_the_inventory_and_measures_the_saving() {
     assert!(full > ceiling, "this configuration is over the ceiling");
     assert_eq!(warm.known_surface, McpToolSurface::Deferred);
 
-    // The deferred figure: what §5.1's stage 1 sends instead — one search tool.
-    // A stand-in for the definition Task 4 adds; Task 4 re-measures with its
-    // real definition.
-    let search_stand_in = workspace_engine::McpTool {
-        name: "mcp_tool_search".to_string(),
-        description: "Search the configured MCP servers for a tool by capability. Returns \
-                      matching tool names, their server, and a one-line description; call a \
-                      returned name to use it."
-            .to_string(),
-        input_schema_json: r#"{"type":"object","properties":{"query":{"type":"string","description":"What the tool should do, in a few words."}},"required":["query"]}"#.to_string(),
-        read_only_hint: Some(true),
-    };
-    let deferred = estimate_mcp_tool_tokens(&search_stand_in);
+    // The deferred figure: what §5.1's stage 1 actually sends instead, read
+    // from the request of a turn over the warm, over-ceiling configuration —
+    // every MCP-related definition in it, measured the same way (D7).
+    let mut deferred_turn = MockModelAdapter::new("Done.");
+    ask_with_cancel(
+        &engine,
+        &repo,
+        "Which tools can you use?",
+        &mut deferred_turn,
+        &CancelToken::new(),
+        &mut |_token| {},
+    );
+    let sent: Vec<workspace_engine::McpTool> = deferred_turn.requests[0]
+        .tools
+        .as_ref()
+        .expect("a native-tool provider is offered tools")
+        .iter()
+        .filter(|tool| tool.name == "mcp_tool_search" || tool.name.starts_with("mcp__"))
+        .map(|tool| workspace_engine::McpTool {
+            name: tool.name.clone(),
+            description: tool.description.clone(),
+            input_schema_json: tool.parameters_json.clone(),
+            read_only_hint: None,
+        })
+        .collect();
+    assert_eq!(
+        sent.iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["mcp_tool_search"],
+        "over the ceiling, the search tool alone stands in for every schema"
+    );
+    let deferred: usize = sent.iter().map(estimate_mcp_tool_tokens).sum();
     eprintln!(
         "spec 33 §7: {} servers, {} tools — schemas in full {full} tokens, \
          with deferral {deferred} tokens (ceiling {ceiling})",

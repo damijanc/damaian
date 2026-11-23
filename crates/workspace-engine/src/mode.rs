@@ -196,6 +196,12 @@ pub(crate) fn profile_permits(
         ToolAction::WebDiagnostic(_) => {
             (!capabilities.allow_browser_diagnostics).then_some(ProfileLimit::BrowserDiagnostics)
         }
+        // Spec 33 §5.1: searching reveals tool names only, and only a
+        // profile with MCP on may reach them; whether a found tool may then be
+        // *called* is the `McpCall` arm's decision, unchanged.
+        ToolAction::McpToolSearch { .. } => {
+            (!capabilities.mcp_enabled).then_some(ProfileLimit::McpDisabled)
+        }
         ToolAction::McpCall { .. } => {
             if !capabilities.mcp_enabled {
                 Some(ProfileLimit::McpDisabled)
@@ -260,9 +266,12 @@ pub(crate) fn mode_permits(
         // narrows the offer in `chat.rs`; it never widens a mode.
         // Spec 65: writing notes is allowed in every mode, beside the reads it
         // records findings from. It writes only the turn's own notes.
+        // Spec 33 §5.1: a search calls no MCP tool, so it is allowed in every
+        // mode; the found tool still meets the `McpCall` row when called.
         ToolAction::AskUser(_)
         | ToolAction::TurnNotes { .. }
-        | ToolAction::ProposeMemory { .. } => Permission::Allowed,
+        | ToolAction::ProposeMemory { .. }
+        | ToolAction::McpToolSearch { .. } => Permission::Allowed,
 
         ToolAction::ProposePatch(_) | ToolAction::EditFile { .. } => {
             if mode == Code {

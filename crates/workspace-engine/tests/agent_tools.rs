@@ -1701,3 +1701,421 @@ fn fetch_url_is_offered_in_code_mode_only() {
 
     fs::remove_dir_all(repo).unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// Spec 33 Task 4 · Deferred discovery surface and `mcp_tool_search`
+// (requirements 2, 5.1, 5.2; context D3)
+// ---------------------------------------------------------------------------
+
+/// A stdio MCP server answering `initialize`, `tools/list` and `tools/call`,
+/// which touches `<dir>/<name>.started` when it is launched, so a test can
+/// tell whether the turn ever started it. `tools_array` must contain no `%`
+/// or `'`: it is spliced into a single-quoted `printf` format.
+fn write_marked_mcp_server(dir: &Path, name: &str, tools_array: &str) -> PathBuf {
+    assert!(!tools_array.contains('%') && !tools_array.contains('\''));
+    let script = dir.join(format!("{name}.sh"));
+    let marker = dir.join(format!("{name}.started"));
+    fs::write(
+        &script,
+        format!(
+            r#"#!/bin/sh
+touch '{marker}'
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed 's/.*"id":\([0-9]*\).*/\1/')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{{"jsonrpc":"2.0","id":%s,"result":{{"protocolVersion":"2025-06-18","capabilities":{{}},"serverInfo":{{"name":"fake","version":"0"}}}}}}\n' "$id" ;;
+    *'"method":"tools/list"'*)
+      printf '{{"jsonrpc":"2.0","id":%s,"result":{{"tools":{tools_array}}}}}\n' "$id" ;;
+    *'"method":"tools/call"'*)
+      printf '{{"jsonrpc":"2.0","id":%s,"result":{{"content":[{{"type":"text","text":"tool ran"}}]}}}}\n' "$id" ;;
+  esac
+done
+"#,
+            marker = marker.display()
+        ),
+    )
+    .unwrap();
+    script
+}
+
+fn mcp_server_started(dir: &Path, name: &str) -> bool {
+    dir.join(format!("{name}.started")).exists()
+}
+
+/// Three tools on the `tracker` server: an issue creator, a pull-request
+/// lister and a deployment trigger.
+fn tracker_tools() -> Vec<serde_json::Value> {
+    ["create_issue", "list_pulls", "trigger_deploy"]
+        .iter()
+        .map(|name| {
+            serde_json::json!({
+                "name": name,
+                "description": format!("{} on the tracker.", name.replace('_', " ")),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": { "title": { "type": "string", "description": "Title." } }
+                }
+            })
+        })
+        .collect()
+}
+
+fn tool_from_json(tool: &serde_json::Value) -> workspace_engine::McpTool {
+    workspace_engine::McpTool {
+        name: tool["name"].as_str().unwrap().to_string(),
+        description: tool["description"].as_str().unwrap_or_default().to_string(),
+        input_schema_json: tool["inputSchema"].to_string(),
+        read_only_hint: tool["annotations"]["readOnlyHint"].as_bool(),
+    }
+}
+
+/// A repository with one `tracker` MCP server whose calls need no approval,
+/// and its inventory recorded when `known` — a server never listed is of
+/// unknown cost and deferred. `overlay` adds config lines.
+fn mcp_engine(repo: &Path, known: bool, overlay: &str) -> (WorkspaceEngine, PathBuf) {
+    write_fixture(repo, "README.md", "# MCP surface\n");
+    let servers = repo.join("servers");
+    fs::create_dir_all(&servers).unwrap();
+    let tools = tracker_tools();
+    let script =
+        write_marked_mcp_server(&servers, "tracker", &serde_json::to_string(&tools).unwrap());
+    let mut config = test_config(repo);
+    config.model_providers.push(native_tool_provider());
+    config.mcp_servers.push(workspace_engine::McpServerConfig {
+        id: "tracker".to_string(),
+        label: "Tracker".to_string(),
+        transport: workspace_engine::McpTransport::Stdio,
+        command: "sh".to_string(),
+        args: vec![script.to_string_lossy().to_string()],
+        env: Vec::new(),
+        url: String::new(),
+        auth_token_env: String::new(),
+        enabled: true,
+        require_approval: false,
+    });
+    if !overlay.is_empty() {
+        config.apply_overlay(workspace_engine::ConfigOverlay::parse(overlay).unwrap());
+    }
+    if known {
+        let listed: Vec<_> = tools.iter().map(tool_from_json).collect();
+        workspace_engine::McpToolInventory::record_listing(
+            &config.data_dir,
+            &workspace_engine::repository_id_for_root(repo),
+            "tracker",
+            &listed,
+        )
+        .unwrap();
+    }
+    (WorkspaceEngine::new(config), servers)
+}
+
+fn offered_names(request: &workspace_engine::ModelRequest) -> Vec<String> {
+    request
+        .tools
+        .as_ref()
+        .map(|tools| tools.iter().map(|tool| tool.name.clone()).collect())
+        .unwrap_or_default()
+}
+
+fn ask_scripted(
+    engine: &WorkspaceEngine,
+    repo: &Path,
+    calls: Vec<Vec<ToolCall>>,
+) -> (ChatTurnResult, MockModelAdapter) {
+    let responses = calls
+        .iter()
+        .map(|round| {
+            if round.is_empty() {
+                "Done.".to_string()
+            } else {
+                String::new()
+            }
+        })
+        .collect();
+    let mut adapter = MockModelAdapter::new_sequence_with_tool_calls(responses, calls);
+    let mut on_token = |_token: &str| {};
+    let result = engine
+        .chat_orchestrator
+        .ask(repo, "Use the tracker.", &[], &mut adapter, &mut on_token)
+        .unwrap();
+    (result, adapter)
+}
+
+fn tool_results(engine: &WorkspaceEngine, result: &ChatTurnResult) -> Vec<String> {
+    engine
+        .session_store
+        .read_messages(&result.session.id)
+        .unwrap()
+        .into_iter()
+        .filter(|message| message.role == "tool")
+        .map(|message| message.content)
+        .collect()
+}
+
+fn search_call(id: &str, query: &str) -> ToolCall {
+    ToolCall {
+        id: id.to_string(),
+        name: "mcp_tool_search".to_string(),
+        arguments_json: serde_json::json!({ "query": query }).to_string(),
+    }
+}
+
+/// Acceptance criterion: a configuration under the deferral ceiling sends its
+/// schemas directly, beside the search tool.
+#[test]
+fn under_the_ceiling_mcp_tools_are_sent_directly() {
+    let repo = temp_dir("mcp-direct");
+    let (engine, _servers) = mcp_engine(&repo, true, "");
+    let (_result, adapter) = ask_scripted(&engine, &repo, vec![Vec::new()]);
+
+    let names = offered_names(&adapter.requests[0]);
+    for tool in ["create_issue", "list_pulls", "trigger_deploy"] {
+        assert!(
+            names.contains(&format!("mcp__tracker__{tool}")),
+            "{tool} is under the ceiling and sent: {names:?}"
+        );
+    }
+    assert!(names.contains(&"mcp_tool_search".to_string()), "{names:?}");
+    fs::remove_dir_all(repo).unwrap();
+}
+
+/// Over the ceiling, the search tool stands in for every schema, and deciding
+/// so starts nothing.
+#[test]
+fn over_the_ceiling_only_the_search_tool_is_sent() {
+    let repo = temp_dir("mcp-deferred");
+    let (engine, servers) = mcp_engine(&repo, true, "mcp_deferral_ceiling_tokens=10\n");
+    let (_result, adapter) = ask_scripted(&engine, &repo, vec![Vec::new()]);
+
+    let names = offered_names(&adapter.requests[0]);
+    assert!(names.contains(&"mcp_tool_search".to_string()), "{names:?}");
+    assert!(
+        !names.iter().any(|name| name.starts_with("mcp__")),
+        "no MCP schema is sent over the ceiling: {names:?}"
+    );
+    assert!(!mcp_server_started(&servers, "tracker"));
+    fs::remove_dir_all(repo).unwrap();
+}
+
+/// `mcp_tool_search` answers from the inventory: name, server and a one-line
+/// description, without connecting to a server whose cost is known.
+#[test]
+fn mcp_tool_search_returns_matches_from_the_inventory() {
+    let repo = temp_dir("mcp-search");
+    let (engine, servers) = mcp_engine(&repo, true, "mcp_deferral_ceiling_tokens=10\n");
+    let (result, _adapter) = ask_scripted(
+        &engine,
+        &repo,
+        vec![vec![search_call("call_1", "open an issue")], Vec::new()],
+    );
+
+    let results = tool_results(&engine, &result);
+    let found: serde_json::Value = serde_json::from_str(&results[0]).unwrap();
+    assert_eq!(found["matches"][0]["name"], "mcp__tracker__create_issue");
+    assert_eq!(found["matches"][0]["server"], "tracker");
+    assert_eq!(
+        found["matches"][0]["description"],
+        "create issue on the tracker."
+    );
+    assert!(
+        !mcp_server_started(&servers, "tracker"),
+        "a search over a known inventory connects nothing"
+    );
+    fs::remove_dir_all(repo).unwrap();
+}
+
+/// D3: a matched tool's schema is sent from the round after the match, and
+/// calling it runs it — through the same permission and approval path as any
+/// MCP call — and keeps its schema for the rest of the turn.
+#[test]
+fn calling_a_matched_tool_adds_its_schema() {
+    let repo = temp_dir("mcp-matched");
+    let (engine, servers) = mcp_engine(&repo, true, "mcp_deferral_ceiling_tokens=10\n");
+    let (result, adapter) = ask_scripted(
+        &engine,
+        &repo,
+        vec![
+            vec![search_call("call_1", "issue")],
+            vec![ToolCall {
+                id: "call_2".to_string(),
+                name: "mcp__tracker__create_issue".to_string(),
+                arguments_json: "{\"title\":\"Bug\"}".to_string(),
+            }],
+            Vec::new(),
+        ],
+    );
+
+    let before = offered_names(&adapter.requests[0]);
+    assert!(!before.contains(&"mcp__tracker__create_issue".to_string()));
+    for later in &adapter.requests[1..] {
+        let names = offered_names(later);
+        assert!(
+            names.contains(&"mcp__tracker__create_issue".to_string()),
+            "the matched tool is sent once matched: {names:?}"
+        );
+        assert!(
+            !names.contains(&"mcp__tracker__trigger_deploy".to_string()),
+            "an unmatched tool stays deferred: {names:?}"
+        );
+    }
+    let results = tool_results(&engine, &result);
+    assert_eq!(results[1], "tool ran", "{results:?}");
+    assert!(mcp_server_started(&servers, "tracker"));
+    fs::remove_dir_all(repo).unwrap();
+}
+
+/// A pinned tool is always sent, even over the ceiling, and only it.
+#[test]
+fn a_pinned_mcp_tool_is_always_sent() {
+    let repo = temp_dir("mcp-pinned");
+    let (engine, _servers) = mcp_engine(
+        &repo,
+        true,
+        "mcp_deferral_ceiling_tokens=10\n\
+         mcp_server.tracker.tool.list_pulls.pinned=true\n",
+    );
+    let (_result, adapter) = ask_scripted(&engine, &repo, vec![Vec::new()]);
+
+    let mcp_names: Vec<String> = offered_names(&adapter.requests[0])
+        .into_iter()
+        .filter(|name| name.starts_with("mcp__"))
+        .collect();
+    assert_eq!(mcp_names, vec!["mcp__tracker__list_pulls".to_string()]);
+    fs::remove_dir_all(repo).unwrap();
+}
+
+/// A disabled tool is absent from the offer and from search, and a model
+/// that names it anyway is told it is unavailable without anything running.
+#[test]
+fn a_disabled_mcp_tool_never_appears() {
+    let repo = temp_dir("mcp-disabled");
+    let (engine, _servers) = mcp_engine(
+        &repo,
+        true,
+        "mcp_server.tracker.tool.trigger_deploy.enabled=false\n",
+    );
+    let (result, adapter) = ask_scripted(
+        &engine,
+        &repo,
+        vec![
+            vec![search_call("call_1", "deploy")],
+            vec![ToolCall {
+                id: "call_2".to_string(),
+                name: "mcp__tracker__trigger_deploy".to_string(),
+                arguments_json: "{}".to_string(),
+            }],
+            Vec::new(),
+        ],
+    );
+
+    for request in &adapter.requests {
+        let names = offered_names(request);
+        assert!(names.contains(&"mcp__tracker__create_issue".to_string()));
+        assert!(
+            !names.contains(&"mcp__tracker__trigger_deploy".to_string()),
+            "a disabled tool is never offered: {names:?}"
+        );
+    }
+    let results = tool_results(&engine, &result);
+    let found: serde_json::Value = serde_json::from_str(&results[0]).unwrap();
+    assert_eq!(found["matches"], serde_json::json!([]), "{found}");
+    assert!(results[1].contains("not available"), "{results:?}");
+    fs::remove_dir_all(repo).unwrap();
+}
+
+/// Acceptance criterion: a session that uses no MCP tool starts no MCP server
+/// process — here a server never listed, so of unknown cost and deferred.
+#[test]
+fn a_session_that_uses_no_mcp_tool_starts_no_server() {
+    let repo = temp_dir("mcp-unused");
+    let (engine, servers) = mcp_engine(&repo, false, "");
+    let (_result, adapter) = ask_scripted(&engine, &repo, vec![Vec::new()]);
+
+    let names = offered_names(&adapter.requests[0]);
+    assert!(names.contains(&"mcp_tool_search".to_string()), "{names:?}");
+    assert!(!names.iter().any(|name| name.starts_with("mcp__")));
+    assert!(!mcp_server_started(&servers, "tracker"));
+    let data_dir = repo.join(".damaian");
+    assert!(
+        workspace_engine::ProcessRegistry::open(&data_dir)
+            .unwrap()
+            .entries()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        !workspace_engine::McpToolInventory::directory(
+            &data_dir,
+            &workspace_engine::repository_id_for_root(&repo)
+        )
+        .exists()
+    );
+    fs::remove_dir_all(repo).unwrap();
+}
+
+/// A server of unknown cost still becomes known: a search lists that server
+/// (and only it), records its inventory, and returns its matches.
+#[test]
+fn searching_lists_a_server_of_unknown_cost_and_records_it() {
+    let repo = temp_dir("mcp-unknown-search");
+    let (engine, servers) = mcp_engine(&repo, false, "");
+    let (result, _adapter) = ask_scripted(
+        &engine,
+        &repo,
+        vec![vec![search_call("call_1", "pull requests")], Vec::new()],
+    );
+
+    let results = tool_results(&engine, &result);
+    let found: serde_json::Value = serde_json::from_str(&results[0]).unwrap();
+    assert_eq!(found["matches"][0]["name"], "mcp__tracker__list_pulls");
+    assert!(mcp_server_started(&servers, "tracker"));
+    let record = workspace_engine::McpToolInventory::load_server(
+        &repo.join(".damaian"),
+        &workspace_engine::repository_id_for_root(&repo),
+        "tracker",
+    )
+    .expect("the listing is recorded");
+    assert_eq!(record.tools.len(), 3);
+    fs::remove_dir_all(repo).unwrap();
+}
+
+/// A deferred tool reached through search meets every existing check: on a
+/// server that requires approval, calling it pauses for the user rather than
+/// running.
+#[test]
+fn a_tool_reached_through_search_still_needs_its_approval() {
+    let repo = temp_dir("mcp-matched-approval");
+    let (engine, _servers) = mcp_engine(
+        &repo,
+        true,
+        "mcp_deferral_ceiling_tokens=10\n\
+         mcp_server.tracker.require_approval=true\n",
+    );
+    let (result, _adapter) = ask_scripted(
+        &engine,
+        &repo,
+        vec![
+            vec![search_call("call_1", "issue")],
+            vec![ToolCall {
+                id: "call_2".to_string(),
+                name: "mcp__tracker__create_issue".to_string(),
+                arguments_json: "{\"title\":\"Bug\"}".to_string(),
+            }],
+            Vec::new(),
+        ],
+    );
+
+    assert!(
+        result.command_proposal.is_some(),
+        "the call waits for approval: {:?}",
+        result.response
+    );
+    assert!(
+        !tool_results(&engine, &result)
+            .iter()
+            .any(|text| text == "tool ran"),
+        "nothing ran before the user decided"
+    );
+    fs::remove_dir_all(repo).unwrap();
+}

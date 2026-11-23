@@ -944,7 +944,9 @@ pub(super) fn action_awaits_plan_review(
         | ToolAction::ReadGitStatus { .. }
         | ToolAction::ReadGitDiff { .. }
         | ToolAction::ListWorktrees { .. }
-        | ToolAction::ReadGitLog { .. } => false,
+        | ToolAction::ReadGitLog { .. }
+        // A search calls no tool; the call it leads to meets the row above.
+        | ToolAction::McpToolSearch { .. } => false,
     }
 }
 

@@ -374,6 +374,25 @@ pub(super) fn tool_action_from_call(call: &ToolCall) -> Result<Option<ToolAction
                 max_count,
             }))
         }
+        MCP_TOOL_SEARCH_TOOL_NAME => {
+            let Ok(arguments) = serde_json::from_str::<serde_json::Value>(&call.arguments_json)
+            else {
+                return Ok(None);
+            };
+            let Some(query) = arguments
+                .get("query")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                return Err(ClientError::InvalidInput(
+                    "mcp_tool_search requires a non-empty query".to_string(),
+                ));
+            };
+            Ok(Some(ToolAction::McpToolSearch {
+                query: query.to_string(),
+            }))
+        }
         "inspect_web_page" | "run_web_scenario" => {
             WebDiagnosticCall::from_tool_call(&call.name, &call.arguments_json)
                 .map(|call| call.map(ToolAction::WebDiagnostic))

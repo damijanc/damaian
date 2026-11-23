@@ -88,6 +88,20 @@ pub(super) fn turn_notes_tool_definition() -> ToolDefinition {
     }
 }
 
+/// `mcp_tool_search` (spec 33 §5.1 stage 1): one small definition in place
+/// of the schemas of every deferred MCP tool. Its cost is the deferred figure
+/// §7 records.
+pub(super) fn mcp_tool_search_tool_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: MCP_TOOL_SEARCH_TOOL_NAME.to_string(),
+        description: "Search the connected MCP servers for a tool by what it does. Returns matching tool names with their server and a one-line description. A returned tool becomes callable by its name from your next step, with its full parameters.".to_string(),
+        parameters_json: "{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\",\"description\":\"What the tool should do, in a few words\"}},\"required\":[\"query\"]}".to_string(),
+    }
+}
+
+/// The name `mcp_tool_search` is offered and decoded by.
+pub(super) const MCP_TOOL_SEARCH_TOOL_NAME: &str = "mcp_tool_search";
+
 /// `propose_memory` (spec 29 §5.11). The tool can suggest, never store: the
 /// dispatch screens the candidate and at most appends a proposal, which the
 /// user confirms through a separate action. `evidence_path` selects a

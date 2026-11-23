@@ -261,6 +261,22 @@ fn engine_with_mcp(repo: &Path, tools_array: &str) -> WorkspaceEngine {
         enabled: true,
         require_approval: true,
     });
+    // Spec 33 §5.1: a server never listed is deferred, so these offer tests
+    // record its inventory first; a small one stays under the ceiling and is
+    // sent directly, which is what the mode filter is asked about.
+    let tools: Vec<crate::mcp::McpTool> =
+        serde_json::from_str::<Vec<serde_json::Value>>(tools_array)
+            .unwrap()
+            .iter()
+            .filter_map(crate::mcp::parse_mcp_tool)
+            .collect();
+    crate::mcp_inventory::McpToolInventory::record_listing(
+        &config.data_dir,
+        &crate::hash::repository_id_for_root(repo),
+        "fake",
+        &tools,
+    )
+    .unwrap();
     WorkspaceEngine::new(config)
 }
 

@@ -34,6 +34,12 @@ pub struct McpInventoryTool {
     pub description: String,
     /// Byte length of the serialized `inputSchema`.
     pub schema_bytes: usize,
+    /// The serialized `inputSchema` itself, so a tool `mcp_tool_search`
+    /// matched can be offered from the next round without connecting to its
+    /// server (spec 33 D3 as built). Empty in a record written before Task 4,
+    /// which makes the offer list the server instead.
+    #[serde(default)]
+    pub input_schema_json: String,
     /// Spec 26's estimate at the structured rate over `description` plus the
     /// serialized `inputSchema` (D7) — the measurement the context budget
     /// already trusts.
@@ -51,11 +57,22 @@ pub struct McpInventoryTool {
 }
 
 impl McpInventoryTool {
-    fn from_tool(tool: &McpTool, first_seen_at_ms: u128) -> Self {
+    /// The tool as last listed, for a definition offered from the record.
+    pub fn to_mcp_tool(&self) -> McpTool {
+        McpTool {
+            name: self.name.clone(),
+            description: self.description.clone(),
+            input_schema_json: self.input_schema_json.clone(),
+            read_only_hint: self.read_only_hint,
+        }
+    }
+
+    pub fn from_tool(tool: &McpTool, first_seen_at_ms: u128) -> Self {
         Self {
             name: tool.name.clone(),
             description: tool.description.clone(),
             schema_bytes: tool.input_schema_json.len(),
+            input_schema_json: tool.input_schema_json.clone(),
             estimated_tokens: estimate_mcp_tool_tokens(tool),
             read_only_hint: tool.read_only_hint,
             content_hash: mcp_tool_content_hash(tool),
@@ -278,6 +295,113 @@ pub fn decide_deferral(
     }
 }
 
+/// The most matches one `mcp_tool_search` call returns. Every match has its
+/// schema added from the next round (D3 as built), so this also bounds what a
+/// single search can add to the request.
+pub const MCP_TOOL_SEARCH_MAX_MATCHES: usize = 8;
+
+/// The longest one-line description a match carries, in characters.
+const MATCH_DESCRIPTION_MAX_CHARS: usize = 160;
+
+/// One `mcp_tool_search` hit (spec 33 §5.1 stage 1): enough to choose a tool,
+/// never its schema.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpToolMatch {
+    /// The `mcp__<server>__<tool>` name the model calls it by.
+    pub name: String,
+    pub server: String,
+    /// The first line or sentence of the tool's description, bounded.
+    pub description: String,
+}
+
+/// Searches `inventory` for tools of `server_ids` that `offered` accepts,
+/// matching the query's words against each tool's name, server id and
+/// description. Ranked by how many distinct query words a tool matches — a
+/// word in the tool's own name counts twice — then by server and name, so
+/// the order is stable. At most `limit` matches; none for an empty query.
+pub fn search_inventory(
+    inventory: &McpToolInventory,
+    server_ids: &[&str],
+    query: &str,
+    limit: usize,
+    mut offered: impl FnMut(&str, &McpInventoryTool) -> bool,
+) -> Vec<McpToolMatch> {
+    let terms: Vec<String> = query
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|term| !term.is_empty())
+        .map(str::to_lowercase)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    if terms.is_empty() {
+        return Vec::new();
+    }
+    let mut scored: Vec<(usize, &str, &McpInventoryTool)> = Vec::new();
+    for server_id in server_ids {
+        let Some(server) = inventory.servers.get(*server_id) else {
+            continue;
+        };
+        for tool in &server.tools {
+            if !offered(server_id, tool) {
+                continue;
+            }
+            let name = tool.name.to_lowercase().replace(['_', '-', '.'], " ");
+            let rest = format!(
+                "{} {}",
+                server_id.to_lowercase(),
+                tool.description.to_lowercase()
+            );
+            let score: usize = terms
+                .iter()
+                .map(|term| {
+                    if name.contains(term.as_str()) {
+                        2
+                    } else if rest.contains(term.as_str()) {
+                        1
+                    } else {
+                        0
+                    }
+                })
+                .sum();
+            if score > 0 {
+                scored.push((score, server_id, tool));
+            }
+        }
+    }
+    scored.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then_with(|| a.1.cmp(b.1))
+            .then_with(|| a.2.name.cmp(&b.2.name))
+    });
+    scored
+        .into_iter()
+        .take(limit)
+        .map(|(_, server_id, tool)| McpToolMatch {
+            name: crate::mcp::namespaced_tool_name(server_id, &tool.name),
+            server: server_id.to_string(),
+            description: one_line_description(&tool.description),
+        })
+        .collect()
+}
+
+/// The first line, then the first sentence of it, bounded.
+fn one_line_description(description: &str) -> String {
+    let line = description.trim().lines().next().unwrap_or_default().trim();
+    let sentence = match line.find(". ") {
+        Some(end) => &line[..=end],
+        None => line,
+    };
+    if sentence.chars().count() <= MATCH_DESCRIPTION_MAX_CHARS {
+        sentence.to_string()
+    } else {
+        let cut: String = sentence
+            .chars()
+            .take(MATCH_DESCRIPTION_MAX_CHARS - 1)
+            .collect();
+        format!("{cut}…")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -383,6 +507,7 @@ mod tests {
                     name: format!("t{index}"),
                     description: String::new(),
                     schema_bytes: 0,
+                    input_schema_json: String::new(),
                     estimated_tokens: *cost,
                     read_only_hint: None,
                     content_hash: String::new(),
@@ -435,5 +560,86 @@ mod tests {
         let one = decide_deferral(&inventory, &["a"], 8_000, |_, tool| tool.name == "t0");
         assert_eq!(one.known_tokens, 5_000);
         assert_eq!(one.known_surface, McpToolSurface::Direct);
+    }
+
+    fn described(server_id: &str, tools: &[(&str, &str)]) -> McpServerInventory {
+        McpServerInventory {
+            server_id: server_id.to_string(),
+            refreshed_at_ms: 0,
+            tools: tools
+                .iter()
+                .map(|(name, description)| {
+                    McpInventoryTool::from_tool(&tool(name, description, "{}"), 0)
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn search_matches_name_server_and_description_and_ranks_the_name_first() {
+        let mut inventory = McpToolInventory::default();
+        inventory.servers.insert(
+            "github".to_string(),
+            described(
+                "github",
+                &[
+                    ("create_issue", "Opens a new issue. Needs a title."),
+                    ("list_pulls", "Lists pull requests, including issue links."),
+                ],
+            ),
+        );
+        inventory.servers.insert(
+            "sentry".to_string(),
+            described("sentry", &[("get_event", "Reads one error event.")]),
+        );
+        let servers = ["github", "sentry"];
+
+        let by_name = search_inventory(&inventory, &servers, "Issue", 8, |_, _| true);
+        assert_eq!(
+            by_name,
+            vec![
+                McpToolMatch {
+                    name: "mcp__github__create_issue".to_string(),
+                    server: "github".to_string(),
+                    description: "Opens a new issue.".to_string(),
+                },
+                McpToolMatch {
+                    name: "mcp__github__list_pulls".to_string(),
+                    server: "github".to_string(),
+                    description: "Lists pull requests, including issue links.".to_string(),
+                },
+            ],
+            "a name hit outranks a description hit"
+        );
+        let by_server = search_inventory(&inventory, &servers, "sentry", 8, |_, _| true);
+        assert_eq!(by_server.len(), 1);
+        assert_eq!(by_server[0].name, "mcp__sentry__get_event");
+
+        assert!(search_inventory(&inventory, &servers, "  ?! ", 8, |_, _| true).is_empty());
+        assert!(search_inventory(&inventory, &servers, "deploy", 8, |_, _| true).is_empty());
+        assert_eq!(
+            search_inventory(&inventory, &servers, "issue", 1, |_, _| true).len(),
+            1,
+            "the limit bounds the result"
+        );
+        assert!(
+            search_inventory(&inventory, &servers, "issue", 8, |_, tool| tool.name
+                != "create_issue")
+            .iter()
+            .all(|hit| hit.name != "mcp__github__create_issue"),
+            "a tool the filter refuses is never a match"
+        );
+        assert!(
+            search_inventory(&inventory, &["sentry"], "issue", 8, |_, _| true).is_empty(),
+            "only the asked-for servers are searched"
+        );
+    }
+
+    #[test]
+    fn a_long_description_is_cut_to_one_bounded_line() {
+        let long = "x".repeat(400);
+        assert_eq!(one_line_description(&long).chars().count(), 160);
+        assert!(one_line_description(&long).ends_with('…'));
+        assert_eq!(one_line_description("First line\nsecond"), "First line");
     }
 }

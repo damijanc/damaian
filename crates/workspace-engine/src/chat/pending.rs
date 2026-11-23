@@ -613,7 +613,8 @@ fn compaction_identity(
         | ToolAction::CompleteStep
         | ToolAction::AskUser(_)
         | ToolAction::TurnNotes { .. }
-        | ToolAction::ProposeMemory { .. } => Some((
+        | ToolAction::ProposeMemory { .. }
+        | ToolAction::McpToolSearch { .. } => Some((
             CompactedToolKind::Command,
             ToolIdentity::endpoint(tool_action_marker(action).0.to_string()),
             None,

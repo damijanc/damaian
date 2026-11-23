@@ -261,7 +261,7 @@ impl McpClient {
 
 /// Parses one `tools/list` array item into an [`McpTool`], or `None` when the
 /// item has no `name` (the only field this repository treats as required).
-fn parse_mcp_tool(item: &Value) -> Option<McpTool> {
+pub(crate) fn parse_mcp_tool(item: &Value) -> Option<McpTool> {
     let name = item.get("name").and_then(Value::as_str)?.to_string();
     let description = item
         .get("description")
@@ -845,48 +845,76 @@ impl McpRuntime {
         Ok(self.connections.get_mut(server_id).expect("just inserted"))
     }
 
-    /// Discovers every active server's tools as ready-to-offer definitions.
-    /// Connection/list failures are logged and skipped, never fatal.
-    pub fn tool_definitions(&mut self) -> Vec<ToolDefinition> {
-        let server_ids: Vec<String> = self
-            .servers
+    /// The ids of every server this runtime may contact, in config order.
+    pub fn server_ids(&self) -> Vec<String> {
+        self.servers
             .iter()
             .map(|server| server.config.id.clone())
-            .collect();
-        let mut definitions = Vec::new();
-        for server_id in server_ids {
-            if !self.tools.contains_key(&server_id) {
-                let list_timeout = self.list_timeout;
-                match self
-                    .connection(&server_id)
-                    .and_then(|client| client.list_tools(list_timeout))
-                {
-                    Ok(tools) => {
-                        self.record(
-                            "mcp_tools_listed",
-                            &[
-                                ("server", server_id.clone()),
-                                ("toolCount", tools.len().to_string()),
-                            ],
-                        );
-                        self.refresh_inventory(&server_id, &tools);
-                        self.tools.insert(server_id.clone(), tools);
-                    }
-                    Err(error) => {
-                        self.record(
-                            "mcp_discovery_failed",
-                            &[("server", server_id.clone()), ("error", error.to_string())],
-                        );
-                        // Drop any half-open connection so a later call can retry.
-                        self.connections.remove(&server_id);
-                        self.tools.insert(server_id.clone(), Vec::new());
-                    }
+            .collect()
+    }
+
+    /// Whether `server_id` is one of this runtime's active servers.
+    pub fn has_server(&self, server_id: &str) -> bool {
+        self.server(server_id).is_some()
+    }
+
+    /// Whether `server_id` has been listed by this runtime — successfully or
+    /// not. A listed server is the only kind that has started a process.
+    pub fn is_listed(&self, server_id: &str) -> bool {
+        self.tools.contains_key(server_id)
+    }
+
+    /// Connects to and lists one server, once per runtime, and returns its
+    /// tools. This is the only place a listing happens, so it is also the only
+    /// place the inventory is refreshed (spec 33 D4): a deferred server that is
+    /// never searched, called or pinned is never contacted (§5.1, §5.3). A
+    /// connection or list failure is audited and reads as no tools, never
+    /// fatal; the failed listing is cached for the runtime's life.
+    pub fn list_server(&mut self, server_id: &str) -> &[McpTool] {
+        if !self.tools.contains_key(server_id) && self.has_server(server_id) {
+            let list_timeout = self.list_timeout;
+            match self
+                .connection(server_id)
+                .and_then(|client| client.list_tools(list_timeout))
+            {
+                Ok(tools) => {
+                    self.record(
+                        "mcp_tools_listed",
+                        &[
+                            ("server", server_id.to_string()),
+                            ("toolCount", tools.len().to_string()),
+                        ],
+                    );
+                    self.refresh_inventory(server_id, &tools);
+                    self.tools.insert(server_id.to_string(), tools);
+                }
+                Err(error) => {
+                    self.record(
+                        "mcp_discovery_failed",
+                        &[
+                            ("server", server_id.to_string()),
+                            ("error", error.to_string()),
+                        ],
+                    );
+                    // Drop any half-open connection so a later call can retry.
+                    self.connections.remove(server_id);
+                    self.tools.insert(server_id.to_string(), Vec::new());
                 }
             }
-            if let Some(tools) = self.tools.get(&server_id) {
-                for tool in tools {
-                    definitions.push(tool.to_tool_definition(&server_id));
-                }
+        }
+        self.tools.get(server_id).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    /// Discovers every active server's tools as ready-to-offer definitions,
+    /// listing each one. Connection/list failures are logged and skipped,
+    /// never fatal. The chat turn no longer uses this — it lists only the
+    /// servers its deferral surface needs — but a caller that wants the whole
+    /// set still can.
+    pub fn tool_definitions(&mut self) -> Vec<ToolDefinition> {
+        let mut definitions = Vec::new();
+        for server_id in self.server_ids() {
+            for tool in self.list_server(&server_id) {
+                definitions.push(tool.to_tool_definition(&server_id));
             }
         }
         definitions

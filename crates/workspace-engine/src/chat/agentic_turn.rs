@@ -60,7 +60,8 @@ impl ChatOrchestrator {
             ask_user_offered,
             fetch_url_offered,
             native_tools,
-        } = self.tool_offer(mode, turn_options, &mut mcp);
+            named_mcp_tools,
+        } = self.tool_offer(mode, turn_options, &session, &messages, &mut mcp);
 
         // Whatever the model has produced so far, carried across rounds so a
         // stop between them still has an answer to preserve.
@@ -242,6 +243,7 @@ impl ChatOrchestrator {
             ask_user_offered,
             fetch_url_offered,
             native_tools,
+            named_mcp_tools,
             partial_response,
             recorded_any_usage,
             web_debug_mode,
@@ -487,6 +489,7 @@ impl ChatOrchestrator {
                     }
                 }
             }
+            self.offer_named_mcp_tools(&mut st);
             let tools = if force_final {
                 None
             } else {
@@ -1126,6 +1129,7 @@ impl ChatOrchestrator {
                 // refused command leaves no stored proposal and no approval card
                 // behind. One site for every class rather than one per arm, so a
                 // new `ToolAction` variant cannot reach its arm unchecked.
+                self.prepare_mcp_call(&mut st.mcp, &tool_action);
                 let permission = precomputed_permissions[index].unwrap_or_else(|| {
                     self.action_permission(st.mode, st.repository_root, &tool_action, &st.mcp)
                 });
@@ -1475,6 +1479,7 @@ impl ChatOrchestrator {
                     }
                 } else {
                     let mut cx = CallContext {
+                        mode: st.mode,
                         repository_root: st.repository_root,
                         session: &st.session,
                         task: &st.task,

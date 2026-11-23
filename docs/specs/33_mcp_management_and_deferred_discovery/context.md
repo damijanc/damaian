@@ -2,7 +2,7 @@
 
 **Planned:** 2026-11-09. Companion to [`proposal.md`](proposal.md). The survey
 below replaces the stale line references in the proposal's §2, and the decisions
-D1–D9 are what [`tasks.md`](tasks.md) rest on.
+D1–D10 are what [`tasks.md`](tasks.md) rest on.
 
 ## Survey: what exists today
 
@@ -95,6 +95,35 @@ manages. `crates/workspace-engine/src/chat.rs` (23,166 lines) is the orchestrato
   and adds the tool's schema to the turn's tool list from that round onward.
   This is the spec's "second step", costs no extra round trip, and only
   connects the server whose tool was actually chosen.
+  **As built (Task 4, 2026-11-21):** a matched tool's schema is sent from the
+  round *after the match*, not only after the first call, so the model calls it
+  with its real parameters rather than guessing them into an approval card. To
+  keep "only the chosen server connects", the inventory (D4) now also records
+  each tool's serialized `inputSchema` (`inputSchemaJson`), and a matched tool
+  of a server not yet listed is offered from that record; the server starts
+  only when the tool is called (or when an older record has no schema, in which
+  case it is listed). Which tools were named — called, or returned by a search
+  — is read back from the turn's own messages each round, so a turn resumed
+  after an approval pause keeps them without a new pending-turn field. A search
+  connects only servers with no inventory yet (unknown cost), which is how such
+  a server becomes known; it returns at most 8 matches
+  (`MCP_TOOL_SEARCH_MAX_MATCHES`), ranked by query words found in the tool
+  name (weight 2) or in its server id or description (weight 1), and only
+  tools the turn could offer (enabled, mode and profile under the recorded
+  claim). A called tool's server is listed before the permission check, so the
+  check reads the claim the server makes now. A disabled tool is never offered
+  or matched, and a call naming one anyway is answered "not available" without
+  connecting.
+- **D10 — pinned tools count against the ceiling (decided in Task 4,
+  2026-11-21).** The ceiling bounds the whole request's MCP schema cost, so
+  `decide_deferral` keeps summing pinned tools with the rest: pinning narrows
+  what else fits under the ceiling instead of spending past it. A pinned tool
+  is always sent whatever the decision; if the pinned set alone exceeds the
+  ceiling, every unpinned tool is deferred and the pinned ones still go. The
+  alternative — excluding pinned tools from the sum — would let pinned cost
+  plus a full ceiling's worth of direct schemas into one request, which is the
+  unbounded growth requirement 2 forbids. Pinning is user/admin-only (Task 1),
+  so a repository cannot use it to crowd out the direct surface.
 - **D4 — inventory persistence (decided in Task 3, 2026-11-21).** The ceiling decision must not
   require connecting, or "a session that uses no MCP tool starts no server"
   fails. Persist a `McpToolInventory` per server — tools with `name`,
@@ -135,4 +164,6 @@ manages. `crates/workspace-engine/src/chat.rs` (23,166 lines) is the orchestrato
 
 None. D2's default, D3, D5 and D6 were confirmed by the owner as written on
 2026-11-10, and D1 was already decided. D4 (inventory persistence) was firmed up in
-Task 3 as recorded above.
+Task 3 as recorded above. Task 4 refined D3 (a match's schema is sent from
+the next round, from the inventory) and added D10 (pinned tools count against
+the ceiling); both are open to the owner's review, as recorded above.

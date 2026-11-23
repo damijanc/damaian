@@ -31,6 +31,10 @@ pub(super) struct TurnState<'a> {
     pub(super) ask_user_offered: bool,
     pub(super) fetch_url_offered: bool,
     pub(super) native_tools: Option<Vec<ToolDefinition>>,
+    /// The MCP tools the turn's messages named when `native_tools` was last
+    /// extended (spec 33 §5.1 stage 2), so a round that named nothing new
+    /// contacts no server.
+    pub(super) named_mcp_tools: BTreeSet<McpToolKey>,
     /// Whatever the model has produced so far, so a stop between rounds
     /// still has an answer to preserve.
     pub(super) partial_response: String,

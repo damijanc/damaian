@@ -6,6 +6,8 @@ use crate::session::ActionMarker;
 /// review and hook gates, so a handler sees exactly the turn state the call
 /// was admitted with.
 pub(super) struct CallContext<'a, 's> {
+    /// The mode captured at the top of the turn (spec 20 §5.4).
+    pub(super) mode: SessionMode,
     pub(super) repository_root: &'a Path,
     pub(super) session: &'a Session,
     pub(super) task: &'a Task,
@@ -154,6 +156,11 @@ impl ChatOrchestrator {
                     arguments_json,
                     action_marker,
                 );
+            }
+            ToolAction::McpToolSearch { query } => {
+                let (content, outcome) =
+                    self.search_mcp_tools(cx.mode, &cx.session.repository_id, cx.mcp, &query);
+                ("Searched the MCP tools.".to_string(), content, outcome)
             }
             ToolAction::TurnNotes { text, replace } => self.handle_turn_notes(cx, text, replace)?,
             ToolAction::ProposeMemory {
@@ -944,6 +951,21 @@ impl ChatOrchestrator {
         action_marker: ActionMarker,
     ) -> Result<CallFlow> {
         let result = {
+            // Spec 33 §5.2: a disabled tool is absent from the offer. A model
+            // that names one anyway is told so; nothing is connected or sent.
+            if !self.mcp_tool_callable(&server_id, &tool_name) {
+                return Ok(ControlFlow::Continue((
+                    action_marker,
+                    (
+                        mcp_call_summary(&server_id, &tool_name),
+                        format!(
+                            "The MCP tool `{tool_name}` on server `{server_id}` is not available \
+                             in this session."
+                        ),
+                        ActionOutcome::Failed,
+                    ),
+                )));
+            }
             // MCP tools reach an external service and can have side
             // effects, so unless the server is marked no-approval we
             // pause the turn exactly like a command needing approval:

@@ -141,7 +141,8 @@ impl ChatOrchestrator {
                     self.build_mcp_runtime(&pending.session.id, &pending.session.repository_id);
                 // A fresh runtime has fetched no tool lists, and the read-only
                 // hint lives in them; without this every hint reads as `None`.
-                mcp.tool_definitions();
+                // Only the called tool's server is listed (spec 33 §5.1).
+                mcp.list_server(&mcp_call.server_id);
                 let permission = permits(
                     mode,
                     &capabilities,
