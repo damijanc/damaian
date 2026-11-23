@@ -763,6 +763,15 @@ the one restart it stays down until the entry expires or Damaian restarts.
   command from Terminal with the repository as the working directory. Damaian's
   spawn sends the server's stderr to `/dev/null`, so the app keeps no server
   log; run the command yourself to see its errors.
+- **The command exists but exits at once.** Two common causes, both covered
+  in the [user guide](USER_GUIDE.md#language-servers):
+  `~/.cargo/bin/rust-analyzer` is rustup's launcher and prints
+  `Unknown binary 'rust-analyzer'` until `rustup component add rust-analyzer`
+  has run; and a server installed with npm under nvm (or another Node version
+  manager) starts with `#!/usr/bin/env node`, which finds no `node` in an app
+  opened from the Dock. Running the command from Terminal hides the second
+  one, because Terminal has the version manager's `PATH`; try
+  `env -i /absolute/path/to/server --stdio` to see what the app sees.
 - **The key has no effect.** It must be in user config, not
   `.damaian/config.conf`: a repository's value is ignored and audited as
   `repository_config_key_rejected`. A typo in the language name, or an empty

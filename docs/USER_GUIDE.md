@@ -157,6 +157,35 @@ language_server.typescript=/absolute/path/to/typescript-language-server --stdio
 
 The key accepts the languages Damaian indexes: `rust`, `typescript`, `javascript`, `python`, `go`, `java`, `kotlin` and `php`. Any other language, or an empty command, is a configuration error naming the key. The value is a command line, split the way an MCP server's command is. An app opened from Finder or the Dock may not see your shell's `PATH`, so use an absolute path: a bare name that works in Terminal can fail in the app.
 
+Damaian does not ship or install a language server. For each language you want:
+
+1. Install a server for it.
+2. Find its absolute path with `command -v <name>` in Terminal.
+3. Add the line to your user config.
+4. Check **Settings › General › Language servers** after a symbol search: it should show `ready` with a PID.
+
+These are common choices. The paths assume Homebrew on Apple silicon (`/opt/homebrew/bin`); use whatever `command -v` prints on your Mac.
+
+| Language | Install | User config line |
+|---|---|---|
+| Rust | `rustup component add rust-analyzer` | `language_server.rust=/Users/you/.cargo/bin/rust-analyzer` |
+| TypeScript | `brew install typescript-language-server` | `language_server.typescript=/opt/homebrew/bin/typescript-language-server --stdio` |
+| JavaScript | the TypeScript server above | `language_server.javascript=/opt/homebrew/bin/typescript-language-server --stdio` |
+| Python | `brew install pyright` | `language_server.python=/opt/homebrew/bin/pyright-langserver --stdio` |
+| Go | `brew install gopls` | `language_server.go=/opt/homebrew/bin/gopls` |
+| PHP | `brew install phpactor` | `language_server.php=/opt/homebrew/bin/phpactor language-server` |
+| Java | `brew install jdtls` | `language_server.java=/opt/homebrew/bin/jdtls` |
+| Kotlin | `brew install kotlin-language-server` | `language_server.kotlin=/opt/homebrew/bin/kotlin-language-server` |
+
+Configure only the languages you use. An unused entry costs nothing until a search needs it, but a configured server that is not installed shows as `unavailable`.
+
+Two setups look installed but fail inside the app:
+
+- **Rust through rustup.** `~/.cargo/bin/rust-analyzer` exists on most Rust machines, but it is only rustup's launcher until `rustup component add rust-analyzer` has run. Before that, `rust-analyzer --version` prints `Unknown binary 'rust-analyzer'`.
+- **A server installed with npm under nvm or another Node version manager.** Its script starts with `#!/usr/bin/env node`, and an app opened from the Dock does not see the version manager's `node`, so the server cannot start even from an absolute path. Install it with Homebrew instead, or point the key at an absolute `node` with the server script after it, for example `language_server.typescript=/Users/you/.nvm/versions/node/v24.0.0/bin/node /Users/you/.nvm/versions/node/v24.0.0/bin/typescript-language-server --stdio`. That line breaks when you switch Node versions.
+
+Some servers also need a runtime of their own; recent `jdtls` releases, for example, need Java 21 or newer. When a server shows `unavailable`, run its configured command in Terminal to see its own error ([Troubleshooting](TROUBLESHOOTING.md#symbol-search-shows-only-likely-results-or-a-language-server-will-not-start)).
+
 **A repository cannot set this key.** It names a program Damaian starts, so it has the same power as `shell`. A `language_server.<language>` line in `.damaian/config.conf` is ignored and recorded in the audit log as a rejected repository key; your own value stands. A permission profile cannot carry it either.
 
 **What is sent.** The server is a local program you named, started with the repository root as its working directory. Damaian sends it the content of files it indexes (`textDocument/didOpen`), the `documentSymbol`, `references`, `implementation` and `definition` requests, and the lifecycle messages. It sends no prompts, model traffic or credentials; the server reads the same repository from disk anyway. Everything coming back — symbol names, locations and diagnostic text — is secret-scanned before Damaian stores or shows it, and a restricted file is never sent to a server.
