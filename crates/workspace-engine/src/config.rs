@@ -1,4 +1,5 @@
 use crate::clarification::MAX_QUESTIONS_PER_TURN_CEILING;
+use crate::command_parse::{ShellParameter, ShellParameters};
 use crate::command_policy::{contains_shell_control, destructive_pattern, normalize_lexically};
 use crate::command_rules::{
     CommandRule, RuleContext, RuleEffect, RuleEvaluation, RuleSource, evaluate_command,
@@ -678,6 +679,12 @@ pub struct Config {
     /// contribute `ask` and `deny` only; their `allow` is refused at load.
     /// Not yet consulted by the command policy (spec 111 Task 4).
     pub command_rules: Vec<CommandRule>,
+    /// `command_shell_parameters` (spec 111 D11): which of `$0`, `$_` and
+    /// `$IFS` the command rules may analyse, beyond the default set. Set by
+    /// user or admin config; a repository or profile may only remove
+    /// entries. Read by the command rules only, never by the spec 64
+    /// read-only boundary.
+    pub command_shell_parameters: Vec<ShellParameter>,
 }
 
 /// The languages `language_server.<language>` accepts: the names
@@ -1599,6 +1606,7 @@ impl Config {
             project_checks_by_repository,
             language_servers,
             command_rules,
+            command_shell_parameters,
         } = overlay;
 
         let mut outcome = OverlayOutcome::default();
@@ -1713,6 +1721,30 @@ impl Config {
         }
         if !taken.is_empty() {
             outcome.record(scope, "command_rule", Some(taken), false);
+        }
+        // Spec 111 D11: admitting `$0`, `$_` or `$IFS` lets a rule cover a
+        // command that would otherwise always ask, so only the user or an
+        // admin may add one; a repository or profile may only remove.
+        if let Some(value) = command_shell_parameters
+            && let Some((entries, loosened)) = restrict_only_subset(
+                &mut self.command_shell_parameters,
+                value,
+                "command_shell_parameters",
+                trusted,
+                rejected,
+            )
+        {
+            outcome.record(
+                scope,
+                "command_shell_parameters",
+                Some(
+                    entries
+                        .iter()
+                        .map(|parameter| parameter.as_str().to_string())
+                        .collect(),
+                ),
+                loosened,
+            );
         }
         for provider in model_providers {
             let key = format!("model_provider.{}", provider.id);
@@ -3420,7 +3452,14 @@ impl Config {
                 Some(ConfigScope::Admin) if !from_always_allow => RuleSource::Admin,
                 _ => RuleSource::User,
             };
-            match legacy_allow_rule(entry, &root, home, &self.command_blocklist, source) {
+            match legacy_allow_rule(
+                entry,
+                &root,
+                home,
+                &self.command_blocklist,
+                self.shell_parameters(),
+                source,
+            ) {
                 Ok(rule) => legacy.rules.push(rule),
                 Err(reason) => legacy.unmigrated.push(UnmigratedCommandEntry {
                     key,
@@ -3572,6 +3611,12 @@ impl Config {
             .insert(repository_id, entries);
         overlay.save(&path)?;
         Ok(path)
+    }
+
+    /// The opt-in shell parameters the command rules analyse (spec 111
+    /// D11).
+    pub fn shell_parameters(&self) -> ShellParameters {
+        ShellParameters::from_list(&self.command_shell_parameters)
     }
 
     /// The resolved values spec 31's refusal points consult.
@@ -3740,6 +3785,11 @@ impl Config {
             &self.allow_file_edits.to_string(),
         );
         push_line(&mut output, "command_access", self.command_access.as_str());
+        push_line(
+            &mut output,
+            "command_shell_parameters",
+            &join_shell_parameters(&self.command_shell_parameters),
+        );
         push_line(
             &mut output,
             "allow_browser_diagnostics",
@@ -4120,6 +4170,7 @@ impl Default for Config {
             // heuristic tier stands alone (proposal §5.4).
             language_servers: BTreeMap::new(),
             command_rules: Vec::new(),
+            command_shell_parameters: Vec::new(),
         }
     }
 }
@@ -4261,6 +4312,8 @@ pub struct ConfigOverlay {
     /// `command_rule` lines, repeatable, in file order (spec 111 D1). Parsed
     /// as the user's; the merge sets each rule's source from its scope.
     pub command_rules: Vec<CommandRule>,
+    /// `command_shell_parameters` (spec 111 D11).
+    pub command_shell_parameters: Option<Vec<ShellParameter>>,
 }
 
 /// Which commands a permission profile lets run at all, narrowest first, so
@@ -4495,6 +4548,9 @@ classify_overlay_fields! {
     // Spec 111 D2: a rule decides whether a command runs. A repository or
     // profile may add `ask` and `deny` rules only; its `allow` is refused.
     command_rules => Capability,
+    // Spec 111 D11: each entry lets a rule cover a command that otherwise
+    // always asks. A repository or profile may only remove entries.
+    command_shell_parameters => Capability,
 }
 
 impl ConfigOverlay {
@@ -4742,6 +4798,9 @@ impl ConfigOverlay {
                 CommandRule::parse(value, RuleSource::User)
                     .map_err(|error| ClientError::InvalidInput(format!("command_rule: {error}")))?,
             ),
+            "command_shell_parameters" => {
+                self.command_shell_parameters = Some(parse_shell_parameters(key, value)?)
+            }
             "secret_patterns" => self.secret_patterns = Some(split_list(value)),
             "require_approval_for_file_edits" => {
                 self.require_approval_for_file_edits = Some(parse_bool(key, value)?)
@@ -5405,6 +5464,7 @@ impl ConfigOverlay {
             project_checks_by_repository,
             language_servers,
             command_rules,
+            command_shell_parameters,
         } = self;
         let mut output = String::new();
         if let Some(value) = data_dir {
@@ -5811,6 +5871,13 @@ impl ConfigOverlay {
         }
         for rule in command_rules {
             push_line(&mut output, "command_rule", &rule.text());
+        }
+        if let Some(value) = command_shell_parameters {
+            push_line(
+                &mut output,
+                "command_shell_parameters",
+                &join_shell_parameters(value),
+            );
         }
         output
     }
@@ -6827,6 +6894,7 @@ fn legacy_allow_rule(
     root: &Path,
     home: Option<&Path>,
     blocklist: &[String],
+    shell_parameters: ShellParameters,
     source: RuleSource,
 ) -> std::result::Result<CommandRule, String> {
     // `cd <sub-root> && <command>` is how a grant for one project root is
@@ -6889,6 +6957,7 @@ fn legacy_allow_rule(
             repository_root: root,
             working_directory: &directory,
             home,
+            shell_parameters,
         },
     ) {
         RuleEvaluation::Unanalysable { reason } => Err(format!("the command {reason}")),
@@ -6918,6 +6987,73 @@ fn split_web_domains(value: &str) -> Vec<String> {
 
 fn split_paths(value: &str) -> Vec<PathBuf> {
     split_list(value).into_iter().map(PathBuf::from).collect()
+}
+
+/// `command_shell_parameters`: any of `$0`, `$_` and `$IFS`, separated by
+/// spaces, commas or `|`. Empty admits none.
+fn parse_shell_parameters(key: &str, value: &str) -> Result<Vec<ShellParameter>> {
+    let mut parameters = Vec::new();
+    for entry in value
+        .split(|character: char| character.is_whitespace() || matches!(character, ',' | '|'))
+        .filter(|entry| !entry.is_empty())
+    {
+        let parameter = ShellParameter::parse(entry).ok_or_else(|| {
+            ClientError::InvalidInput(format!(
+                "{key} accepts only $0, $_ and $IFS (not `{entry}`)"
+            ))
+        })?;
+        if !parameters.contains(&parameter) {
+            parameters.push(parameter);
+        }
+    }
+    parameters.sort();
+    Ok(parameters)
+}
+
+fn join_shell_parameters(parameters: &[ShellParameter]) -> String {
+    parameters
+        .iter()
+        .map(|parameter| parameter.as_str())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// A set where each entry admits more (spec 111 D11's
+/// `command_shell_parameters`). A trusted scope replaces it; an untrusted one
+/// may only remove entries, so what it holds is the intersection, and an
+/// entry it names that is not already there is refused and recorded.
+///
+/// Returns the entries this scope now holds in force, and whether a trusted
+/// scope added an entry, the move an untrusted one is refused.
+fn restrict_only_subset<T: Copy + PartialEq>(
+    current: &mut Vec<T>,
+    incoming: Vec<T>,
+    key: &str,
+    trusted: bool,
+    rejected: &mut Vec<RejectedConfigKey>,
+) -> Option<(Vec<T>, bool)> {
+    if trusted {
+        let loosens = incoming.iter().any(|entry| !current.contains(entry));
+        *current = incoming.clone();
+        return Some((incoming, loosens));
+    }
+    if incoming.iter().any(|entry| !current.contains(entry)) {
+        rejected.push(RejectedConfigKey::new(
+            key,
+            RepositoryKeyClass::RestrictOnly,
+        ));
+    }
+    let narrowed: Vec<T> = current
+        .iter()
+        .copied()
+        .filter(|entry| incoming.contains(entry))
+        .collect();
+    if narrowed == *current {
+        // Nothing removed: this scope changed nothing it may change.
+        return None;
+    }
+    *current = narrowed.clone();
+    Some((narrowed, false))
 }
 
 fn join_list(values: &[String]) -> String {

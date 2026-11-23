@@ -301,6 +301,37 @@ const DESTRUCTIVE_COMMANDS: &[&str] = &[
     "/sbin/reboot",
 ];
 
+/// Shell special parameters (spec 111 D11 and its 2026-11-21 refinement):
+/// the default set as argument words, in each placement and quoting, the
+/// empty-capable ones inside a word, the opt-in ones (off here), and the
+/// same text quoted.
+const SHELL_PARAMETER_COMMANDS: &[&str] = &[
+    "echo $?",
+    "ls; echo $?",
+    "cargo test; echo \"exit $?\"",
+    "git status && echo $#",
+    "echo $$ $! $- $@ $* $1 $9",
+    "echo \"$@\"",
+    "echo ${1} \"${#}\"",
+    "echo run-$$",
+    "rm -rf /tmp/$$",
+    "rm -rf /tmp/run-$$",
+    "rm -rf /tmp/'$$'",
+    "rm -rf \"$1\"",
+    "rm -rf /tmp/$1",
+    "rm -rf /tmp/$!",
+    "rm -rf target/$1",
+    "ls crates/$1",
+    "$1",
+    "cd $1 && ls",
+    "ls > $1",
+    "echo $0",
+    "echo $_",
+    "echo $IFS",
+    "echo ${1:-x}",
+    "echo $((1 + 1))",
+];
+
 /// The legacy-key scenario's user config: entries from the existing tests
 /// (`foundation.rs`, `plan_turn.rs`, `permission_profiles.rs`, …) and the
 /// shapes the migration has to handle.
@@ -328,6 +359,8 @@ const USER_ALLOWLIST: &[&str] = &[
     "git push --dry-run",
     "curl https://example.com",
     "grep 'a;b' notes.md",
+    // D11: a default parameter as a whole argument is sayable as a rule.
+    "echo \"$@\"",
 ];
 const USER_BLOCKLIST: &[&str] = &["docker", "git push", "rm -rf /", "npm publish"];
 /// Always allow grants for this repository, one of them for a sub-root.
@@ -373,6 +406,9 @@ const LEGACY_KEY_COMMANDS: &[&str] = &[
     "sudo git push",
     "echo hi && git push",
     "git push $REMOTE",
+    "git push \"$1\"",
+    "echo \"$@\"",
+    "echo $@",
     "curl https://example.com",
     "curl -s https://example.com",
     "cargo publish",
@@ -590,6 +626,24 @@ const KNOWN_DIFFERENCES: &[Known] = &[
         commands: &["git push $REMOTE"],
     },
     Known {
+        why: "spec 111 D11 (2026-11-21): a parameter that may expand to nothing inside a path \
+              is unanalysable, so it asks; the old text pattern blocked these through the \
+              `rm -rf /` prefix. Open for Task 4, with `git push $REMOTE`",
+        old: Old::Blocked,
+        new: RuleVerdict::Ask,
+        places: EVERYWHERE,
+        commands: &["rm -rf /tmp/$1", "rm -rf /tmp/$!"],
+    },
+    Known {
+        why: "D11: a parameter is matched as written, quotes aside, so the migrated `echo \"$@\"` \
+              covers `echo $@` too; both expand to nothing here, and the read-only boundary \
+              already ran it unasked",
+        old: Old::Undecided { asks: false },
+        new: RuleVerdict::Allow,
+        places: &[LEGACY_ROOT],
+        commands: &["echo $@"],
+    },
+    Known {
         why: "an allowlist entry no rule can say exactly is not migrated (`$HOME` cannot be \
               analysed; `*` would be a wildcard), so it asks; the deprecation note names it",
         old: Old::Allowed,
@@ -747,6 +801,7 @@ fn differences(
         .cloned()
         .chain(config.command_rules.iter().cloned())
         .collect();
+    let shell_parameters = config.shell_parameters();
     let policy = CommandPolicy::new_with_report(config, &report);
     let mut found = Vec::new();
     for &relative in directories {
@@ -760,6 +815,7 @@ fn differences(
                     repository_root: &repository.root,
                     working_directory: &directory,
                     home: Some(home),
+                    shell_parameters,
                 },
             )
             .verdict();
@@ -792,6 +848,7 @@ fn the_old_keys_and_the_migrated_rules_decide_the_same() {
     let root = repository.root.clone();
     let mut corpus = with_root(POLICY_TEST_COMMANDS, &root);
     corpus.extend(with_root(DESTRUCTIVE_COMMANDS, &root));
+    corpus.extend(with_root(SHELL_PARAMETER_COMMANDS, &root));
     corpus.extend(recorded_commands(&root));
     let mut legacy_commands = corpus.clone();
     legacy_commands.extend(with_root(LEGACY_KEY_COMMANDS, &root));

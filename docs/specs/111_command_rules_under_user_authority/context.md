@@ -238,3 +238,20 @@
     therefore admitted as read-only. The equivalence corpus of Task 3 gains
     cases for these forms. Task 3b lands it before Task 4 switches the live
     policy.
+  - *Refined by the owner, 2026-11-21, before Task 3b's code:*
+    - **A parameter that can expand to nothing stands only as a whole word.**
+      In the one-line command Damaian runs, `$1`–`$9`, `$@` and `$*` are
+      empty, and `$!` is empty when no job runs in the background. Inside a
+      word they hide a shorter path: `rm -rf /tmp/$1` is checked as `/tmp/$1`
+      but runs as `rm -rf /tmp/`. These, and the opt-in `$0`, `$_` and
+      `$IFS`, are accepted only as a whole argument (`rm "$1"`, `echo $@`).
+      Inside a word or a path the command is unanalysable. Only `$?`, `$#`,
+      `$$` (always non-empty digits) and `$-` may stand inside a word
+      (`/tmp/run-$$`).
+    - **A real parameter stays distinct from the same text quoted.** `rm -rf
+      /tmp/'$$'` names a file literally called `$$`, and `rm -rf /tmp/$$`
+      names the process id. The parsed word marks an expanding parameter, so
+      the two never match the same rule or the same session approval.
+    - **The opt-in applies to the command rules only.** The spec 64 read-only
+      boundary keeps the default set. Plan mode's version of that check cannot
+      read `command_shell_parameters`, and the two checks must decide alike.

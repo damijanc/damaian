@@ -1,3 +1,4 @@
+use crate::command_parse::{PARAMETER_MARK, ShellParameters};
 use crate::config::{CommandAccess, Config, ConfigScope, RepositoryConfigReport};
 use crate::error::Result;
 use crate::path_policy::PathPolicy;
@@ -1030,6 +1031,87 @@ pub(crate) struct ShellLine {
     /// `~` followed by `/` or nothing, which the shell replaces with the home
     /// directory. A quoted `'~/x'` is a literal name and is not listed.
     pub(crate) home_tilde: Vec<(usize, usize)>,
+    /// `(command, word)` indexes of the words that hold an admitted shell
+    /// parameter (spec 111 D11). For the command rules ([`chain_line`]) each
+    /// such parameter is also preceded by [`PARAMETER_MARK`] in the word.
+    pub(crate) parameter_words: Vec<(usize, usize)>,
+}
+
+/// What `$` starts, read without consuming it (spec 111 D11).
+enum Dollar {
+    /// An admitted parameter: its text as written (`$?`, `${1}`, `$IFS`),
+    /// and whether it may expand to nothing, which admits it only as a
+    /// whole word.
+    Parameter { text: String, whole_word_only: bool },
+    /// `$NAME`, `${NAME}`, `${…:-…}`, `$((…))`, `$(…)`, a parameter the user
+    /// has not turned on, or a `$` with nothing usable after it.
+    Unanalysable,
+}
+
+/// Reads the parameter after a `$` from `rest` (the characters after it).
+/// `$?`, `$#`, `$$` and `$-` always expand to something, so they may stand
+/// inside a word; `$!`, `$@`, `$*`, `$1`–`$9` and the opt-in `$0`, `$_` and
+/// `$IFS` may be empty (or, for `$IFS`, resplit the line), so only a whole
+/// word may be one of them.
+fn read_dollar(rest: &std::iter::Peekable<std::str::Chars>, opt_in: ShellParameters) -> Dollar {
+    let mut ahead = rest.clone();
+    let classify = |name: &str| -> Option<bool> {
+        match name {
+            "?" | "#" | "$" | "-" => Some(false),
+            "!" | "@" | "*" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" => Some(true),
+            _ => opt_in.admitted_name(name).map(|_| true),
+        }
+    };
+    match ahead.next() {
+        Some('{') => {
+            let mut name = String::new();
+            for character in ahead.by_ref() {
+                if character == '}' {
+                    return match classify(&name) {
+                        Some(whole_word_only) => Dollar::Parameter {
+                            text: format!("${{{name}}}"),
+                            whole_word_only,
+                        },
+                        None => Dollar::Unanalysable,
+                    };
+                }
+                name.push(character);
+            }
+            Dollar::Unanalysable
+        }
+        Some(first) if first == '_' || first.is_ascii_alphabetic() => {
+            // A name runs as far as name characters go: `$IFSX` is `IFSX`.
+            let mut name = first.to_string();
+            while let Some(next) =
+                ahead.next_if(|next| *next == '_' || next.is_ascii_alphanumeric())
+            {
+                name.push(next);
+            }
+            match classify(&name) {
+                Some(whole_word_only) => Dollar::Parameter {
+                    text: format!("${name}"),
+                    whole_word_only,
+                },
+                None => Dollar::Unanalysable,
+            }
+        }
+        Some(single) => match classify(&single.to_string()) {
+            Some(whole_word_only) => Dollar::Parameter {
+                text: format!("${single}"),
+                whole_word_only,
+            },
+            None => Dollar::Unanalysable,
+        },
+        None => Dollar::Unanalysable,
+    }
+}
+
+/// The admitted parameters in the word being read (spec 111 D11).
+#[derive(Default)]
+struct WordParameters {
+    count: usize,
+    /// The marked text of each parameter that may expand to nothing.
+    whole_word_only: Vec<String>,
 }
 
 /// Splits `command` into simple commands and words the way a POSIX shell or
@@ -1040,28 +1122,37 @@ pub(crate) struct ShellLine {
 /// any other redirect), which is a parsing gap and so must ask rather than run
 /// (spec 64 §5.1).
 fn shell_line(command: &str) -> Option<ShellLine> {
-    scan_shell_line(command, false)
+    // The read-only boundary admits only D11's default set: Plan mode's
+    // check (`is_low_risk_read_only`) cannot read `command_shell_parameters`,
+    // and the two must decide alike.
+    scan_shell_line(command, false, ShellParameters::default())
 }
 
 /// The same tokenizer for the command rules (spec 111 D3), which also split
-/// chains at `||`. Everything else it refuses stays refused, so a here-doc,
-/// a backslash or an unmodelled redirect is still `None`: cannot analyse.
-pub(crate) fn chain_line(command: &str) -> Option<ShellLine> {
-    scan_shell_line(command, true)
+/// chains at `||`, admit the opt-in shell parameters the user turned on, and
+/// mark each admitted parameter in its word (D11). Everything else it
+/// refuses stays refused, so a here-doc, a backslash or an unmodelled
+/// redirect is still `None`: cannot analyse.
+pub(crate) fn chain_line(command: &str, opt_in: ShellParameters) -> Option<ShellLine> {
+    scan_shell_line(command, true, opt_in)
 }
 
-fn scan_shell_line(command: &str, admit_or: bool) -> Option<ShellLine> {
+fn scan_shell_line(command: &str, rules: bool, opt_in: ShellParameters) -> Option<ShellLine> {
+    let admit_or = rules;
+    let mark = rules;
     let mut commands = Vec::new();
     let mut operators = Vec::new();
-    let mut words = Vec::new();
+    let mut words: Vec<String> = Vec::new();
     let mut expansion = None;
     let mut unanalysable = None;
     let mut home_tilde = Vec::new();
+    let mut parameter_words = Vec::new();
     let mut current = String::new();
     let mut in_word = false;
     // Whether the word in progress has a quoted part: `'2'>x` is a word
     // followed by a redirect, not a redirect of descriptor 2.
     let mut word_quoted = false;
+    let mut word_parameters = WordParameters::default();
     // The previous unquoted character, for the positions where `~` expands.
     let mut previous: Option<char> = None;
     let mut characters = command.chars().peekable();
@@ -1071,11 +1162,57 @@ fn scan_shell_line(command: &str, admit_or: bool) -> Option<ShellLine> {
         expansion.get_or_insert(found);
         unanalysable.get_or_insert(found);
     };
+    // Ends the word in progress. A word holding a parameter is checked for
+    // D11's placement: never the program word, never `cd`'s directory, and
+    // a parameter that may expand to nothing only as the whole word.
+    let finish_word = |current: &mut String,
+                       words: &mut Vec<String>,
+                       word_parameters: &mut WordParameters,
+                       commands_len: usize,
+                       parameter_words: &mut Vec<(usize, usize)>,
+                       expansion: &mut Option<&'static str>,
+                       unanalysable: &mut Option<&'static str>| {
+        let parameters = std::mem::take(word_parameters);
+        if parameters.count > 0 {
+            if words.is_empty() {
+                note("a shell parameter as the program", expansion, unanalysable);
+            } else if words[0] == "cd" {
+                note(
+                    "a shell parameter as `cd`'s directory",
+                    expansion,
+                    unanalysable,
+                );
+            }
+            let whole = match parameters.whole_word_only.as_slice() {
+                [] => true,
+                [only] => parameters.count == 1 && current == only,
+                _ => false,
+            };
+            if !whole {
+                note(
+                    "`$!`, `$@`, `$*`, `$0`–`$9`, `$_` or `$IFS` inside a word, where it may \
+                     expand to nothing",
+                    expansion,
+                    unanalysable,
+                );
+            }
+            parameter_words.push((commands_len, words.len()));
+        }
+        words.push(std::mem::take(current));
+    };
     while let Some(character) = characters.next() {
         match character {
             ' ' | '\t' => {
                 if in_word {
-                    words.push(std::mem::take(&mut current));
+                    finish_word(
+                        &mut current,
+                        &mut words,
+                        &mut word_parameters,
+                        commands.len(),
+                        &mut parameter_words,
+                        &mut expansion,
+                        &mut unanalysable,
+                    );
                     in_word = false;
                     word_quoted = false;
                 }
@@ -1084,7 +1221,15 @@ fn scan_shell_line(command: &str, admit_or: bool) -> Option<ShellLine> {
             }
             ';' | '\n' => {
                 if in_word {
-                    words.push(std::mem::take(&mut current));
+                    finish_word(
+                        &mut current,
+                        &mut words,
+                        &mut word_parameters,
+                        commands.len(),
+                        &mut parameter_words,
+                        &mut expansion,
+                        &mut unanalysable,
+                    );
                     in_word = false;
                     word_quoted = false;
                 }
@@ -1149,7 +1294,15 @@ fn scan_shell_line(command: &str, admit_or: bool) -> Option<ShellLine> {
                     _ => return None,
                 };
                 if in_word {
-                    words.push(std::mem::take(&mut current));
+                    finish_word(
+                        &mut current,
+                        &mut words,
+                        &mut word_parameters,
+                        commands.len(),
+                        &mut parameter_words,
+                        &mut expansion,
+                        &mut unanalysable,
+                    );
                     in_word = false;
                     word_quoted = false;
                 }
@@ -1174,13 +1327,39 @@ fn scan_shell_line(command: &str, admit_or: bool) -> Option<ShellLine> {
                 loop {
                     match characters.next()? {
                         '"' => break,
-                        '$' | '`' => {
+                        '$' => match read_dollar(&characters, opt_in) {
+                            Dollar::Parameter {
+                                text,
+                                whole_word_only,
+                            } => {
+                                // The text after `$` has been read; skip it.
+                                for _ in 1..text.chars().count() {
+                                    characters.next();
+                                }
+                                push_parameter(
+                                    &mut current,
+                                    &mut word_parameters,
+                                    &text,
+                                    whole_word_only,
+                                    mark,
+                                );
+                            }
+                            Dollar::Unanalysable => {
+                                note(
+                                    "`$` or a backtick inside double quotes",
+                                    &mut expansion,
+                                    &mut unanalysable,
+                                );
+                                current.push('$');
+                            }
+                        },
+                        '`' => {
                             note(
                                 "`$` or a backtick inside double quotes",
                                 &mut expansion,
                                 &mut unanalysable,
                             );
-                            current.push('$');
+                            current.push('`');
                         }
                         '\\' => return None,
                         quoted => current.push(quoted),
@@ -1193,7 +1372,28 @@ fn scan_shell_line(command: &str, admit_or: bool) -> Option<ShellLine> {
             }
             '\\' | '<' | '\r' => return None,
             control if control.is_control() => return None,
-            '$' => note("`$`", &mut expansion, &mut unanalysable),
+            PARAMETER_MARK => note("a reserved character", &mut expansion, &mut unanalysable),
+            '$' => match read_dollar(&characters, opt_in) {
+                Dollar::Parameter {
+                    text,
+                    whole_word_only,
+                } => {
+                    for _ in 1..text.chars().count() {
+                        characters.next();
+                    }
+                    push_parameter(
+                        &mut current,
+                        &mut word_parameters,
+                        &text,
+                        whole_word_only,
+                        mark,
+                    );
+                    in_word = true;
+                    previous = text.chars().last();
+                    continue;
+                }
+                Dollar::Unanalysable => note("`$`", &mut expansion, &mut unanalysable),
+            },
             '`' => note("a backtick", &mut expansion, &mut unanalysable),
             '*' | '?' | '[' | '{' | '(' | ')' => {
                 note(
@@ -1236,7 +1436,15 @@ fn scan_shell_line(command: &str, admit_or: bool) -> Option<ShellLine> {
         previous = Some(character);
     }
     if in_word {
-        words.push(current);
+        finish_word(
+            &mut current,
+            &mut words,
+            &mut word_parameters,
+            commands.len(),
+            &mut parameter_words,
+            &mut expansion,
+            &mut unanalysable,
+        );
     }
     commands.push(words);
     // A trailing `;` or newline ends the line; it does not start an empty
@@ -1251,7 +1459,30 @@ fn scan_shell_line(command: &str, admit_or: bool) -> Option<ShellLine> {
         expansion,
         unanalysable,
         home_tilde,
+        parameter_words,
     })
+}
+
+/// Appends an admitted parameter to the word in progress: marked for the
+/// command rules, so it never equals the same text quoted (D11).
+fn push_parameter(
+    current: &mut String,
+    word_parameters: &mut WordParameters,
+    text: &str,
+    whole_word_only: bool,
+    mark: bool,
+) {
+    let start = current.len();
+    if mark {
+        current.push(PARAMETER_MARK);
+    }
+    current.push_str(text);
+    word_parameters.count += 1;
+    if whole_word_only {
+        word_parameters
+            .whole_word_only
+            .push(current[start..].to_string());
+    }
 }
 
 const READ_ONLY_GIT_SUBCOMMANDS: [&str; 4] = ["status", "diff", "log", "show"];
@@ -2404,6 +2635,51 @@ mod tests {
             assert_needs_approval(&repo.classify("git log --format=`id`"));
         }
 
+        /// Spec 111 D11: the shared tokenizer admits the default shell
+        /// parameters as argument words, so a read-only line that prints an
+        /// exit status is read-only.
+        #[test]
+        fn default_shell_parameters_are_admitted_as_read_only_arguments() {
+            let repo = Repository::new("parameters");
+            for command in [
+                "ls; echo $?",
+                "echo $?",
+                "echo \"exit $?\"",
+                "git status && echo \"$#\" ${1}",
+                "ls crates | head -n 5; echo $?",
+            ] {
+                let classification = repo.classify(command);
+                assert!(
+                    runs_unasked(&classification),
+                    "{command}: {:?}",
+                    classification.reasons
+                );
+                assert!(classification.is_read_only_without_approval(), "{command}");
+            }
+            for command in [
+                // Program word, `cd`'s directory, inside a path.
+                "ls && $1",
+                "cd $1 && ls",
+                "ls crates/$1",
+                // The opt-in ones belong to the command rules only, so the
+                // read-only boundary never admits them, whatever the setting.
+                "echo $0",
+                "echo $_",
+                "echo $IFS",
+                // Every other `$` form.
+                "echo $HOME",
+                "echo ${1:-x}",
+            ] {
+                assert_needs_approval(&repo.classify(command));
+            }
+            let config = Config {
+                command_shell_parameters: crate::command_parse::ShellParameter::ALL.to_vec(),
+                ..Config::default()
+            };
+            let classification = CommandPolicy::new(config).classify("echo $0", &repo.root);
+            assert_needs_approval(&classification);
+        }
+
         #[test]
         fn restricted_paths_need_approval_with_the_restricted_path_reason() {
             let repo = Repository::new("restricted");
@@ -2610,6 +2886,7 @@ mod tests {
                     expansion: None,
                     unanalysable: None,
                     home_tilde: Vec::new(),
+                    parameter_words: Vec::new(),
                 })
             );
             assert_eq!(

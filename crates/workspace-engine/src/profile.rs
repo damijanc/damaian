@@ -430,6 +430,7 @@ pub fn split_profile_keys(overlay: ConfigOverlay) -> (ConfigOverlay, Vec<Rejecte
         project_checks_by_repository,
         language_servers,
         command_rules,
+        command_shell_parameters,
     } = overlay;
 
     let mut refused = Vec::new();
@@ -715,6 +716,9 @@ pub fn split_profile_keys(overlay: ConfigOverlay) -> (ConfigOverlay, Vec<Rejecte
         // Spec 111 D2: carried as written; an `allow` among them is a
         // direction refusal, which the merge makes and reports.
         command_rules,
+        // Spec 111 D11: carried as written; adding an entry is a direction
+        // refusal, which the merge makes and reports.
+        command_shell_parameters,
         ..ConfigOverlay::default()
     };
     (carried, refused)

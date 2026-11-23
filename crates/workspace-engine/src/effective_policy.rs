@@ -169,6 +169,7 @@ pub fn rule_label(key: &str) -> Option<String> {
         "require_approval_for_all_commands" => "Ask before every command",
         "allow_file_edits" => "File changes allowed",
         "command_access" => "Which commands may run",
+        "command_shell_parameters" => "Extra shell parameters command rules may read",
         "allow_browser_diagnostics" => "Browser diagnostics allowed",
         "allow_mutating_mcp_tools" => "MCP tools that change things allowed",
         "allow_git_commits" => "Git commits allowed",

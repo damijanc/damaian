@@ -7,6 +7,11 @@
 //! rewrite after the check — `$VAR`, `$(…)`, backticks, an unquoted glob, a
 //! here-doc — makes the whole command [`CommandParse::Unanalysable`], which
 //! the rules treat as `ask` and no `allow` covers (proposal requirement 4).
+//! The shell's special parameters are the exception (context.md D11): `$?`,
+//! `$#`, `$$` and `$-` anywhere in an argument, `$!`, `$@`, `$*`, `$1`–`$9`
+//! and the user's opt-in `$0`, `$_`, `$IFS` only as a whole argument; never
+//! as the program or `cd`'s directory. Each is marked with
+//! [`PARAMETER_MARK`] in its word, so it never equals the same text quoted.
 //!
 //! Stated limits: symlinks are not followed (D4); GNU's abbreviated long
 //! options (`--rec`) are compared as written; an option the table does not
@@ -35,6 +40,101 @@ pub struct ParseContext<'a> {
     /// The user's home directory, for `~`. Without one, a `~` makes the
     /// command unanalysable.
     pub home: Option<&'a Path>,
+    /// The shell parameters the user admitted beyond the default set
+    /// (`command_shell_parameters`, spec 111 D11).
+    pub shell_parameters: ShellParameters,
+}
+
+/// Marks an expanding shell parameter in a parsed word (spec 111 D11), so
+/// `/tmp/$$` (the process id) never equals `/tmp/'$$'` (a file named `$$`).
+/// A private-use character, like the rules' wildcard: a command that
+/// contains it is unanalysable.
+pub const PARAMETER_MARK: char = '\u{E001}';
+
+/// A word's text as a person reads it: without [`PARAMETER_MARK`].
+pub fn displayed(text: &str) -> String {
+    text.replace(PARAMETER_MARK, "")
+}
+
+/// A shell parameter that is analysable only when the user turns it on
+/// (spec 111 D11): `$0` names the shell, `$_` hides the previous command's
+/// last argument, `$IFS` changes how the rest of the line is split.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ShellParameter {
+    Zero,
+    Underscore,
+    Ifs,
+}
+
+impl ShellParameter {
+    pub const ALL: [ShellParameter; 3] = [Self::Zero, Self::Underscore, Self::Ifs];
+
+    /// As written in `command_shell_parameters` and in a command.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Zero => "$0",
+            Self::Underscore => "$_",
+            Self::Ifs => "$IFS",
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|parameter| parameter.as_str() == text)
+    }
+
+    /// The name after `$` (or inside `${…}`).
+    fn name(self) -> &'static str {
+        &self.as_str()[1..]
+    }
+}
+
+/// Which of the opt-in [`ShellParameter`]s are admitted. The default admits
+/// none of them; the default set of D11 (`$?`, `$1`, `"$@"`, …) is always
+/// admitted.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ShellParameters {
+    zero: bool,
+    underscore: bool,
+    ifs: bool,
+}
+
+impl ShellParameters {
+    /// Every opt-in parameter: for reading a rule's own pattern, which is
+    /// never run, so whether it parses does not depend on the setting.
+    pub const ALL: ShellParameters = ShellParameters {
+        zero: true,
+        underscore: true,
+        ifs: true,
+    };
+
+    pub fn from_list(parameters: &[ShellParameter]) -> Self {
+        let mut admitted = Self::default();
+        for parameter in parameters {
+            match parameter {
+                ShellParameter::Zero => admitted.zero = true,
+                ShellParameter::Underscore => admitted.underscore = true,
+                ShellParameter::Ifs => admitted.ifs = true,
+            }
+        }
+        admitted
+    }
+
+    pub fn admits(self, parameter: ShellParameter) -> bool {
+        match parameter {
+            ShellParameter::Zero => self.zero,
+            ShellParameter::Underscore => self.underscore,
+            ShellParameter::Ifs => self.ifs,
+        }
+    }
+
+    /// The opt-in parameter named `name` (what follows `$`), if admitted.
+    pub(crate) fn admitted_name(self, name: &str) -> Option<ShellParameter> {
+        ShellParameter::ALL
+            .into_iter()
+            .find(|parameter| parameter.name() == name && self.admits(*parameter))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -125,7 +225,7 @@ pub fn parse_command(command: &str, context: &ParseContext) -> CommandParse {
     let unanalysable = |reason: &str| CommandParse::Unanalysable {
         reason: reason.to_string(),
     };
-    let Some(line) = chain_line(command.trim()) else {
+    let Some(line) = chain_line(command.trim(), context.shell_parameters) else {
         return unanalysable(
             "uses shell syntax the parser does not model (a backslash, an unclosed quote, a \
              here-doc, `&`, or a redirect other than to /dev/null)",
@@ -162,8 +262,15 @@ pub fn parse_command(command: &str, context: &ParseContext) -> CommandParse {
             .map(|(position, text)| Word {
                 text,
                 home: line.home_tilde.contains(&(index, position)),
+                parameter: line.parameter_words.contains(&(index, position)),
             })
             .collect();
+        // The tokenizer already refuses a parameter as the first word or as
+        // `cd`'s argument (D11); this also covers `/usr/bin/cd`-like spellings
+        // the text comparison there does not see.
+        if system_name(words[0].text) == "cd" && words[1..].iter().any(|word| word.parameter) {
+            return unanalysable("uses a shell parameter as `cd`'s directory");
+        }
         if words[0].text.contains('=') && !words[0].text.starts_with('=') {
             return unanalysable("sets an environment variable before the program");
         }
@@ -221,6 +328,9 @@ struct Word<'a> {
     text: &'a str,
     /// Begins with an unquoted home tilde.
     home: bool,
+    /// Holds an expanding shell parameter (D11), marked with
+    /// [`PARAMETER_MARK`] in `text`.
+    parameter: bool,
 }
 
 struct Resolver<'a> {
@@ -265,7 +375,14 @@ impl Resolver<'_> {
     /// An option's value written inside its word (`-ofile`, `--output=file`).
     /// A tilde there is not expanded by the shell, so it is literal.
     fn inline_value(&self, kind: Value, text: &str) -> Argument {
-        self.value(kind, &Word { text, home: false })
+        self.value(
+            kind,
+            &Word {
+                text,
+                home: false,
+                parameter: text.contains(PARAMETER_MARK),
+            },
+        )
     }
 }
 
@@ -578,6 +695,10 @@ fn parse_dd(words: &[Word], resolver: &Resolver) -> PartShape {
 /// The parts one simple command runs as: itself, or a wrapper followed by
 /// what it wraps (recursively, so `sudo nice rm` is three parts).
 fn unwrap(words: &[Word], resolver: &Resolver) -> Result<Vec<CommandPart>, String> {
+    if words[0].parameter {
+        // D11: what runs would be whatever the parameter expands to.
+        return Err("uses a shell parameter as the program".to_string());
+    }
     let written = words[0].text;
     let name = system_name(written);
     if name == "xargs" {
@@ -1323,8 +1444,8 @@ fn git_subcommand(subcommand: &str) -> Option<&'static Grammar> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Argument, ChainOperator, CommandOption, CommandParse, CommandPart, ParseContext, PartShape,
-        parse_command,
+        Argument, ChainOperator, CommandOption, CommandParse, CommandPart, PARAMETER_MARK,
+        ParseContext, PartShape, ShellParameter, ShellParameters, parse_command,
     };
     use std::collections::BTreeSet;
     use std::path::{Path, PathBuf};
@@ -1338,6 +1459,7 @@ mod tests {
             &ParseContext {
                 working_directory: Path::new(WORKING_DIRECTORY),
                 home: Some(Path::new(HOME)),
+                shell_parameters: ShellParameters::default(),
             },
         )
     }
@@ -1493,6 +1615,7 @@ mod tests {
             &ParseContext {
                 working_directory: Path::new(WORKING_DIRECTORY),
                 home: None,
+                shell_parameters: ShellParameters::default(),
             },
         );
         assert!(matches!(parsed, CommandParse::Unanalysable { .. }));
@@ -1736,5 +1859,162 @@ mod tests {
         ] {
             assert_unanalysable(command);
         }
+    }
+
+    fn parse_with(command: &str, shell_parameters: ShellParameters) -> CommandParse {
+        parse_command(
+            command,
+            &ParseContext {
+                working_directory: Path::new(WORKING_DIRECTORY),
+                home: Some(Path::new(HOME)),
+                shell_parameters,
+            },
+        )
+    }
+
+    /// `text` with its one `$…` parameter marked, as the parser records it.
+    fn marked(text: &str) -> String {
+        text.replacen('$', &format!("{PARAMETER_MARK}$"), 1)
+    }
+
+    #[test]
+    fn default_shell_parameters_parse_as_marked_argument_words() {
+        // Spec 111 D11: bare, double-quoted and braced; as a whole word.
+        for (command, written) in [
+            ("echo $?", "$?"),
+            ("echo $#", "$#"),
+            ("echo $$", "$$"),
+            ("echo $!", "$!"),
+            ("echo $-", "$-"),
+            ("echo $@", "$@"),
+            ("echo $*", "$*"),
+            ("echo $1", "$1"),
+            ("echo $9", "$9"),
+            ("echo \"$@\"", "$@"),
+            ("echo \"$1\"", "$1"),
+            ("echo ${1}", "${1}"),
+            ("echo \"${#}\"", "${#}"),
+            ("echo \"exit $?\"", "exit $?"),
+            ("echo run-$$", "run-$$"),
+        ] {
+            assert_eq!(
+                operands(&only_part(command)),
+                [word(&marked(written))],
+                "`{command}`"
+            );
+        }
+        // Embedded in a path: always-non-empty ones only.
+        assert_eq!(
+            operands(&only_part("rm -rf /tmp/run-$$")),
+            [path(&format!("/tmp/run-{}", marked("$$")))]
+        );
+        assert_eq!(
+            operands(&only_part("rm -rf \"$1\"")),
+            [path(&format!("{WORKING_DIRECTORY}/{}", marked("$1")))]
+        );
+        // `$?` in a chain, as agents write it.
+        let chain = parts("cargo test; echo \"exit $?\"");
+        assert_eq!(chain.len(), 2);
+    }
+
+    #[test]
+    fn a_parameter_that_may_be_empty_is_only_a_whole_word() {
+        // D11's refinement: `/tmp/$1` runs as `/tmp/` when `$1` is empty.
+        for command in [
+            "rm -rf /tmp/$1",
+            "rm -rf /tmp/$!",
+            "rm -rf /tmp/\"$@\"",
+            "echo x$*",
+            "echo $1$2",
+            "echo \"$1 $2\"",
+            "echo --file=$1",
+            "echo ${1}x",
+        ] {
+            assert_unanalysable(command);
+        }
+    }
+
+    #[test]
+    fn a_parameter_is_never_the_program_or_cds_directory() {
+        for command in [
+            "$1",
+            "$@ -rf /tmp/x",
+            "\"$1\" status",
+            "ls && $1",
+            "sudo $1 rm",
+            "env $@",
+            "nice \"$1\"",
+            "cd $1 && ls",
+            "cd /tmp/$$ && ls",
+            "cd $1",
+            "ls > $1",
+            "echo x 2>$?",
+        ] {
+            assert_unanalysable(command);
+        }
+    }
+
+    #[test]
+    fn every_other_dollar_form_stays_unanalysable() {
+        for command in [
+            "echo $HOME",
+            "echo ${HOME}",
+            "echo ${1:-x}",
+            "echo ${#1}",
+            "echo ${10}",
+            "echo $((1 + 1))",
+            "echo $(pwd)",
+            "echo \"$(pwd)\"",
+            "echo $",
+            "echo ${",
+            "echo $'x'",
+            "echo $IFSX",
+            "echo $_x",
+            "echo \u{E001}$$",
+        ] {
+            assert_unanalysable(command);
+        }
+    }
+
+    #[test]
+    fn opt_in_parameters_need_the_users_setting() {
+        for command in ["echo $0", "echo $_", "echo $IFS", "echo \"${IFS}\""] {
+            assert_unanalysable(command);
+        }
+        let all = ShellParameters::ALL;
+        for (command, written) in [
+            ("echo $0", "$0"),
+            ("echo $_", "$_"),
+            ("echo $IFS", "$IFS"),
+            ("echo \"${IFS}\"", "${IFS}"),
+        ] {
+            let CommandParse::Chain(chain) = parse_with(command, all) else {
+                panic!("`{command}` should parse with every opt-in");
+            };
+            assert_eq!(
+                operands(&chain.parts[0]),
+                [word(&marked(written))],
+                "`{command}`"
+            );
+        }
+        // One admitted does not admit the others.
+        let zero = ShellParameters::from_list(&[ShellParameter::Zero]);
+        assert!(parse_with("echo $0", zero).chain().is_some());
+        assert!(parse_with("echo $_", zero).chain().is_none());
+        // Same placement rules: never inside a word, never the program.
+        for command in ["rm -rf /tmp/$0", "echo a$IFS", "$0 -c x", "cd $_"] {
+            assert!(
+                parse_with(command, all).chain().is_none(),
+                "`{command}` should stay unanalysable"
+            );
+        }
+    }
+
+    #[test]
+    fn a_quoted_dollar_is_text_and_differs_from_the_parameter() {
+        let quoted = only_part("rm -rf /tmp/'$$'");
+        let real = only_part("rm -rf /tmp/$$");
+        assert_eq!(operands(&quoted), [path("/tmp/$$")]);
+        assert_ne!(quoted, real);
     }
 }

@@ -284,6 +284,14 @@ fn weakening_cases() -> Vec<WeakeningCase> {
             "command_rule=allow rm -rf /\n",
             Reported("command_rule"),
         ),
+        // Spec 111 D11: a repository or profile may only remove an opt-in
+        // shell parameter, never turn one on.
+        case(
+            "command_shell_parameters",
+            "",
+            "command_shell_parameters=$0 $_ $IFS\n",
+            Reported("command_shell_parameters"),
+        ),
         case(
             "secret_patterns",
             "secret_patterns=USER_SECRET\n",
@@ -1291,6 +1299,46 @@ fn command_access_moves_only_toward_none_from_repository_scope() {
             .any(|r| r.key == "command_access" && r.class == RepositoryKeyClass::RestrictOnly);
         assert_eq!(was_refused, refused, "{user} then {repository}");
     }
+}
+
+/// Spec 111 D11: `command_shell_parameters` is the user's or an admin's; a
+/// repository may remove entries, and naming one the user did not turn on
+/// is refused without turning it on.
+#[test]
+fn command_shell_parameters_only_narrow_from_repository_scope() {
+    use workspace_engine::command_parse::ShellParameter::{Ifs, Underscore, Zero};
+    // (user, repository, resolved, refused)
+    let cases = [
+        ("$0 $IFS", "$0", vec![Zero], false),
+        ("$0 $IFS", "", vec![], false),
+        ("$0 $IFS", "$0 $IFS", vec![Zero, Ifs], false),
+        ("", "$0", vec![], true),
+        ("$0", "$0 $_", vec![Zero], true),
+        ("$IFS", "$_", vec![], true),
+    ];
+    for (user, repository, resolved, refused) in cases {
+        let (config, report) = load(
+            "command-shell-parameters-narrow",
+            &format!("command_shell_parameters={user}\n"),
+            &format!("command_shell_parameters={repository}\n"),
+        );
+        assert_eq!(
+            config.command_shell_parameters, resolved,
+            "{user} then {repository}"
+        );
+        let was_refused = report.rejected_keys.iter().any(|r| {
+            r.key == "command_shell_parameters" && r.class == RepositoryKeyClass::RestrictOnly
+        });
+        assert_eq!(was_refused, refused, "{user} then {repository}");
+    }
+    let (config, _) = load(
+        "command-shell-parameters-user",
+        "command_shell_parameters=$IFS, $_ $0\n",
+        "",
+    );
+    assert_eq!(config.command_shell_parameters, vec![Zero, Underscore, Ifs]);
+    let (config, _) = load("command-shell-parameters-default", "", "");
+    assert!(config.command_shell_parameters.is_empty());
 }
 
 #[test]

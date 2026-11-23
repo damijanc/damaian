@@ -1733,6 +1733,7 @@ fn repository_command_rules_may_only_ask_or_deny() {
         repository_root: &fixture.root,
         working_directory: &fixture.root,
         home: None,
+        shell_parameters: config.shell_parameters(),
     };
     let verdict =
         |command: &str| evaluate_command(command, &config.command_rules, &context).verdict();

@@ -25,7 +25,7 @@
 
 use crate::command_parse::{
     Argument, Chain, ChainOperator, CommandOption, CommandParse, CommandPart, ParseContext,
-    PartShape, parse_command,
+    PartShape, ShellParameters, displayed, parse_command,
 };
 use crate::command_policy::normalize_lexically;
 use std::collections::BTreeSet;
@@ -180,6 +180,7 @@ impl CommandRule {
             &ParseContext {
                 working_directory: Path::new("/"),
                 home: Some(Path::new("/")),
+                shell_parameters: ShellParameters::ALL,
             },
         )?;
         Ok(Self {
@@ -196,10 +197,13 @@ impl CommandRule {
     /// `working_directory`. No wildcard is read in it, so a quoted `'*'` in
     /// the approved command stays a literal. Each part of an approved chain
     /// is covered, alone or in another chain, in the directory it ran in.
+    /// `shell_parameters` is the user's `command_shell_parameters`, so a
+    /// command the rules cannot analyse is never approved for the session.
     pub fn session(
         command: &str,
         working_directory: &Path,
         home: Option<&Path>,
+        shell_parameters: ShellParameters,
     ) -> Result<Self, String> {
         let directory = normalize_lexically(working_directory);
         let parsed = parse_command(
@@ -207,6 +211,7 @@ impl CommandRule {
             &ParseContext {
                 working_directory: &directory,
                 home,
+                shell_parameters,
             },
         );
         if let CommandParse::Unanalysable { reason } = parsed {
@@ -253,6 +258,7 @@ impl CommandRule {
             &ParseContext {
                 working_directory: &part.working_directory,
                 home,
+                shell_parameters: ShellParameters::ALL,
             },
         ) else {
             return false;
@@ -284,6 +290,9 @@ impl CommandRule {
             &ParseContext {
                 working_directory: Path::new(directory),
                 home,
+                // The approved command parsed when the rule was made; a
+                // wider set reads an analysable command the same way.
+                shell_parameters: ShellParameters::ALL,
             },
         ) {
             CommandParse::Chain(chain) => wrap_groups(&chain)
@@ -335,7 +344,7 @@ fn compile_pattern(pattern: &str, context: &ParseContext) -> Result<CompiledPatt
         Some(body) if body.ends_with(char::is_whitespace) => (body.trim_end(), true),
         _ => (pattern, false),
     };
-    let marked = body.replace('*', &WILDCARD.to_string());
+    let marked = mark_wildcards(body);
     match parse_command(&marked, context) {
         CommandParse::Unanalysable { reason } => {
             Err(format!("the pattern {}", reason.replace(WILDCARD, "*")))
@@ -357,6 +366,24 @@ fn compile_pattern(pattern: &str, context: &ParseContext) -> Result<CompiledPatt
                 .to_string(),
         ),
     }
+}
+
+/// Every `*` of a pattern is a wildcard, except the one in the shell
+/// parameter `$*` (or `${*}`), which is the parameter (spec 111 D11).
+fn mark_wildcards(pattern: &str) -> String {
+    let mut marked = String::with_capacity(pattern.len());
+    let mut previous: [Option<char>; 2] = [None, None];
+    for character in pattern.chars() {
+        let parameter =
+            character == '*' && (previous[1] == Some('$') || previous == [Some('$'), Some('{')]);
+        if character == '*' && !parameter {
+            marked.push(WILDCARD);
+        } else {
+            marked.push(character);
+        }
+        previous = [previous[1], Some(character)];
+    }
+    marked
 }
 
 fn part_matches(pattern: &CommandPart, rest: bool, command: &CommandPart) -> bool {
@@ -626,7 +653,7 @@ fn built_in_denial(part: &CommandPart, repository_root: &Path) -> Option<BuiltIn
                 // At or above the root, or outside it: not strictly inside.
                 Argument::Path(path) if !path.starts_with(&root) || path == &root => denial(
                     BuiltInDefault::RecursiveRemove,
-                    format!("recursive `rm` of `{}`", path.display()),
+                    format!("recursive `rm` of `{}`", displayed(&path.to_string_lossy())),
                 ),
                 _ => None,
             })
@@ -663,7 +690,7 @@ fn built_in_denial(part: &CommandPart, repository_root: &Path) -> Option<BuiltIn
                     {
                         denial(
                             BuiltInDefault::DdToDevice,
-                            format!("`dd` writing to `{}`", path.display()),
+                            format!("`dd` writing to `{}`", displayed(&path.to_string_lossy())),
                         )
                     }
                     _ => None,
@@ -686,6 +713,8 @@ pub struct RuleContext<'a> {
     pub repository_root: &'a Path,
     pub working_directory: &'a Path,
     pub home: Option<&'a Path>,
+    /// The user's `command_shell_parameters` (spec 111 D11).
+    pub shell_parameters: ShellParameters,
 }
 
 /// What the rules decide about a part or a chain, in order of strictness so
@@ -764,6 +793,7 @@ pub fn evaluate_command(
         &ParseContext {
             working_directory: context.working_directory,
             home: context.home,
+            shell_parameters: context.shell_parameters,
         },
     );
     match parsed {
@@ -850,6 +880,7 @@ mod tests {
         BuiltInDefault, CommandRule, Decider, RuleContext, RuleEffect, RuleEvaluation, RuleSource,
         RuleVerdict, evaluate_command, word_matches,
     };
+    use crate::command_parse::{ShellParameter, ShellParameters};
     use std::path::Path;
 
     const ROOT: &str = "/Users/me/project";
@@ -860,6 +891,7 @@ mod tests {
             repository_root: Path::new(ROOT),
             working_directory: Path::new(ROOT),
             home: Some(Path::new(HOME)),
+            shell_parameters: ShellParameters::default(),
         }
     }
 
@@ -1072,7 +1104,13 @@ mod tests {
     #[test]
     fn a_session_rule_allows_its_exact_command_and_never_lifts_a_deny() {
         let session = |command: &str| {
-            CommandRule::session(command, Path::new(ROOT), Some(Path::new(HOME))).unwrap()
+            CommandRule::session(
+                command,
+                Path::new(ROOT),
+                Some(Path::new(HOME)),
+                ShellParameters::default(),
+            )
+            .unwrap()
         };
         let cargo = [session("cargo clippy --all-targets")];
         assert_eq!(
@@ -1123,7 +1161,15 @@ mod tests {
             RuleVerdict::Allow
         );
         assert_eq!(verdict("cargo clippy", &chain), RuleVerdict::Allow);
-        assert!(CommandRule::session("echo $(rm -rf /)", Path::new(ROOT), None).is_err());
+        assert!(
+            CommandRule::session(
+                "echo $(rm -rf /)",
+                Path::new(ROOT),
+                None,
+                ShellParameters::default()
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1345,13 +1391,105 @@ mod tests {
         ));
         assert!(CommandRule::parse("allow xargs *", RuleSource::User).is_err());
         // A session approval covers the wrapped group exactly.
-        let session =
-            [
-                CommandRule::session("sudo make install", Path::new(ROOT), Some(Path::new(HOME)))
-                    .unwrap(),
-            ];
+        let session = [CommandRule::session(
+            "sudo make install",
+            Path::new(ROOT),
+            Some(Path::new(HOME)),
+            ShellParameters::default(),
+        )
+        .unwrap()];
         assert_eq!(verdict("sudo make install", &session), RuleVerdict::Allow);
         assert_eq!(verdict("make install", &session), RuleVerdict::Default);
         assert_eq!(verdict("sudo make clean", &session), RuleVerdict::Default);
+    }
+
+    fn session_with(
+        command: &str,
+        shell_parameters: ShellParameters,
+    ) -> Result<CommandRule, String> {
+        CommandRule::session(
+            command,
+            Path::new(ROOT),
+            Some(Path::new(HOME)),
+            shell_parameters,
+        )
+    }
+
+    /// Spec 111 D11: a parameter is matched as written.
+    #[test]
+    fn a_shell_parameter_is_matched_as_written() {
+        // `/tmp/$$` is outside the repository, so the built-in default
+        // denies it; a user `allow` naming `/tmp/*` overrides that, one
+        // naming `/tmp/build` does not cover it.
+        assert_eq!(verdict("rm -rf /tmp/$$", &[]), RuleVerdict::Deny);
+        let star = [user("allow rm -rf /tmp/*")];
+        assert_eq!(verdict("rm -rf /tmp/$$", &star), RuleVerdict::Allow);
+        assert_eq!(verdict("rm -rf /tmp/run-$$", &star), RuleVerdict::Allow);
+        let build = [user("allow rm -rf /tmp/build")];
+        assert_eq!(verdict("rm -rf /tmp/$$", &build), RuleVerdict::Deny);
+        // A rule may name the parameter itself, `$*` included.
+        let exact = [user("allow rm -rf /tmp/$$")];
+        assert_eq!(verdict("rm -rf /tmp/$$", &exact), RuleVerdict::Allow);
+        assert_eq!(verdict("rm -rf /tmp/$#", &exact), RuleVerdict::Deny);
+        let echo = [user("deny echo $*")];
+        assert_eq!(verdict("echo $*", &echo), RuleVerdict::Deny);
+        assert_eq!(verdict("echo \"$@\"", &echo), RuleVerdict::Default);
+        assert_eq!(verdict("echo x", &echo), RuleVerdict::Default);
+        let any = [user("allow echo *")];
+        assert_eq!(verdict("echo \"exit $?\"", &any), RuleVerdict::Allow);
+        // Empty-capable ones inside a path stay unanalysable: no rule.
+        assert!(matches!(
+            evaluate("rm -rf /tmp/$1", &star),
+            RuleEvaluation::Unanalysable { .. }
+        ));
+        assert!(matches!(
+            evaluate("rm -rf /tmp/$!", &star),
+            RuleEvaluation::Unanalysable { .. }
+        ));
+        // The card's detail shows the parameter without its mark.
+        let RuleEvaluation::Parts(parts) = evaluate("rm -rf /tmp/$$", &[]) else {
+            panic!("`rm -rf /tmp/$$` should parse");
+        };
+        let detail = &parts[0].built_in.as_ref().expect("built-in denial").detail;
+        assert_eq!(detail, "recursive `rm` of `/tmp/$$`");
+    }
+
+    #[test]
+    fn a_quoted_dollar_never_matches_the_same_rule_as_the_parameter() {
+        let literal = [user("allow rm -rf /tmp/'$$'")];
+        assert_eq!(verdict("rm -rf /tmp/'$$'", &literal), RuleVerdict::Allow);
+        assert_eq!(verdict("rm -rf /tmp/$$", &literal), RuleVerdict::Deny);
+        let real = [user("allow rm -rf /tmp/$$")];
+        assert_eq!(verdict("rm -rf /tmp/$$", &real), RuleVerdict::Allow);
+        assert_eq!(verdict("rm -rf /tmp/'$$'", &real), RuleVerdict::Deny);
+        // Nor the same session approval.
+        let approved = [session_with("echo '$1'", ShellParameters::default()).unwrap()];
+        assert_eq!(verdict("echo '$1'", &approved), RuleVerdict::Allow);
+        assert_eq!(verdict("echo $1", &approved), RuleVerdict::Default);
+        let approved = [session_with("echo $1", ShellParameters::default()).unwrap()];
+        assert_eq!(verdict("echo $1", &approved), RuleVerdict::Allow);
+        assert_eq!(verdict("echo '$1'", &approved), RuleVerdict::Default);
+    }
+
+    #[test]
+    fn opt_in_parameters_are_analysed_only_when_the_user_turned_them_on() {
+        let rules = [user("allow echo $0")];
+        assert!(matches!(
+            evaluate("echo $0", &rules),
+            RuleEvaluation::Unanalysable { .. }
+        ));
+        let mut enabled = context();
+        enabled.shell_parameters = ShellParameters::from_list(&[ShellParameter::Zero]);
+        assert_eq!(
+            evaluate_command("echo $0", &rules, &enabled).verdict(),
+            RuleVerdict::Allow
+        );
+        assert!(matches!(
+            evaluate_command("echo $_", &rules, &enabled),
+            RuleEvaluation::Unanalysable { .. }
+        ));
+        // A session approval needs the setting the command is judged under.
+        assert!(session_with("echo $IFS", ShellParameters::default()).is_err());
+        assert!(session_with("echo $IFS", ShellParameters::ALL).is_ok());
     }
 }
