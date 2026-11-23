@@ -96,18 +96,44 @@ impl Write for FlakyWriter {
 // Without a periodic write there is nothing to fail on, so a client that
 // disappeared while the provider was still thinking would go unnoticed —
 // exactly the long-wait case the whole feature exists for.
+//
+// The token is sent only once a keepalive has been written. A fixed sleep
+// before sending raced the relay's start: on a loaded CI runner the relay
+// began after the token was queued and never had a silent interval to fill.
 #[test]
 fn the_relay_writes_a_keepalive_while_the_turn_is_silent() {
+    struct SignallingWriter {
+        written: Vec<u8>,
+        keepalive_seen: Option<std::sync::mpsc::Sender<()>>,
+    }
+    impl std::io::Write for SignallingWriter {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.written.extend_from_slice(buffer);
+            if String::from_utf8_lossy(&self.written).contains(": keepalive")
+                && let Some(seen) = self.keepalive_seen.take()
+            {
+                let _ = seen.send(());
+            }
+            Ok(buffer.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
     let (sender, receiver) = std::sync::mpsc::channel();
+    let (seen_sender, seen) = std::sync::mpsc::channel();
     let cancel = CancelToken::new();
     std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(150));
+        // Bounded, so a relay that never writes a keepalive fails the
+        // assertion below instead of hanging the test.
+        let _ = seen.recv_timeout(Duration::from_secs(10));
         let _ = sender.send(TurnEvent::Token("hi".to_string()));
     });
 
-    let mut out = FlakyWriter {
+    let mut out = SignallingWriter {
         written: Vec::new(),
-        writes_before_failure: usize::MAX,
+        keepalive_seen: Some(seen_sender),
     };
     relay_turn_events(&mut out, &cancel, None, receiver, Duration::from_millis(25)).expect("relay");
 
