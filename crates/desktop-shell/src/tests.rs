@@ -5669,6 +5669,62 @@ fn command_proposal_endpoint_serves_a_stored_proposals_directories() {
         "{payload}"
     );
     assert_eq!(payload["repositoryRoot"], repo_str, "{payload}");
+    // No command rule decided `npm test`: the card has no rule line.
+    assert!(payload["rule"].is_null(), "{payload}");
+    assert!(payload["ruleWarning"].is_null(), "{payload}");
+}
+
+/// Spec 111 D7: the card names the command rule that decided and its source,
+/// and Damaian's built-in default when that blocked it.
+#[test]
+fn command_proposal_endpoint_names_the_deciding_rule_and_its_source() {
+    let repo = repository_map_fixture("repomap-proposal-rule");
+    fs::create_dir_all(repo.join(".damaian")).unwrap();
+    fs::write(
+        repo.join(".damaian/config.conf"),
+        "command_rule=ask npm test *\n",
+    )
+    .unwrap();
+    let repo_str = repo.to_string_lossy().to_string();
+    let engine = engine_for_repo(&repo_str).unwrap();
+    let asked = engine
+        .validation_orchestrator
+        .propose_command(&repo, "npm test", "test proposal")
+        .unwrap();
+    let blocked = engine
+        .validation_orchestrator
+        .propose_command(&repo, "rm -rf /", "test proposal")
+        .unwrap();
+
+    let (port, token) = serve_for_test();
+    let stored = |proposal_id: &str| {
+        let response = get_for_test(
+            port,
+            &token,
+            &format!(
+                "/api/command-proposal?repo={}&proposal_id={proposal_id}",
+                percent_encode_for_test(&repo_str)
+            ),
+        );
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        json_of(&response)
+    };
+
+    let payload = stored(&asked.id);
+    assert_eq!(payload["rule"], "ask npm test *", "{payload}");
+    assert_eq!(payload["ruleSource"], "repository", "{payload}");
+    assert_eq!(
+        payload["ruleSummary"], "Asked by repository rule `ask npm test *` (repository config)",
+        "{payload}"
+    );
+    assert!(payload["ruleWarning"].is_null(), "{payload}");
+
+    let payload = stored(&blocked.id);
+    assert_eq!(payload["ruleSource"], "default", "{payload}");
+    assert_eq!(
+        payload["ruleSummary"], "Damaian's default: recursive `rm` of `/`",
+        "{payload}"
+    );
 }
 
 fn get_session_for_test(port: u16, token: &str, session_id: &str) -> String {

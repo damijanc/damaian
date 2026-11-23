@@ -363,6 +363,7 @@ mod tests {
             causes: vec![],
             expected_effects: String::new(),
             may_use_network: false,
+            rule: None,
         }
     }
 
@@ -376,6 +377,7 @@ mod tests {
             causes: vec![],
             expected_effects: String::new(),
             may_use_network: true,
+            rule: None,
         }
     }
 
@@ -890,6 +892,7 @@ mod tests {
             causes: vec![],
             expected_effects: "Configured safe command".to_string(),
             may_use_network: false,
+            rule: None,
         }
     }
 

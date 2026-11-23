@@ -206,7 +206,8 @@
     to it (D8), so a blocklisted command written with `$…` or a glob asks
     instead of being blocked; and the allowlist branch kept
     `require_approval_for_all_commands`, so an `allow` from a migrated
-    entry must still ask when that key is on.
+    entry must still ask when that key is on. Both settled in Task 4: D12
+    and D13.
 - **D11 — shell special parameters (decided by the owner, 2026-11-21).**
   D3 made every `$` unanalysable, so any command using one asked and no rule
   could cover it. Agents' commands use special parameters all the time
@@ -255,3 +256,71 @@
     - **The opt-in applies to the command rules only.** The spec 64 read-only
       boundary keeps the default set. Plan mode's version of that check cannot
       read `command_shell_parameters`, and the two checks must decide alike.
+
+- **D12 — an unanalysable command a `deny` names stays blocked (decided by
+  the owner, 2026-11-21).** A blocklisted command written with `$…` or a
+  glob (`git push $REMOTE` under `command_blocklist = git push`) stays
+  **blocked**; it must not drop to "ask". Built as a text check, used only
+  for a command the parser refuses: a `deny` rule of any source (migrated
+  blocklist; user, admin, repository, profile) whose words match the command's first words, `*` inside a word a
+  wildcard and a trailing ` *` any further words, and whose `in <directory>`
+  matches; so `deny git push *` covers `git push $REMOTE` and `deny rm -rf
+  /tmp/**` does not cover `rm -rf $DIR` (that asks). Damaian's built-in
+  defaults keep their old text patterns for such commands
+  (`destructive_pattern`), so `rm -rf *` is blocked again rather than
+  asking (D8 listed it as asking). No `allow` covers an unanalysable command,
+  so erring only moves it between asking and blocked.
+  `RuleEvaluation::Unanalysable` carries the decider as `denied_by`; the
+  equivalence corpus no longer lists `git push $REMOTE`, `rm -rf *`, or
+  Task 3b's `rm -rf /tmp/$1` and `rm -rf /tmp/$!` (blocked again by the
+  `rm -rf /` text pattern).
+
+- **D13 — how Task 4 reads D2 and D7 (2026-11-21).** Settled while
+  switching `CommandPolicy` to the rules.
+  - *Rules.* `CommandPolicy::command_rules(root)` is
+    `legacy_command_rules(root, home, report).rules` followed by
+    `config.command_rules`; the home directory is `$HOME` (absolute), and the
+    report is kept from `new_with_report` so migrated entries keep their
+    source.
+  - *Verdicts.* `Deny` blocks with `RuleDenied { rule, source }` or
+    `BuiltInDefault { name, detail }`. `Allow` (every part allowed by a user,
+    admin or session rule) runs; `require_approval_for_all_commands` still
+    asks with its `Setting` cause, as the old allowlist branch did; no
+    outside-the-repository default asks about it (`allow rm -rf /tmp/**`
+    names a place outside on purpose); the profile's `command_access` still
+    applies, because a profile only tightens. Its risk is `low`, or `high`
+    when it lifts a built-in block. `Ask` puts `RuleAsks { rule, source }`
+    first, then the defaults' own causes. `Default` goes to the defaults
+    (shell control, read-only admission, the approval causes) exactly as
+    before. A chain mixing allowed and undecided parts is `Default` as a
+    whole, so its shell control asks; deciding the undecided parts one by
+    one is not done. An unanalysable command no `deny` names goes to the
+    defaults too and, if they would not ask, asks with `Unanalysable
+    { reason }` (no command in the corpus reaches that).
+  - *Causes.* `Blocklisted` and `Destructive` stay only so proposals stored
+    earlier read back; new decisions use the four new causes. Audit names:
+    `rule_denied`, `rule_asks`, `built_in_default`, `unanalysable`.
+  - *What decided.* `CommandClassification::rule` and
+    `CommandProposal::rule` hold a `DecidingRule { effect, rule, source,
+    overrides }` (stored as the optional `RULE` field, JSON); `summary()` is
+    the card's line ("Allowed by your rule `…` (user config)", "Damaian's
+    default: …") and `warning()` D7's override line. `command_proposal_stored`
+    gains a `rule` field; a lifted built-in block writes
+    `command_rule_override { proposalId, rule, ruleSource, builtInDefault,
+    workingDirectory }`, never the command's output. The shell serves the
+    rule, its source, the summary and the warning from `GET
+    /api/command-proposal`, which the card already reads, so `chat` needs no
+    new payload field; the card shows the warning, and the rule line when
+    the cause line does not already name the rule. A command a user `allow`
+    lets run without asking shows no card, so its override is in the audit
+    only; showing it in the transcript is left for later.
+  - *Always allow* writes `command_rule = allow <command> in <working
+    directory>` to user config (`command_allowlisted` audit gains `rule`).
+    A directory a rule line cannot name (a space or `*`) keeps the old
+    `command_allowlist.<id>` entry, read as the same rule (D10). Not
+    eligible: a command with `*` (a rule reads it as a wildcard) or one the
+    rule parser refuses, besides the old exclusions (blocked, shell control,
+    every command asks).
+  - *Equivalence.* The old policy is kept behind
+    `CommandPolicy::deciding_by_legacy_keys()` (hidden), only so the corpus
+    can replay it; it goes with the old keys.

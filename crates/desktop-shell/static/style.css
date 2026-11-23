@@ -6093,6 +6093,26 @@ body.worker-view #chat-model-menu {
   font-size: 12px;
 }
 
+/* The command rule that decided (spec 111 D7), and the warning when a rule of
+   the user's lifts one of Damaian's built-in blocks. The warning is the line
+   to read before approving, so it is warn ink, not muted. */
+.command-approval-rule {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.command-approval-rule-warning {
+  margin: 0;
+  padding: 4px 8px;
+  border: 1px solid var(--warn-line);
+  border-radius: 6px;
+  background: var(--warn-soft);
+  color: var(--warn-ink);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
 /* "Runs in `packages/api`" on a command approval card. */
 .command-approval-location {
   color: var(--muted);

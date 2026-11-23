@@ -29,6 +29,7 @@ fn proposal_saying(
         may_use_network: false,
         reasons: causes.iter().map(ApprovalCause::plain_words).collect(),
         causes,
+        rule: None,
         created_at_ms: 0,
         status: "pending".to_string(),
         purpose: CommandPurpose::Other,

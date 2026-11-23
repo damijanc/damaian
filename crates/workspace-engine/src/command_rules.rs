@@ -20,8 +20,9 @@
 //! `deny`. A chain is denied if any part is, asks if any part asks, and is
 //! allowed only when every part is.
 //!
-//! Nothing here changes a decision yet: until spec 111 Task 4 the command
-//! policy (`command_policy.rs`) decides, and this path sits beside it.
+//! Since spec 111 Task 4 these rules decide: `CommandPolicy::classify_at`
+//! (`command_policy.rs`) evaluates them, and a command no rule decides goes
+//! to Damaian's other defaults there.
 
 use crate::command_parse::{
     Argument, Chain, ChainOperator, CommandOption, CommandParse, CommandPart, ParseContext,
@@ -759,9 +760,12 @@ impl PartDecision {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuleEvaluation {
     /// The command cannot be analysed (proposal requirement 4): it asks, and
-    /// no rule covers it.
+    /// no `allow` covers it. It is still denied when its text starts the way
+    /// a `deny` rule or a built-in default does (`denied_by`), so `git push
+    /// $REMOTE` stays blocked under `deny git push *` (owner, 2026-11-21).
     Unanalysable {
         reason: String,
+        denied_by: Option<Decider>,
     },
     Parts(Vec<PartDecision>),
 }
@@ -771,6 +775,9 @@ impl RuleEvaluation {
     /// defaults leaves the chain to them; only all-`allow` allows.
     pub fn verdict(&self) -> RuleVerdict {
         match self {
+            Self::Unanalysable {
+                denied_by: Some(_), ..
+            } => RuleVerdict::Deny,
             Self::Unanalysable { .. } => RuleVerdict::Ask,
             Self::Parts(parts) => parts
                 .iter()
@@ -797,7 +804,10 @@ pub fn evaluate_command(
         },
     );
     match parsed {
-        CommandParse::Unanalysable { reason } => RuleEvaluation::Unanalysable { reason },
+        CommandParse::Unanalysable { reason } => RuleEvaluation::Unanalysable {
+            reason,
+            denied_by: unanalysable_denial(command, rules, context),
+        },
         CommandParse::Chain(chain) => RuleEvaluation::Parts(
             wrap_groups(&chain)
                 .into_iter()
@@ -809,6 +819,62 @@ pub fn evaluate_command(
                 .collect(),
         ),
     }
+}
+
+/// What denies a command that cannot be parsed (owner, 2026-11-21: a
+/// blocklisted command written with `$…` or a glob stays blocked; context.md
+/// D12). The check is on the text, word by word from its start: a `deny`
+/// rule of any source whose literal words match the command's first words,
+/// with `*` inside a word a wildcard and a trailing ` *` any further words
+/// (so `deny git push *` covers `git push $REMOTE`, and `deny rm -rf
+/// /tmp/**` does not cover `rm -rf $DIR`); else the text patterns Damaian's
+/// built-in defaults used before they were parsed (`rm -rf *`). Erring
+/// either way only moves a command between asking and blocked: no `allow`
+/// ever covers it.
+fn unanalysable_denial(
+    command: &str,
+    rules: &[CommandRule],
+    context: &RuleContext,
+) -> Option<Decider> {
+    let words: Vec<&str> = command.split_whitespace().collect();
+    let rule = RuleSource::ORDER
+        .iter()
+        .flat_map(|source| rules.iter().filter(move |rule| rule.source == *source))
+        .filter(|rule| rule.effect == RuleEffect::Deny)
+        .filter(|rule| {
+            rule.directory.as_ref().is_none_or(|directory| {
+                directory_matches(directory, context.working_directory, context.home)
+            })
+        })
+        .rfind(|rule| text_covers(&rule.pattern, &words));
+    if let Some(rule) = rule {
+        return Some(Decider::Rule(rule.clone()));
+    }
+    let (default, pattern) = crate::command_policy::destructive_text_default(command)?;
+    Some(Decider::BuiltIn(BuiltInDenial {
+        default,
+        detail: format!("`{pattern}`"),
+    }))
+}
+
+/// Whether a rule pattern's words cover the start of `words`, compared as
+/// text (no parsing). See [`unanalysable_denial`].
+fn text_covers(pattern: &str, words: &[&str]) -> bool {
+    let pattern_words: Vec<&str> = pattern.split_whitespace().collect();
+    let (pattern_words, rest) = match pattern_words.split_last() {
+        Some((&"*", head)) => (head, true),
+        _ => (pattern_words.as_slice(), false),
+    };
+    let lengths_fit = if rest {
+        words.len() >= pattern_words.len()
+    } else {
+        words.len() == pattern_words.len()
+    };
+    lengths_fit
+        && pattern_words
+            .iter()
+            .zip(words)
+            .all(|(pattern, word)| word_matches(&pattern.replace('*', &WILDCARD.to_string()), word))
 }
 
 /// The ranges of `chain.parts` that a wrapper ties together.
@@ -916,7 +982,7 @@ mod tests {
             RuleEvaluation::Parts(parts) => parts
                 .iter()
                 .find_map(|part| part.built_in.as_ref().map(|denial| denial.default)),
-            RuleEvaluation::Unanalysable { reason } => panic!("`{command}`: {reason}"),
+            RuleEvaluation::Unanalysable { reason, .. } => panic!("`{command}`: {reason}"),
         }
     }
 

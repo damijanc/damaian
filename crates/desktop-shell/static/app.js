@@ -15808,11 +15808,31 @@ function createCommandApprovalPreview(
   const location = document.createElement("p");
   location.className = "command-approval-location";
   location.hidden = true;
+  // What decided, from the same stored proposal (spec 111 D7): the command
+  // rule and its source, and a warning when a rule of the user's lifts one of
+  // Damaian's built-in blocks. A block or a rule's ask already names its rule
+  // in the cause line, so the rule line is shown only when it adds something.
+  const ruleLine = document.createElement("p");
+  ruleLine.className = "command-approval-rule";
+  ruleLine.hidden = true;
+  const ruleWarning = document.createElement("p");
+  ruleWarning.className = "command-approval-rule-warning";
+  ruleWarning.setAttribute("role", "note");
+  ruleWarning.hidden = true;
   if (proposal.proposalId && proposalRepo) {
     void api(
       `/api/command-proposal?repo=${encodeURIComponent(proposalRepo)}&proposal_id=${encodeURIComponent(proposal.proposalId)}`,
     )
       .then((stored) => {
+        if (stored.ruleWarning) {
+          ruleWarning.textContent = stored.ruleWarning;
+          ruleWarning.hidden = false;
+        }
+        if (stored.ruleSummary && !(proposal.cause || "").includes(stored.rule || "")) {
+          ruleLine.textContent = stored.ruleSummary;
+          ruleLine.dataset.source = stored.ruleSource || "";
+          ruleLine.hidden = false;
+        }
         const relative = repositoryRelative(stored.repositoryRoot, stored.workingDirectory);
         if (!relative) return;
         location.textContent = "Runs in ";
@@ -15853,7 +15873,8 @@ function createCommandApprovalPreview(
 
   // Grants that outlive this turn go behind the overflow rather than sitting at
   // the same weight as Approve: the cost of a mis-click is not symmetric.
-  // `Allow Always` writes the user's allowlist for this repository (spec 10);
+  // `Allow Always` writes a user command rule for this exact command in this
+  // directory (spec 111 requirement 9);
   // the session grant widens browser diagnostics for the whole session
   // (spec 12). The server decides eligibility — blocked commands, shell-control
   // syntax and `require_approval_for_all_commands` all rule out the allowlist
@@ -15863,7 +15884,7 @@ function createCommandApprovalPreview(
   if (proposal.allowAlways && !decide) {
     menuItems.push({
       label: "Always allow in this project",
-      hint: "Adds to the allowlist — persists after this turn",
+      hint: "Adds your rule for this command here — persists after this turn",
       onSelect: () => runWithGrant({ always: true }, "Command allowed for this project"),
     });
   }
@@ -16114,7 +16135,18 @@ function createCommandApprovalPreview(
   });
 
   footer.append(disclosure, actions);
-  wrapper.append(header, cause, command, agentReason, location, details, footer, output);
+  wrapper.append(
+    header,
+    cause,
+    ruleWarning,
+    ruleLine,
+    command,
+    agentReason,
+    location,
+    details,
+    footer,
+    output,
+  );
   return wrapper;
 }
 

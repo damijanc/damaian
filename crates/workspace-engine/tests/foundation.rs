@@ -599,11 +599,13 @@ fn allowlist_does_not_bypass_shell_control_detection() {
 
     let root = Path::new("/tmp/damaian-test");
     assert_eq!(policy.classify("npm test", root).risk, CommandRisk::Low);
-    for command in ["npm test; rm -rf ~", "npm test\ncat /etc/passwd"] {
-        let classification = policy.classify(command, root);
-        assert_eq!(classification.risk, CommandRisk::High);
-        assert!(classification.requires_approval);
-    }
+    let chained = policy.classify("npm test\ncat /etc/passwd", root);
+    assert_eq!(chained.risk, CommandRisk::High);
+    assert!(chained.requires_approval);
+    // Every part of a chain is decided (spec 111 D3): the allowed `npm test`
+    // does not carry the chain, and its `rm -rf ~` is Damaian's built-in block.
+    let destructive = policy.classify("npm test; rm -rf ~", root);
+    assert!(destructive.blocked, "{destructive:?}");
 }
 
 #[test]
@@ -4303,7 +4305,9 @@ fn command_proposal_response_leads_with_the_deciding_cause() {
         )
         .unwrap();
     assert!(
-        result.response.starts_with("Blocked: matches"),
+        result
+            .response
+            .starts_with("Blocked by your rule `deny echo forbidden *` (user config)"),
         "{}",
         result.response
     );

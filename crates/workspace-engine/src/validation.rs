@@ -1,10 +1,11 @@
 use crate::audit::AuditLog;
 use crate::cancel::CancelToken;
 use crate::command_policy::{
-    ApprovalCause, CommandClassification, CommandPolicy, CommandRisk, allow_always_eligible,
-    relative_location, root_qualified_allowlist_entry,
+    ApprovalCause, CommandClassification, CommandPolicy, CommandRisk, DecidingRule,
+    allow_always_eligible, relative_location, root_qualified_allowlist_entry,
 };
 use crate::command_purpose::{CommandPurpose, command_purpose};
+use crate::command_rules::{CommandRule, RuleEffect, RuleSource};
 use crate::command_runner::{CommandExecution, CommandRunOptions, CommandRunner};
 use crate::config::ConfigOverlay;
 use crate::error::{ClientError, Result};
@@ -33,6 +34,10 @@ pub struct CommandProposal {
     /// (spec 62 §5.4). Stored with the proposal so reattach and *Allow Always*
     /// read the same causes the audit record names.
     pub causes: Vec<ApprovalCause>,
+    /// The command rule or built-in default that decided (spec 111 D7), for
+    /// the card. `None` for a command Damaian's other defaults decided, and
+    /// for a proposal stored before command rules decided.
+    pub rule: Option<DecidingRule>,
     pub created_at_ms: u128,
     pub status: String,
     /// What the command is for (spec 63 §5.1), decided from the
@@ -433,8 +438,36 @@ impl ValidationOrchestrator {
                         .collect::<Vec<_>>()
                         .join(","),
                 ),
+                // The deciding command rule as written, empty when none
+                // decided (spec 111 D7).
+                (
+                    "rule",
+                    proposal
+                        .rule
+                        .as_ref()
+                        .filter(|rule| rule.source != "default")
+                        .map(|rule| rule.rule.clone())
+                        .unwrap_or_default(),
+                ),
             ],
         )?;
+        // A rule of the user's lifted one of Damaian's built-in blocks (D7):
+        // the rule text and the default's name, never the command's output.
+        if let Some(rule) = &proposal.rule
+            && let Some(overridden) = &rule.overrides
+        {
+            self.audit_log.record(
+                "command_rule_override",
+                &[
+                    ("actor", "system".to_string()),
+                    ("proposalId", proposal.id.clone()),
+                    ("rule", rule.rule.clone()),
+                    ("ruleSource", rule.source.clone()),
+                    ("builtInDefault", overridden.name.clone()),
+                    ("workingDirectory", proposal.working_directory.clone()),
+                ],
+            )?;
+        }
         Ok(proposal)
     }
 
@@ -611,18 +644,18 @@ impl ValidationOrchestrator {
     }
 
     /// Permanently allows a proposal's command, so future proposals for the
-    /// exact same command classify as low risk and skip the approval prompt.
+    /// exact same command, in the same directory, run without asking.
     ///
-    /// Writes `command_allowlist.<repository_id>` to the *user's* config, not
-    /// to `<repo>/.damaian/config.conf`: the grant is still scoped to the one
-    /// repository the proposal was raised against, but it is the user's
-    /// decision about that repository, and a repository config entry would be
-    /// indistinguishable from one that arrived with a clone — which is how a
-    /// repository could allow its own commands (spec 34 §5.4). The id is per
-    /// checkout, so a grant does not transfer to another clone of the same
-    /// project. A proposal made in a sub-root stores the root-qualified entry
-    /// under the repository's id (spec 24 `context.md` §2), so the grant
-    /// authorises that directory only. Returns the path written.
+    /// Writes a user command rule (spec 111 requirement 9): `command_rule =
+    /// allow <command> in <working directory>` in the *user's* config, never
+    /// in `<repo>/.damaian/config.conf`: the grant is the user's decision, and
+    /// a repository config entry would be indistinguishable from one that
+    /// arrived with a clone (spec 34 §5.4). The exact command in the exact
+    /// directory, so the grant covers what was approved and nothing beside
+    /// it; a directory names one checkout, so it does not transfer to
+    /// another clone. A directory a rule line cannot name (a space or `*` in
+    /// its path) keeps the old per-repository `command_allowlist.<id>` entry,
+    /// which is read as the same rule (D10). Returns the path written.
     ///
     /// The caller is expected to run the command afterwards: this only records
     /// the decision.
@@ -643,40 +676,56 @@ impl ValidationOrchestrator {
                 proposal.command
             )));
         }
+        let Some(relative) =
+            relative_location(&repository_root, Path::new(&proposal.working_directory))
+        else {
+            return Err(ClientError::PolicyBlocked(format!(
+                "Command runs outside its repository and cannot be permanently allowed: {}",
+                proposal.command
+            )));
+        };
 
         let repository_id = repository_id_for_root(&repository_root);
         let path = config.user_config_path();
         let mut overlay = ConfigOverlay::load_or_default(&path)?;
-        // The per-repository key holds only what was granted here. The user's
-        // machine-wide `command_allowlist` stays separate and is unioned in at
-        // load time, so seeding from the effective list — which the repository
-        // -scoped variant of this used to need — would only duplicate it.
-        let mut allowlist = overlay
-            .command_allowlist_by_repository
-            .remove(&repository_id)
-            .unwrap_or_default();
-
         let command = proposal.command.trim();
-        let command =
-            match relative_location(&repository_root, Path::new(&proposal.working_directory)) {
-                Some(relative) if relative.is_empty() => command.to_string(),
-                Some(relative) => root_qualified_allowlist_entry(&relative, command),
-                // No entry could ever match there (`classify_pattern`), so a
-                // grant would be a click that does nothing.
-                None => {
-                    return Err(ClientError::PolicyBlocked(format!(
-                        "Command runs outside its repository and cannot be permanently allowed: {}",
-                        proposal.command
-                    )));
+        let directory =
+            crate::command_policy::normalize_lexically(Path::new(&proposal.working_directory))
+                .to_string_lossy()
+                .into_owned();
+        let (granted, already_allowed) = match exact_user_rule(command, &directory) {
+            Some(rule) => {
+                let text = rule.text();
+                let already_allowed = overlay
+                    .command_rules
+                    .iter()
+                    .any(|existing| existing.text() == text);
+                if !already_allowed {
+                    overlay.command_rules.push(rule);
                 }
-            };
-        let already_allowed = allowlist.iter().any(|entry| entry.trim() == command);
-        if !already_allowed {
-            allowlist.push(command.clone());
-        }
-        overlay
-            .command_allowlist_by_repository
-            .insert(repository_id.clone(), allowlist);
+                (text, already_allowed)
+            }
+            None => {
+                // The per-repository key holds only what was granted here.
+                let mut allowlist = overlay
+                    .command_allowlist_by_repository
+                    .remove(&repository_id)
+                    .unwrap_or_default();
+                let entry = if relative.is_empty() {
+                    command.to_string()
+                } else {
+                    root_qualified_allowlist_entry(&relative, command)
+                };
+                let already_allowed = allowlist.iter().any(|existing| existing.trim() == entry);
+                if !already_allowed {
+                    allowlist.push(entry.clone());
+                }
+                overlay
+                    .command_allowlist_by_repository
+                    .insert(repository_id.clone(), allowlist);
+                (entry, already_allowed)
+            }
+        };
         overlay.save(&path)?;
 
         self.audit_log.record(
@@ -684,7 +733,10 @@ impl ValidationOrchestrator {
             &[
                 ("actor", "user".to_string()),
                 ("proposalId", proposal.id.clone()),
-                ("command", command),
+                ("command", command.to_string()),
+                // The rule line written (`allow cargo test in /repo`), or the
+                // old allowlist entry for a directory a rule cannot name.
+                ("rule", granted),
                 ("approvedBy", approved_by.to_string()),
                 ("alreadyAllowed", already_allowed.to_string()),
                 ("repositoryId", repository_id),
@@ -730,6 +782,24 @@ impl ValidationOrchestrator {
     }
 }
 
+/// The user rule *Always allow* writes: `allow <command> in <directory>`,
+/// when that line reads back as exactly this rule. `None` when it would not
+/// (a space or `*` in the directory, which a rule line cannot say).
+fn exact_user_rule(command: &str, directory: &str) -> Option<CommandRule> {
+    if directory.contains('*') {
+        return None;
+    }
+    let rule = CommandRule::new(
+        RuleEffect::Allow,
+        command,
+        Some(directory.to_string()),
+        RuleSource::User,
+    )
+    .ok()?;
+    let read_back = CommandRule::parse(&rule.text(), RuleSource::User).ok()?;
+    (read_back == rule).then_some(rule)
+}
+
 fn proposal_from_classification(
     repository_root: &Path,
     working_directory: &Path,
@@ -753,6 +823,7 @@ fn proposal_from_classification(
         may_use_network: classification.may_use_network,
         reasons: classification.reasons,
         causes: classification.causes,
+        rule: classification.rule,
         created_at_ms: now_millis(),
         status: "pending".to_string(),
         purpose,
@@ -820,6 +891,15 @@ fn serialize_proposal(proposal: &CommandProposal) -> Result<String> {
             ClientError::InvalidInput(format!("Could not store approval causes: {error}"))
         })?,
     );
+    // Last, optional the same way: proposals stored before spec 111 Task 4
+    // have no deciding rule and read back with none.
+    write_field(
+        &mut output,
+        "RULE",
+        &serde_json::to_string(&proposal.rule).map_err(|error| {
+            ClientError::InvalidInput(format!("Could not store the deciding rule: {error}"))
+        })?,
+    );
     output.push_str("END_COMMAND_PROPOSAL\n");
     Ok(output)
 }
@@ -863,6 +943,12 @@ fn deserialize_proposal(raw: &str) -> Result<CommandProposal> {
     } else {
         Vec::new()
     };
+    let rule = if cursor.next_field_is("RULE") {
+        serde_json::from_str(&cursor.read_field("RULE")?)
+            .map_err(|_| ClientError::InvalidInput("Invalid command proposal rule".to_string()))?
+    } else {
+        None
+    };
     Ok(CommandProposal {
         id,
         command,
@@ -876,6 +962,7 @@ fn deserialize_proposal(raw: &str) -> Result<CommandProposal> {
         may_use_network,
         reasons,
         causes,
+        rule,
         created_at_ms,
         status,
         purpose,

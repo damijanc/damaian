@@ -1,4 +1,8 @@
 use crate::command_parse::{PARAMETER_MARK, ShellParameters};
+use crate::command_rules::{
+    BuiltInDefault, CommandRule, Decider, RuleContext, RuleEvaluation, RuleVerdict,
+    evaluate_command,
+};
 use crate::config::{CommandAccess, Config, ConfigScope, RepositoryConfigReport};
 use crate::error::Result;
 use crate::path_policy::PathPolicy;
@@ -38,11 +42,39 @@ impl CommandRisk {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ApprovalCause {
+    /// Read back from proposals stored before command rules decided (spec
+    /// 111 Task 4); a command is now denied by a [`Self::RuleDenied`].
     Blocklisted {
         rule: String,
     },
+    /// Read back from proposals stored before command rules decided; a
+    /// command is now blocked by a [`Self::BuiltInDefault`].
     Destructive {
         pattern: String,
+    },
+    /// A `deny` command rule decided (spec 111 D7). `rule` is the rule as
+    /// written (`deny git push *`), `source` where it came from.
+    RuleDenied {
+        rule: String,
+        source: String,
+    },
+    /// An `ask` command rule decided.
+    RuleAsks {
+        rule: String,
+        source: String,
+    },
+    /// One of Damaian's built-in defaults blocked the command and no rule of
+    /// the user's allows it (spec 111 D5). `name` is
+    /// [`BuiltInDefault::as_str`]; `detail` what it saw ("recursive `rm` of
+    /// `/`").
+    BuiltInDefault {
+        name: String,
+        detail: String,
+    },
+    /// The command cannot be analysed, so it asks and no rule can allow it
+    /// (spec 111 requirement 4). Only named when nothing else asks.
+    Unanalysable {
+        reason: String,
     },
     ShellControl {
         constructs: String,
@@ -87,6 +119,10 @@ impl ApprovalCause {
         match self {
             Self::Blocklisted { .. } => "blocklisted",
             Self::Destructive { .. } => "destructive",
+            Self::RuleDenied { .. } => "rule_denied",
+            Self::RuleAsks { .. } => "rule_asks",
+            Self::BuiltInDefault { .. } => "built_in_default",
+            Self::Unanalysable { .. } => "unanalysable",
             Self::ShellControl { .. } => "shell_control",
             Self::Docker => "docker",
             Self::HighRisk { .. } => "high_risk",
@@ -107,6 +143,25 @@ impl ApprovalCause {
                 format!("Blocked: matches *Commands that are always blocked* (`{rule}`)")
             }
             Self::Destructive { pattern } => format!("Blocked: `{pattern}` can destroy work"),
+            Self::RuleDenied { rule, source } => {
+                format!(
+                    "Blocked by {} `{rule}` ({source} config)",
+                    rule_owner(source)
+                )
+            }
+            Self::RuleAsks { rule, source } => {
+                format!(
+                    "Asks first: {} `{rule}` ({source} config)",
+                    rule_owner(source)
+                )
+            }
+            Self::BuiltInDefault { detail, .. } => {
+                format!("Blocked: Damaian would block this ({detail}); no rule of yours allows it")
+            }
+            Self::Unanalysable { reason } => format!(
+                "Asks first: Damaian cannot analyse this command (it {reason}), so no rule can \
+                 allow it"
+            ),
             Self::ShellControl { constructs } => format!(
                 "Asks first: uses {constructs} — Damaian never runs shell control without asking"
             ),
@@ -144,6 +199,104 @@ impl ApprovalCause {
     }
 }
 
+/// "your rule", "repository rule": whose rule a card names (spec 111 D7).
+fn rule_owner(source: &str) -> String {
+    match source {
+        "user" => "your rule".to_string(),
+        "admin" => "the administrator's rule".to_string(),
+        other => format!("{other} rule"),
+    }
+}
+
+/// What decided a command under the command rules (spec 111 D7), for the
+/// card and the audit: the rule as written and its source, or Damaian's
+/// built-in default. Stored with the proposal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DecidingRule {
+    /// `allow`, `ask` or `deny`.
+    pub effect: String,
+    /// The rule as written (`allow rm -rf /tmp/**`), or for a built-in
+    /// default what it saw (recursive `rm` of `/`).
+    pub rule: String,
+    /// `user`, `admin`, `repository`, `profile`, `session`, or `default`
+    /// for a built-in default.
+    pub source: String,
+    /// The built-in block a user's `allow` lifted, when it did.
+    pub overrides: Option<BuiltInOverride>,
+}
+
+/// A built-in default a rule of the user's overrode (D7): warned on the card
+/// and audited as `command_rule_override`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BuiltInOverride {
+    /// [`BuiltInDefault::as_str`], the name the audit record carries.
+    pub name: String,
+    /// What the default saw: recursive `rm` of `/tmp`.
+    pub detail: String,
+}
+
+impl DecidingRule {
+    fn from_decider(decider: &Decider, effect: RuleVerdict) -> Self {
+        let effect = match effect {
+            RuleVerdict::Allow => "allow",
+            RuleVerdict::Ask => "ask",
+            _ => "deny",
+        };
+        match decider {
+            Decider::Rule(rule) => Self {
+                effect: effect.to_string(),
+                rule: rule.text(),
+                source: rule.source.as_str().to_string(),
+                overrides: None,
+            },
+            Decider::BuiltIn(denial) => Self {
+                effect: effect.to_string(),
+                rule: denial.detail.clone(),
+                source: "default".to_string(),
+                overrides: None,
+            },
+        }
+    }
+
+    /// The card's line naming what decided: "Allowed by your rule `allow
+    /// cargo test` (user config)".
+    pub fn summary(&self) -> String {
+        if self.source == "default" {
+            return format!("Damaian's default: {}", self.rule);
+        }
+        let verb = match self.effect.as_str() {
+            "allow" => "Allowed by",
+            "ask" => "Asked by",
+            _ => "Denied by",
+        };
+        format!(
+            "{verb} {} `{}` ({} config)",
+            rule_owner(&self.source),
+            self.rule,
+            self.source
+        )
+    }
+
+    /// The warning a card shows when this rule lifted a built-in block (D7):
+    /// "Damaian would block this: recursive `rm` of `/tmp`. Your rule `…`
+    /// allows it."
+    pub fn warning(&self) -> Option<String> {
+        let overridden = self.overrides.as_ref()?;
+        let owner = rule_owner(&self.source);
+        let mut owner_capitalised = owner.chars();
+        let owner = owner_capitalised
+            .next()
+            .map(|first| first.to_uppercase().collect::<String>() + owner_capitalised.as_str())
+            .unwrap_or_default();
+        Some(format!(
+            "Damaian would block this: {}. {owner} `{}` allows it.",
+            overridden.detail, self.rule
+        ))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandClassification {
     pub command: String,
@@ -159,6 +312,9 @@ pub struct CommandClassification {
     pub causes: Vec<ApprovalCause>,
     pub expected_effects: String,
     pub may_use_network: bool,
+    /// The command rule or built-in default that decided (spec 111 D7);
+    /// `None` when no rule matched and Damaian's other defaults decided.
+    pub rule: Option<DecidingRule>,
 }
 
 impl CommandClassification {
@@ -181,6 +337,7 @@ impl CommandClassification {
             causes,
             expected_effects,
             may_use_network,
+            rule: None,
         }
     }
 
@@ -226,6 +383,23 @@ pub struct CommandPolicy {
     /// when the policy was built from a bare [`Config`], in which case the
     /// source is unknown and the `Setting` plain words omit it.
     sources: Option<BTreeMap<String, ConfigScope>>,
+    /// The report the policy was built with, so the migrated old command
+    /// keys keep the source of the scope that set them (spec 111 D6).
+    report: Option<RepositoryConfigReport>,
+    /// The user's home directory, so `~` in a command or a rule resolves;
+    /// without it such a command cannot be analysed (spec 111 Task 2).
+    home: Option<PathBuf>,
+    /// The old text checks (`command_blocklist`, `command_allowlist`, the
+    /// destructive patterns) decide instead of the command rules. Only the
+    /// equivalence corpus sets it, through [`Self::deciding_by_legacy_keys`].
+    legacy_keys_decide: bool,
+}
+
+/// `$HOME`, when it names an absolute directory.
+fn home_directory() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|home| home.is_absolute())
 }
 
 impl CommandPolicy {
@@ -233,7 +407,28 @@ impl CommandPolicy {
         Self {
             config,
             sources: None,
+            report: None,
+            home: home_directory(),
+            legacy_keys_decide: false,
         }
+    }
+
+    /// The policy as it decided before command rules (spec 111 Task 4): the
+    /// old keys and the destructive text patterns. Kept only so
+    /// `tests/command_rule_equivalence.rs` can replay the old decisions
+    /// beside the rules; it goes with the old keys (D6).
+    #[doc(hidden)]
+    pub fn deciding_by_legacy_keys(mut self) -> Self {
+        self.legacy_keys_decide = true;
+        self
+    }
+
+    /// Replaces the home directory `~` resolves to, for tests that must not
+    /// depend on the machine's.
+    #[doc(hidden)]
+    pub fn with_home(mut self, home: Option<PathBuf>) -> Self {
+        self.home = home;
+        self
     }
 
     /// [`Self::new`] with the source attribution `report` recorded, so the
@@ -252,7 +447,23 @@ impl CommandPolicy {
         Self {
             config,
             sources: Some(sources),
+            report: Some(report.clone()),
+            home: home_directory(),
+            legacy_keys_decide: false,
         }
+    }
+
+    /// Every command rule in force for the repository at `repository_root`,
+    /// in evaluation order within each source (D1, D10): the old keys read
+    /// as rules first, then the `command_rule` lines, so the user's own
+    /// rules win over a migrated entry of the same source.
+    pub fn command_rules(&self, repository_root: &Path) -> Vec<CommandRule> {
+        let mut rules = self
+            .config
+            .legacy_command_rules(repository_root, self.home.as_deref(), self.report.as_ref())
+            .rules;
+        rules.extend(self.config.command_rules.iter().cloned());
+        rules
     }
 
     /// The policy configuration in effect, so callers that need to reason
@@ -309,8 +520,21 @@ impl CommandPolicy {
         working_directory: &Path,
     ) -> CommandClassification {
         let location = relative_location(repository_root, working_directory);
-        let (mut classification, admission) = self.classify_pattern(command, location.as_deref());
-        if !classification.blocked && location.is_none() {
+        let (mut classification, admission) = self.classify_pattern(
+            command,
+            repository_root,
+            working_directory,
+            location.as_deref(),
+        );
+        // A command the user's rules allow runs as they decided (spec 111
+        // D2): no outside-the-repository default asks about it, since `allow
+        // rm -rf /tmp/**` names a place outside on purpose. The profile's
+        // `command_access` below still applies: a profile only tightens.
+        let allowed_by_rule = classification
+            .rule
+            .as_ref()
+            .is_some_and(|rule| rule.effect == "allow");
+        if !classification.blocked && !allowed_by_rule && location.is_none() {
             escalate(
                 &mut classification,
                 ApprovalCause::OutsideRepository {
@@ -388,6 +612,7 @@ impl CommandPolicy {
                 }
             }
         } else if !classification.blocked
+            && !allowed_by_rule
             && let Some(path) = escaping_path_outside_root(
                 &classification.command,
                 repository_root,
@@ -425,12 +650,23 @@ impl CommandPolicy {
     fn classify_pattern(
         &self,
         command: &str,
+        repository_root: &Path,
+        working_directory: &Path,
         location: Option<&str>,
     ) -> (CommandClassification, Option<Admission>) {
         let normalized = command.trim().to_string();
         let verdict = read_only_verdict(&normalized);
-        let (classification, admitted_read_only) =
-            self.classify_text(normalized, command, location, &verdict);
+        let (classification, admitted_read_only) = if self.legacy_keys_decide {
+            self.classify_by_legacy_keys(normalized, command, location, &verdict)
+        } else {
+            self.classify_text(
+                normalized,
+                command,
+                repository_root,
+                working_directory,
+                &verdict,
+            )
+        };
         let admitted = match verdict {
             ReadOnlyVerdict::Admitted(admission) if admitted_read_only => Some(admission),
             _ => None,
@@ -438,7 +674,196 @@ impl CommandPolicy {
         (classification, admitted)
     }
 
+    /// The command rules decide (spec 111 Task 4): a `deny` from any part
+    /// blocks, an all-`allow` chain runs, an `ask` asks; a command no rule
+    /// decides, and no built-in default blocks, goes to Damaian's other
+    /// defaults ([`Self::classify_by_defaults`]: read-only admission, the
+    /// approval causes). A command that cannot be analysed asks, or is
+    /// blocked when its text starts like a `deny` (D12).
     fn classify_text(
+        &self,
+        normalized: String,
+        command: &str,
+        repository_root: &Path,
+        working_directory: &Path,
+        verdict: &ReadOnlyVerdict,
+    ) -> (CommandClassification, bool) {
+        let rules = self.command_rules(repository_root);
+        let evaluation = evaluate_command(
+            &normalized,
+            &rules,
+            &RuleContext {
+                repository_root,
+                working_directory,
+                home: self.home.as_deref(),
+                // The user's opt-in reaches the rules only; the read-only
+                // boundary keeps the default set (D11).
+                shell_parameters: self.config.shell_parameters(),
+            },
+        );
+        match &evaluation {
+            RuleEvaluation::Unanalysable {
+                denied_by: Some(decider),
+                ..
+            } => (
+                self.denied_classification(normalized, command, decider),
+                false,
+            ),
+            RuleEvaluation::Unanalysable { reason, .. } => {
+                let (mut classification, admitted) =
+                    self.classify_by_defaults(normalized, command, verdict);
+                // Requirement 4: it asks whatever the defaults say. They
+                // already ask for nearly everything unanalysable, and then
+                // their cause is the clearer one.
+                if !classification.requires_approval && !classification.blocked {
+                    escalate(
+                        &mut classification,
+                        ApprovalCause::Unanalysable {
+                            reason: reason.clone(),
+                        },
+                    );
+                }
+                (classification, admitted)
+            }
+            RuleEvaluation::Parts(parts) => match evaluation.verdict() {
+                RuleVerdict::Deny => {
+                    let decider = parts
+                        .iter()
+                        .find(|part| part.verdict == RuleVerdict::Deny)
+                        .and_then(|part| part.decided_by.as_ref())
+                        .expect("a denied part names what denied it");
+                    (
+                        self.denied_classification(normalized, command, decider),
+                        false,
+                    )
+                }
+                RuleVerdict::Allow => (
+                    self.allowed_classification(normalized, command, parts),
+                    false,
+                ),
+                RuleVerdict::Ask => {
+                    let part = parts
+                        .iter()
+                        .find(|part| part.verdict == RuleVerdict::Ask)
+                        .expect("an asking chain has an asking part");
+                    let Some(Decider::Rule(rule)) = &part.decided_by else {
+                        unreachable!("only a rule asks; a built-in default only denies")
+                    };
+                    let (mut classification, admitted) =
+                        self.classify_by_defaults(normalized, command, verdict);
+                    let cause = ApprovalCause::RuleAsks {
+                        rule: rule.text(),
+                        source: rule.source.as_str().to_string(),
+                    };
+                    // The rule is what decided, so it leads the causes; the
+                    // defaults' own reasons follow it.
+                    classification.requires_approval = true;
+                    if classification.risk == CommandRisk::Low {
+                        classification.risk = CommandRisk::Medium;
+                    }
+                    classification.reasons.insert(0, cause.plain_words());
+                    classification.causes.insert(0, cause);
+                    classification.rule = Some(DecidingRule::from_decider(
+                        &Decider::Rule(rule.clone()),
+                        RuleVerdict::Ask,
+                    ));
+                    (classification, admitted)
+                }
+                RuleVerdict::Default => self.classify_by_defaults(normalized, command, verdict),
+            },
+        }
+    }
+
+    /// Blocked by a `deny` rule or a built-in default.
+    fn denied_classification(
+        &self,
+        normalized: String,
+        command: &str,
+        decider: &Decider,
+    ) -> CommandClassification {
+        let cause = match decider {
+            Decider::Rule(rule) => ApprovalCause::RuleDenied {
+                rule: rule.text(),
+                source: rule.source.as_str().to_string(),
+            },
+            Decider::BuiltIn(denial) => ApprovalCause::BuiltInDefault {
+                name: denial.default.as_str().to_string(),
+                detail: denial.detail.clone(),
+            },
+        };
+        let mut classification = CommandClassification::new(
+            normalized,
+            CommandRisk::Blocked,
+            true,
+            true,
+            vec![cause],
+            "Blocked by local policy".to_string(),
+            may_use_network(command),
+        );
+        classification.rule = Some(DecidingRule::from_decider(decider, RuleVerdict::Deny));
+        classification
+    }
+
+    /// Every part allowed by a rule of the user's (or admin's): it runs
+    /// without asking unless every command must ask. The card names the
+    /// rule of a part that lifted a built-in block first, so the warning is
+    /// never hidden behind an ordinary allow (D7).
+    fn allowed_classification(
+        &self,
+        normalized: String,
+        command: &str,
+        parts: &[crate::command_rules::PartDecision],
+    ) -> CommandClassification {
+        let deciding = parts
+            .iter()
+            .find(|part| part.overrides_built_in())
+            .or_else(|| parts.first())
+            .expect("an allowed chain has a part");
+        let mut rule = deciding
+            .decided_by
+            .as_ref()
+            .map(|decider| DecidingRule::from_decider(decider, RuleVerdict::Allow));
+        let overridden = deciding
+            .built_in
+            .as_ref()
+            .filter(|_| deciding.overrides_built_in());
+        if let (Some(rule), Some(denial)) = (rule.as_mut(), overridden) {
+            rule.overrides = Some(BuiltInOverride {
+                name: denial.default.as_str().to_string(),
+                detail: denial.detail.clone(),
+            });
+        }
+        // The same as the old allowlist branch: `require_approval_for_all_commands`
+        // still asks (spec 111 D10).
+        let causes = if self.config.require_approval_for_all_commands {
+            vec![self.setting_cause("require_approval_for_all_commands")]
+        } else {
+            Vec::new()
+        };
+        let mut classification = CommandClassification::new(
+            normalized,
+            // A lifted built-in block is still a dangerous command; the
+            // risk says so even though it runs as the user decided.
+            if overridden.is_some() {
+                CommandRisk::High
+            } else {
+                CommandRisk::Low
+            },
+            false,
+            self.config.require_approval_for_all_commands,
+            causes,
+            "Allowed by a command rule".to_string(),
+            may_use_network(command),
+        );
+        classification.rule = rule;
+        classification
+    }
+
+    /// The policy before command rules (spec 111 Task 4), for the
+    /// equivalence corpus only ([`Self::deciding_by_legacy_keys`]): the
+    /// blocklist prefix, the destructive text patterns and the exact
+    /// allowlist, then Damaian's other defaults.
+    fn classify_by_legacy_keys(
         &self,
         normalized: String,
         command: &str,
@@ -478,29 +903,10 @@ impl CommandPolicy {
             );
         }
 
+        // The allowlist was consulted after the shell-control gate.
         if contains_shell_control(&normalized) {
-            // Spec 64 requirement 6: the tokenizer, not this character scan,
-            // decides. A read-only pipeline, or an admitted command with `|`
-            // inside quotes, passes; every other operator, redirect and
-            // substitution is still caught here.
-            if matches!(verdict, ReadOnlyVerdict::Admitted(_)) {
-                return (self.read_only_classification(normalized), true);
-            }
-            let constructs = shell_control_constructs(&normalized);
-            return (
-                CommandClassification::new(
-                    normalized,
-                    CommandRisk::High,
-                    false,
-                    true,
-                    vec![ApprovalCause::ShellControl { constructs }],
-                    "Potential chained or redirected command effects".to_string(),
-                    may_use_network(command),
-                ),
-                false,
-            );
+            return self.classify_by_defaults(normalized, command, verdict);
         }
-
         let allowlisted = match location {
             Some("") => configured_exact_matches(&self.config.command_allowlist, &normalized),
             Some(relative) => configured_exact_matches(
@@ -524,6 +930,42 @@ impl CommandPolicy {
                     causes,
                     "Configured safe command".to_string(),
                     false,
+                ),
+                false,
+            );
+        }
+        self.classify_by_defaults(normalized, command, verdict)
+    }
+
+    /// Damaian's defaults for a command no command rule decided and no
+    /// built-in default blocks: shell control asks unless the read-only
+    /// boundary admits the pipeline (spec 64), then read-only admission and
+    /// the approval causes (spec 62). The `bool` is whether the command was
+    /// admitted as read-only, so `classify_at` checks its paths.
+    fn classify_by_defaults(
+        &self,
+        normalized: String,
+        command: &str,
+        verdict: &ReadOnlyVerdict,
+    ) -> (CommandClassification, bool) {
+        if contains_shell_control(&normalized) {
+            // Spec 64 requirement 6: the tokenizer, not this character scan,
+            // decides. A read-only pipeline, or an admitted command with `|`
+            // inside quotes, passes; every other operator, redirect and
+            // substitution is still caught here.
+            if matches!(verdict, ReadOnlyVerdict::Admitted(_)) {
+                return (self.read_only_classification(normalized), true);
+            }
+            let constructs = shell_control_constructs(&normalized);
+            return (
+                CommandClassification::new(
+                    normalized,
+                    CommandRisk::High,
+                    false,
+                    true,
+                    vec![ApprovalCause::ShellControl { constructs }],
+                    "Potential chained or redirected command effects".to_string(),
+                    may_use_network(command),
                 ),
                 false,
             );
@@ -766,8 +1208,25 @@ impl CommandPolicy {
 /// - `require_approval_for_all_commands` means "prompt me for everything",
 ///   which an allowlist entry cannot satisfy — offering the option there
 ///   would promise something the policy then refuses to honor.
+///
+/// Since spec 111 Task 4 the grant is a user command rule of the exact
+/// command, so a command no rule can say exactly is not eligible either: a
+/// `*` (a rule reads it as a wildcard, so the grant would cover more than
+/// was approved), or text the rule parser refuses (`$…`, a trailing `in
+/// /dir`).
 pub fn allow_always_eligible(config: &Config, command: &str, blocked: bool) -> bool {
-    !blocked && !config.require_approval_for_all_commands && !contains_shell_control(command.trim())
+    let command = command.trim();
+    !blocked
+        && !config.require_approval_for_all_commands
+        && !contains_shell_control(command)
+        && !command.contains('*')
+        && CommandRule::new(
+            crate::command_rules::RuleEffect::Allow,
+            command,
+            None,
+            crate::command_rules::RuleSource::User,
+        )
+        .is_ok()
 }
 
 /// Whether `command_access` lets this command run. `Local` judges the text,
@@ -943,6 +1402,23 @@ pub(crate) fn destructive_pattern(command: &str) -> Option<&'static str> {
         return Some("reboot");
     }
     None
+}
+
+/// [`destructive_pattern`] as the built-in default it stands for. Only a
+/// command that cannot be parsed is judged by its text this way (spec 111
+/// D12): a parsed one goes through the defaults over parsed parts.
+pub(crate) fn destructive_text_default(command: &str) -> Option<(BuiltInDefault, &'static str)> {
+    let pattern = destructive_pattern(command)?;
+    let default = match pattern {
+        "rm -rf" => BuiltInDefault::RecursiveRemove,
+        "git reset --hard" => BuiltInDefault::GitResetHard,
+        "git clean -fd" => BuiltInDefault::GitCleanForce,
+        "dd" => BuiltInDefault::DdToDevice,
+        "mkfs" => BuiltInDefault::MakeFilesystem,
+        "shutdown" => BuiltInDefault::Shutdown,
+        _ => BuiltInDefault::Reboot,
+    };
+    Some((default, pattern))
 }
 
 /// Whether `command` is in the admitted read-only form (spec 64 §5.1–§5.2):

@@ -3397,9 +3397,10 @@ impl Config {
     /// or one a rule pattern cannot say exactly; a blocklist entry that is
     /// not one command.
     ///
-    /// Nothing calls this to decide yet: until spec 111 Task 4 the old keys
-    /// decide in [`crate::command_policy`], and the equivalence corpus
-    /// (`tests/command_rule_equivalence.rs`) holds the two side by side.
+    /// [`crate::command_policy::CommandPolicy::command_rules`] puts these
+    /// before the `command_rule` lines, and they decide (spec 111 Task 4);
+    /// the equivalence corpus (`tests/command_rule_equivalence.rs`) replays
+    /// the old keys' decisions beside them.
     pub fn legacy_command_rules(
         &self,
         repository_root: &Path,
@@ -6960,7 +6961,7 @@ fn legacy_allow_rule(
             shell_parameters,
         },
     ) {
-        RuleEvaluation::Unanalysable { reason } => Err(format!("the command {reason}")),
+        RuleEvaluation::Unanalysable { reason, .. } => Err(format!("the command {reason}")),
         RuleEvaluation::Parts(_) => Ok(rule),
     }
 }

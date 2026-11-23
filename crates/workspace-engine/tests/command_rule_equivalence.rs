@@ -570,13 +570,6 @@ const KNOWN_DIFFERENCES: &[Known] = &[
         places: &[LEGACY_SUB_ROOT],
         commands: &["rm -rf .", "rm -rf ./", "rm -rf \".\"", "rm -rf '.'"],
     },
-    Known {
-        why: "a glob cannot be analysed, so it asks instead of matching the text pattern (D8)",
-        old: Old::Blocked,
-        new: RuleVerdict::Ask,
-        places: EVERYWHERE,
-        commands: &["rm -rf *"],
-    },
     // --- The migration of the old keys (D6) ---------------------------------
     Known {
         why: "another spelling of an allowlisted command is the same command: options as a \
@@ -616,23 +609,6 @@ const KNOWN_DIFFERENCES: &[Known] = &[
         new: RuleVerdict::Deny,
         places: LEGACY,
         commands: &["echo hi && git push", "sudo git push"],
-    },
-    Known {
-        why: "open for Task 4: a command that cannot be analysed asks and no rule applies to \
-              it (D8), so a blocklisted command written with `$…` asks instead of being blocked",
-        old: Old::Blocked,
-        new: RuleVerdict::Ask,
-        places: LEGACY,
-        commands: &["git push $REMOTE"],
-    },
-    Known {
-        why: "spec 111 D11 (2026-11-21): a parameter that may expand to nothing inside a path \
-              is unanalysable, so it asks; the old text pattern blocked these through the \
-              `rm -rf /` prefix. Open for Task 4, with `git push $REMOTE`",
-        old: Old::Blocked,
-        new: RuleVerdict::Ask,
-        places: EVERYWHERE,
-        commands: &["rm -rf /tmp/$1", "rm -rf /tmp/$!"],
     },
     Known {
         why: "D11: a parameter is matched as written, quotes aside, so the migrated `echo \"$@\"` \
@@ -802,7 +778,9 @@ fn differences(
         .chain(config.command_rules.iter().cloned())
         .collect();
     let shell_parameters = config.shell_parameters();
-    let policy = CommandPolicy::new_with_report(config, &report);
+    // The old keys decide here: since Task 4 the rules decide in the policy
+    // itself, and this test keeps the old decisions beside them.
+    let policy = CommandPolicy::new_with_report(config, &report).deciding_by_legacy_keys();
     let mut found = Vec::new();
     for &relative in directories {
         let directory = repository.root.join(relative);

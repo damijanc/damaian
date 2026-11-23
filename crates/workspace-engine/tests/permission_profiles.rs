@@ -3965,24 +3965,29 @@ fn a_blocklisted_command_is_blocked_with_its_rule() {
     assert!(classification.blocked);
     assert_eq!(
         classification.causes,
-        vec![ApprovalCause::Blocklisted {
-            rule: "git push".to_string()
+        // Read as the rule `deny git push *` (spec 111 D6), which the cause
+        // names with its source (D7).
+        vec![ApprovalCause::RuleDenied {
+            rule: "deny git push *".to_string(),
+            source: "user".to_string(),
         }]
     );
 }
 
 #[test]
-fn a_destructive_command_is_blocked_with_its_pattern() {
-    for (command, pattern) in [
-        ("rm -rf /", "rm -rf"),
-        ("git reset --hard", "git reset --hard"),
+fn a_destructive_command_is_blocked_with_its_built_in_default() {
+    // Spec 111 D5/D7: the built-in default names itself and what it saw.
+    for (command, name, detail) in [
+        ("rm -rf /", "recursive_remove", "recursive `rm` of `/`"),
+        ("git reset --hard", "git_reset_hard", "`git reset --hard`"),
     ] {
         let classification = classify(command);
         assert!(classification.blocked);
         assert_eq!(
             classification.causes,
-            vec![ApprovalCause::Destructive {
-                pattern: pattern.to_string()
+            vec![ApprovalCause::BuiltInDefault {
+                name: name.to_string(),
+                detail: detail.to_string(),
             }],
             "{command}"
         );

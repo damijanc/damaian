@@ -148,6 +148,7 @@ impl ChatOrchestrator {
                 causes: Vec::new(),
                 expected_effects: String::new(),
                 may_use_network: false,
+                rule: None,
             };
             let run_command_permitted = permits(
                 mode,

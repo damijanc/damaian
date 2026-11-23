@@ -310,11 +310,25 @@ pub(crate) fn handle_command_proposal(
         .validation_orchestrator
         .load_proposal(&proposal_id)
         .map_err(|error| error.to_string())?;
+    // What decided, for the card (spec 111 D7): the rule as written and its
+    // source, the line naming it, and the warning when a rule of the user's
+    // lifted a built-in block. `null` when no rule decided.
+    let optional = |text: Option<String>| {
+        text.map_or_else(
+            || "null".to_string(),
+            |text| format!("\"{}\"", escape_json(&text)),
+        )
+    };
+    let rule = proposal.rule.as_ref();
     let body = format!(
-        "{{\"proposalId\":\"{}\",\"workingDirectory\":\"{}\",\"repositoryRoot\":\"{}\"}}",
+        "{{\"proposalId\":\"{}\",\"workingDirectory\":\"{}\",\"repositoryRoot\":\"{}\",\"rule\":{},\"ruleSource\":{},\"ruleSummary\":{},\"ruleWarning\":{}}}",
         escape_json(&proposal.id),
         escape_json(&proposal.working_directory),
-        escape_json(&proposal.repository_root)
+        escape_json(&proposal.repository_root),
+        optional(rule.map(|rule| rule.rule.clone())),
+        optional(rule.map(|rule| rule.source.clone())),
+        optional(rule.map(|rule| rule.summary())),
+        optional(rule.and_then(|rule| rule.warning())),
     );
     write_response(stream, request, 200, "application/json", &body)
 }

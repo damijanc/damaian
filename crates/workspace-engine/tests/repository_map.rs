@@ -435,13 +435,15 @@ fn allow_always_in_a_sub_root_writes_a_qualified_grant_under_the_repository_id()
 
     assert_eq!(path, repo.user_config);
     let written = fs::read_to_string(&path).unwrap();
-    let root_id = repository_id_for_root(&repo.root);
     let api_id = repository_id_for_root(&repo.api);
+    // Spec 111 requirement 9: a user rule of the exact command in exactly
+    // the sub-root's directory.
     assert!(
         written.contains(&format!(
-            "command_allowlist.{root_id}=cd packages/api && npm test"
+            "command_rule=allow npm test in {}",
+            repo.api.to_string_lossy()
         )),
-        "the grant belongs to the repository, qualified with its directory: {written}"
+        "the grant is a rule qualified with its directory: {written}"
     );
     assert!(
         !written.contains(&api_id),
@@ -619,7 +621,7 @@ fn at_the_repository_root_nothing_changes() {
     );
 
     // The existing entry points store the root as both halves of the pair,
-    // and Allow Always writes a plain entry.
+    // and Allow Always writes a rule for the root directory.
     let engine = WorkspaceEngine::new(repo.load());
     let orchestrator = &engine.validation_orchestrator;
     assert_eq!(
@@ -634,14 +636,12 @@ fn at_the_repository_root_nothing_changes() {
         .allow_command_always(&proposal.id, "tester")
         .unwrap();
     let written = fs::read_to_string(&repo.user_config).unwrap();
-    let root_id = repository_id_for_root(&repo.root);
-    let line = written
-        .lines()
-        .find(|line| line.starts_with(&format!("command_allowlist.{root_id}=")))
-        .unwrap();
     assert!(
-        line.split('|').any(|entry| entry.trim() == "npm run build"),
-        "{line}"
+        written.contains(&format!(
+            "command_rule=allow npm run build in {}",
+            repo.root.to_string_lossy()
+        )),
+        "{written}"
     );
     let reloaded = repo.policy().classify("npm run build", &repo.root);
     assert_eq!(reloaded.risk, CommandRisk::Low);

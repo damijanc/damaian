@@ -753,8 +753,13 @@ fn user_scope_overlay_still_replaces_values() {
     assert!(config.secret_patterns.is_empty());
 }
 
+/// The checkout's directory as an Always allow rule names it.
+fn root_text(fixture: &Fixture) -> String {
+    fixture.root.to_string_lossy().into_owned()
+}
+
 #[test]
-fn allow_always_is_stored_in_user_config_under_the_repository_id() {
+fn allow_always_is_stored_in_user_config_as_a_rule_for_the_checkout() {
     let fixture = fixture("allow-always", "", "");
     let engine = WorkspaceEngine::new(fixture.base());
     let proposal = engine
@@ -770,9 +775,13 @@ fn allow_always_is_stored_in_user_config_under_the_repository_id() {
 
     assert_eq!(path, fixture.user_config);
     let written = fs::read_to_string(&path).unwrap();
-    let repository_id = repository_id_for_root(&fixture.root);
+    // Spec 111 requirement 9: the grant is a user rule of the exact command
+    // in the exact directory, which names this checkout.
     assert!(
-        written.contains(&format!("command_allowlist.{repository_id}=git push")),
+        written.contains(&format!(
+            "command_rule=allow git push in {}",
+            root_text(&fixture)
+        )),
         "user config should carry the grant: {written}"
     );
     assert_eq!(
@@ -805,7 +814,12 @@ fn allow_always_keeps_the_users_machine_wide_allowlist() {
     let config = fixture.load();
 
     assert!(config.command_allowlist.iter().any(|c| c == "ls -la"));
-    assert!(config.command_allowlist.iter().any(|c| c == "git push"));
+    assert!(
+        config
+            .command_rules
+            .iter()
+            .any(|rule| rule.text() == format!("allow git push in {}", root_text(&fixture)))
+    );
 
     fixture.cleanup();
 }
@@ -852,10 +866,13 @@ fn allow_always_is_idempotent() {
             .unwrap();
     }
 
-    let entries = fixture.load().command_allowlist;
+    let rules = fixture.load().command_rules;
 
     assert_eq!(
-        entries.iter().filter(|entry| *entry == "git push").count(),
+        rules
+            .iter()
+            .filter(|rule| rule.text() == format!("allow git push in {}", root_text(&fixture)))
+            .count(),
         1
     );
 
@@ -886,10 +903,12 @@ fn allow_always_does_not_transfer_to_another_checkout() {
     )
     .unwrap();
 
+    // The rule is the user's and loads everywhere, but it names the first
+    // checkout's directory, so the other checkout still asks.
+    let classification = CommandPolicy::new(config).classify("git push", &other);
     assert!(
-        config.command_allowlist.is_empty(),
-        "a grant is per checkout: {:?}",
-        config.command_allowlist
+        classification.requires_approval,
+        "a grant is per checkout: {classification:?}"
     );
 
     let _ = fs::remove_dir_all(other);
