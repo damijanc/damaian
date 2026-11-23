@@ -3801,6 +3801,11 @@ impl Config {
             &self.allow_file_edits.to_string(),
         );
         push_line(&mut output, "command_access", self.command_access.as_str());
+        // Spec 111 Task 5: every rule in force, in evaluation order within
+        // its source; Settings › Commands shows each one's source.
+        for rule in &self.command_rules {
+            push_line(&mut output, "command_rule", &rule.text());
+        }
         push_line(
             &mut output,
             "command_shell_parameters",

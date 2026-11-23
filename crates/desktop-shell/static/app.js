@@ -2714,6 +2714,294 @@ async function saveProjectChecks() {
   return payload;
 }
 
+// Spec 111 Task 5: Settings › Commands. The list is every command rule in
+// force for the selected repository, in evaluation order, with its source.
+// Only the user's own `command_rule` lines are editable; every edit sends the
+// whole list together with the one Settings read, so an Always allow written
+// meanwhile is refused rather than overwritten.
+let commandRulesPayload = null;
+// null: the form is closed; -1: adding a rule; n: editing the user's rule n.
+let commandRuleEditing = null;
+
+const COMMAND_RULE_SOURCES = {
+  user: "Your rule",
+  admin: "Administrator config",
+  repository: "This repository's config",
+  profile: "Permission profile",
+  session: "Approved for this session",
+};
+
+const commandRuleMenu = createContextMenu();
+
+async function refreshCommandRules(repoPath = repo()) {
+  const status = $("command-rules-status");
+  if (!status) return null;
+  const query = repoPath ? `?repo=${encodeURIComponent(repoPath)}` : "";
+  let payload;
+  try {
+    payload = await api(`/api/command-rules${query}`);
+  } catch (error) {
+    status.textContent = `Command rules could not be loaded: ${error.message}`;
+    return null;
+  }
+  if (repo() !== repoPath) return null;
+  renderCommandRules(payload);
+  return payload;
+}
+
+// Text with `code` spans, as the engine writes its descriptions.
+function appendTextWithCode(element, text) {
+  String(text)
+    .split("`")
+    .forEach((piece, index) => {
+      if (!piece) return;
+      if (index % 2) {
+        const code = document.createElement("code");
+        code.textContent = piece;
+        element.append(code);
+      } else {
+        element.append(piece);
+      }
+    });
+}
+
+function renderCommandRules(payload) {
+  commandRulesPayload = payload;
+  const rules = payload.rules || [];
+  const own = (payload.userRules || []).length;
+  const status = [
+    `${rules.length === 1 ? "1 rule" : `${rules.length} rules`} in force`,
+    `${own === 1 ? "1 of yours" : `${own} of yours`}, saved in ${payload.configPath}`,
+  ];
+  if (!repo()) status.push("open a folder to see its repository's rules too");
+  if ((payload.shellParameters || []).length) {
+    status.push(`shell parameters ${payload.shellParameters.join(" ")} allowed in rules`);
+  }
+  $("command-rules-status").textContent = `${status.join(" · ")}.`;
+
+  const notes = $("command-rules-notes");
+  const noteLines = [...(payload.notes || [])];
+  (payload.refused || []).forEach((refused) => {
+    const where = refused.source === "profile" ? "The permission profile's" : "This repository's";
+    const line = refused.line ? ` on line ${refused.line}` : "";
+    noteLines.push(
+      `${where} \`allow\` rule${line} is not applied: only your own rules can allow a command.`,
+    );
+  });
+  notes.replaceChildren(
+    ...noteLines.map((text) => {
+      const line = document.createElement("p");
+      appendTextWithCode(line, text);
+      return line;
+    }),
+  );
+  notes.hidden = noteLines.length === 0;
+
+  const list = $("command-rules-list");
+  if (!rules.length) {
+    const empty = document.createElement("div");
+    empty.className = "provider-empty-row";
+    empty.textContent =
+      "No command rules. Damaian's defaults below decide; add a rule to allow, ask about or block a command.";
+    list.replaceChildren(empty);
+  } else {
+    list.replaceChildren(...rules.map((rule) => commandRuleRow(rule, own)));
+  }
+
+  $("command-defaults-list").replaceChildren(
+    ...(payload.defaults || []).map((builtIn) => {
+      const row = document.createElement("div");
+      row.className = "settings-row command-rule-row";
+      const text = document.createElement("p");
+      text.className = "command-rule-text";
+      const effect = document.createElement("span");
+      effect.className = "command-rule-effect";
+      effect.dataset.effect = "deny";
+      effect.textContent = "deny";
+      const description = document.createElement("span");
+      description.className = "command-rule-description";
+      appendTextWithCode(description, builtIn.description);
+      text.append(effect, description);
+      row.append(text);
+      return row;
+    }),
+  );
+}
+
+function commandRuleRow(rule, ownCount) {
+  const row = document.createElement("div");
+  row.className = "settings-row command-rule-row";
+  row.dataset.source = rule.source;
+  const copy = document.createElement("div");
+  copy.className = "command-rule-copy";
+  const text = document.createElement("p");
+  text.className = "command-rule-text";
+  const effect = document.createElement("span");
+  effect.className = "command-rule-effect";
+  effect.dataset.effect = rule.effect;
+  effect.textContent = rule.effect;
+  const pattern = document.createElement("code");
+  pattern.textContent = rule.pattern;
+  text.append(effect, pattern);
+  if (rule.directory) {
+    const directory = document.createElement("code");
+    directory.textContent = rule.directory;
+    text.append("in", directory);
+  }
+  const meta = document.createElement("p");
+  let source = COMMAND_RULE_SOURCES[rule.source] || rule.source;
+  if (rule.line) source += ` · line ${rule.line}`;
+  if (rule.fromOldKey) source += " · read from an old command key";
+  meta.textContent = source;
+  copy.append(text, meta);
+  row.append(copy);
+
+  if (rule.userIndex !== null && rule.userIndex !== undefined) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "btn-icon command-rule-menu-btn";
+    button.title = "More options for this rule";
+    button.setAttribute("aria-label", `More options for rule ${rule.text}`);
+    button.setAttribute("aria-haspopup", "menu");
+    button.setAttribute("aria-expanded", "false");
+    button.innerHTML = '<span class="dots-icon" aria-hidden="true"></span>';
+    button.addEventListener("click", (event) => {
+      event.stopPropagation();
+      toggleCommandRuleMenu(rule, ownCount, button);
+    });
+    row.append(button);
+  }
+  return row;
+}
+
+function toggleCommandRuleMenu(rule, ownCount, anchorEl) {
+  const index = rule.userIndex;
+  const run = (action) => () => {
+    void action().catch((error) => toast(error.message));
+  };
+  commandRuleMenu.toggle(anchorEl, {
+    key: `command-rule\n${index}`,
+    sections: [
+      [{ label: "Edit", action: "edit", onSelect: () => openCommandRuleForm(index) }],
+      [
+        {
+          label: "Move up",
+          action: "move-up",
+          disabled: index === 0,
+          onSelect: run(() => moveCommandRule(index, -1)),
+        },
+        {
+          label: "Move down",
+          action: "move-down",
+          disabled: index >= ownCount - 1,
+          onSelect: run(() => moveCommandRule(index, 1)),
+        },
+      ],
+      [
+        {
+          label: "Delete",
+          action: "delete",
+          danger: true,
+          onSelect: run(() => deleteCommandRule(index)),
+        },
+      ],
+    ],
+  });
+}
+
+async function saveCommandRules(rules) {
+  const payload = await api(
+    "/api/command-rules",
+    form({
+      repo: repo(),
+      rules: rules.join("\n"),
+      previous: (commandRulesPayload?.userRules || []).join("\n"),
+    }),
+  );
+  renderCommandRules(payload);
+  return payload;
+}
+
+async function moveCommandRule(index, offset) {
+  const rules = [...(commandRulesPayload?.userRules || [])];
+  const target = index + offset;
+  if (target < 0 || target >= rules.length) return;
+  [rules[index], rules[target]] = [rules[target], rules[index]];
+  await saveCommandRules(rules);
+}
+
+async function deleteCommandRule(index) {
+  const rules = [...(commandRulesPayload?.userRules || [])];
+  const text = rules[index];
+  if (text === undefined) return;
+  const confirmed = await confirmDialog(
+    "Delete command rule?",
+    `Delete your rule "${text}"? Commands it decided go back to the other rules and Damaian's defaults.`,
+    { danger: true, confirmLabel: "Delete" },
+  );
+  if (!confirmed) return;
+  rules.splice(index, 1);
+  await saveCommandRules(rules);
+  if (commandRuleEditing !== null) closeCommandRuleForm();
+  toast("Command rule deleted");
+}
+
+function openCommandRuleForm(index = -1) {
+  const rule =
+    index >= 0 ? (commandRulesPayload?.rules || []).find((each) => each.userIndex === index) : null;
+  commandRuleEditing = rule ? index : -1;
+  $("command-rule-effect").value = rule ? rule.effect : "allow";
+  $("command-rule-pattern").value = rule ? rule.pattern : "";
+  $("command-rule-directory").value = rule?.directory || "";
+  $("command-rule-save-btn").textContent = rule ? "Save rule" : "Add rule";
+  $("command-rule-error").hidden = true;
+  $("command-rule-form").hidden = false;
+  $("command-rule-pattern").focus();
+}
+
+function closeCommandRuleForm() {
+  commandRuleEditing = null;
+  $("command-rule-form").hidden = true;
+  $("command-rule-error").hidden = true;
+}
+
+// The rule as a `command_rule` value. A directory that a rule line cannot
+// name is refused here, because the parser would read it as part of the
+// command instead.
+function commandRuleFormText() {
+  const effect = $("command-rule-effect").value;
+  const pattern = $("command-rule-pattern").value.trim();
+  const directory = $("command-rule-directory").value.trim();
+  if (!pattern) throw new Error("Write the command the rule is for.");
+  if (directory) {
+    if (!(directory.startsWith("/") || directory === "~" || directory.startsWith("~/"))) {
+      throw new Error("The directory must start with / or ~.");
+    }
+    if (/\s/.test(directory)) throw new Error("The directory cannot contain spaces.");
+    return `${effect} ${pattern} in ${directory}`;
+  }
+  return `${effect} ${pattern}`;
+}
+
+async function submitCommandRuleForm() {
+  const error = $("command-rule-error");
+  try {
+    const text = commandRuleFormText();
+    const rules = [...(commandRulesPayload?.userRules || [])];
+    if (commandRuleEditing === null || commandRuleEditing < 0) {
+      rules.push(text);
+    } else {
+      rules[commandRuleEditing] = text;
+    }
+    await saveCommandRules(rules);
+    closeCommandRuleForm();
+    toast("Command rule saved");
+  } catch (failure) {
+    error.textContent = failure.message;
+    error.hidden = false;
+  }
+}
+
 function rootDisplayPath(path) {
   return path === "" ? "." : path;
 }
@@ -3990,6 +4278,7 @@ async function installAppUpdate() {
 function setSettingsPage(page) {
   const target = [
     "general",
+    "commands",
     "shortcuts",
     "checkpoints",
     "mcp",
@@ -4002,6 +4291,7 @@ function setSettingsPage(page) {
   if (target === "mcp") renderMcpConfigSelect();
   if (target === "checkpoints") void renderCheckpointList();
   if (target === "hooks") void renderSettingsHooks();
+  if (target === "commands") void refreshCommandRules();
   if (target === "general") void refreshLanguageServers().catch(() => {});
   document.querySelectorAll(".settings-nav-item").forEach((button) => {
     button.classList.toggle("active", button.dataset.settingsPage === target);
@@ -17971,6 +18261,13 @@ $("roots-add-btn").addEventListener("click", async () => {
   } catch (error) {
     toast(error.message);
   }
+});
+
+$("command-rule-add-btn").addEventListener("click", () => openCommandRuleForm(-1));
+$("command-rule-cancel-btn").addEventListener("click", () => closeCommandRuleForm());
+$("command-rule-form").addEventListener("submit", (event) => {
+  event.preventDefault();
+  void submitCommandRuleForm();
 });
 
 $("project-checks-save-btn").addEventListener("click", async () => {

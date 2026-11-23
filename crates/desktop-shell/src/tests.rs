@@ -9436,3 +9436,198 @@ fn app_js_edits_project_checks_in_settings() {
     assert!(super::APP_JS.contains("`/api/project-checks?repo=${encodeURIComponent(repoPath)}`"));
     assert!(super::APP_JS.contains("\"/api/project-checks\",\n    form({ repo: repoPath, checks: $(\"project-checks-editor\").value }),"));
 }
+
+/// Spec 111 Task 5: Settings › Commands lists Damaian's defaults and every
+/// rule in force with its source, and edits only the user's own
+/// `command_rule` lines, in user config. A repository's `ask`/`deny` is
+/// listed but not editable, its `allow` is refused and reported by line, and
+/// nothing is written into the repository. A list that changed since it was
+/// read, or a line the parser refuses, leaves user config as it was.
+#[test]
+fn command_rules_route_lists_sources_and_edits_only_user_rules() {
+    let repo = temp_shell_repo("command-rules");
+    let repository_config = "command_rule=deny git push *\ncommand_rule=allow make deploy\n";
+    fs::write(repo.join(".damaian/config.conf"), repository_config).unwrap();
+    let repo_str = repo.to_string_lossy().to_string();
+    let (port, token) = serve_for_test();
+    let url = format!(
+        "/api/command-rules?repo={}",
+        percent_encode_for_test(&repo_str)
+    );
+
+    let read = json_of(&get_for_test(port, &token, &url));
+    assert_eq!(read["defaults"].as_array().unwrap().len(), 7, "{read}");
+    assert_eq!(read["defaults"][0]["name"], "recursive_remove", "{read}");
+    let repository_rule = read["rules"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|rule| rule["source"] == "repository")
+        .cloned()
+        .expect("the repository's deny is listed");
+    assert_eq!(repository_rule["text"], "deny git push *", "{read}");
+    assert_eq!(repository_rule["line"], 1, "{read}");
+    assert!(repository_rule["userIndex"].is_null(), "{read}");
+    assert!(
+        read["rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|rule| rule["effect"] != "allow" || rule["source"] != "repository"),
+        "a repository allow never reaches the list: {read}"
+    );
+    assert_eq!(read["refused"][0]["source"], "repository", "{read}");
+    assert_eq!(read["refused"][0]["line"], 2, "{read}");
+    let previous = read["userRules"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|rule| rule.as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+
+    let mut added = previous.clone();
+    added.push("allow cargo test *".to_string());
+    added.push("ask npm publish * in ~/work".to_string());
+    let saved = post_fields_for_test(
+        port,
+        &token,
+        "/api/command-rules",
+        &[
+            ("repo", &repo_str),
+            ("rules", &added.join("\n")),
+            ("previous", &previous.join("\n")),
+        ],
+    );
+    assert!(saved.starts_with("HTTP/1.1 200"), "{saved}");
+    let payload = json_of(&saved);
+    let config_path = payload["configPath"].as_str().unwrap().to_string();
+    let written = fs::read_to_string(&config_path).unwrap();
+    assert!(
+        written.contains("command_rule=allow cargo test *"),
+        "{written}"
+    );
+    assert!(
+        written.contains("command_rule=ask npm publish * in ~/work"),
+        "{written}"
+    );
+    assert_eq!(
+        fs::read_to_string(repo.join(".damaian/config.conf")).unwrap(),
+        repository_config,
+        "nothing is written into the repository"
+    );
+    let rules = payload["rules"].as_array().unwrap();
+    let position = |text: &str| {
+        rules
+            .iter()
+            .position(|rule| rule["text"] == text)
+            .unwrap_or_else(|| panic!("{text} is listed: {payload}"))
+    };
+    assert!(
+        position("deny git push *") < position("allow cargo test *"),
+        "repository rules come before the user's, as they are evaluated: {payload}"
+    );
+    let own = &rules[position("ask npm publish * in ~/work")];
+    assert_eq!(own["source"], "user", "{payload}");
+    assert_eq!(own["directory"], "~/work", "{payload}");
+    assert_eq!(own["userIndex"], previous.len() + 1, "{payload}");
+
+    let stale = post_fields_for_test(
+        port,
+        &token,
+        "/api/command-rules",
+        &[
+            ("repo", &repo_str),
+            ("rules", ""),
+            ("previous", &previous.join("\n")),
+        ],
+    );
+    assert!(!stale.starts_with("HTTP/1.1 200"), "{stale}");
+    assert!(
+        stale.contains("changed since Settings read them"),
+        "{stale}"
+    );
+    let mut refused = added.clone();
+    refused.push("permit ls".to_string());
+    let invalid = post_fields_for_test(
+        port,
+        &token,
+        "/api/command-rules",
+        &[
+            ("repo", &repo_str),
+            ("rules", &refused.join("\n")),
+            ("previous", &added.join("\n")),
+        ],
+    );
+    assert!(!invalid.starts_with("HTTP/1.1 200"), "{invalid}");
+    assert!(
+        invalid.contains(&format!("Rule {}", refused.len())),
+        "{invalid}"
+    );
+    assert_eq!(
+        fs::read_to_string(&config_path).unwrap(),
+        written,
+        "a refused save leaves user config as it was"
+    );
+
+    // Reordering is the same write.
+    let mut reordered = added.clone();
+    let last = reordered.len() - 1;
+    reordered.swap(last - 1, last);
+    let moved = json_of(&post_fields_for_test(
+        port,
+        &token,
+        "/api/command-rules",
+        &[
+            ("repo", &repo_str),
+            ("rules", &reordered.join("\n")),
+            ("previous", &added.join("\n")),
+        ],
+    ));
+    assert_eq!(moved["userRules"][last - 1], "ask npm publish * in ~/work");
+
+    let cleared = json_of(&post_fields_for_test(
+        port,
+        &token,
+        "/api/command-rules",
+        &[
+            ("repo", &repo_str),
+            ("rules", &previous.join("\n")),
+            ("previous", &reordered.join("\n")),
+        ],
+    ));
+    assert_eq!(
+        cleared["userRules"].as_array().unwrap().len(),
+        previous.len()
+    );
+}
+
+/// Spec 111 Task 5: the Commands page exists, loads through the route, and
+/// sends every edit with the list it replaces.
+#[test]
+fn app_js_lists_and_edits_command_rules_in_settings() {
+    for id in [
+        "settings-page-commands",
+        "command-rules-status",
+        "command-rules-notes",
+        "command-rule-add-btn",
+        "command-rule-form",
+        "command-rule-effect",
+        "command-rule-pattern",
+        "command-rule-directory",
+        "command-rule-save-btn",
+        "command-rules-list",
+        "command-defaults-list",
+    ] {
+        assert!(super::INDEX_HTML.contains(&format!("id=\"{id}\"")), "{id}");
+    }
+    assert!(super::INDEX_HTML.contains("data-settings-page=\"commands\""));
+    assert!(super::APP_JS.contains("api(`/api/command-rules${query}`)"));
+    assert!(
+        super::APP_JS.contains("previous: (commandRulesPayload?.userRules || []).join(\"\\n\"),")
+    );
+    // Only the user's own rules get a ⋮ menu; Delete is in it, confirmed.
+    assert!(
+        super::APP_JS.contains("if (rule.userIndex !== null && rule.userIndex !== undefined) {")
+    );
+    assert!(super::APP_JS.contains("\"Delete command rule?\""));
+}

@@ -1058,3 +1058,198 @@ fn project_checks_json(repo: &str) -> Result<String, String> {
         list(&effective)
     ))
 }
+
+/// `GET /api/command-rules?repo=`: Settings › Commands (spec 111 Task 5).
+/// Damaian's built-in defaults, then every command rule in force for the
+/// repository in evaluation order (repository, profile, user, admin; D1),
+/// each with its source and whether it is one of the user's own
+/// `command_rule` lines, which are the only ones Settings edits. Without a
+/// repository the old keys cannot be read as rules (D10), so only the
+/// `command_rule` lines are listed.
+pub(crate) fn handle_command_rules(
+    stream: &mut TcpStream,
+    request: &Request,
+) -> Result<(), String> {
+    let repo = request.param("repo").unwrap_or_default();
+    if !repo.is_empty() {
+        validate_working_folder(&repo)?;
+    }
+    let body = command_rules_json(&repo)?;
+    write_response(stream, request, 200, "application/json", &body)
+}
+
+/// `POST /api/command-rules` with `rules` (the user's whole list, one
+/// `command_rule` value per line, in order) and `previous` (the list as
+/// Settings read it): replaces the user's `command_rule` lines in user
+/// config, never the repository's. Adding, editing, reordering and deleting
+/// are all this one write. A list that changed since Settings read it (an
+/// Always allow, or an edit by hand) is refused rather than overwritten, and
+/// so is any line the rule parser refuses, naming its position.
+pub(crate) fn handle_command_rules_set(
+    stream: &mut TcpStream,
+    request: &Request,
+) -> Result<(), String> {
+    let form = parse_form(&request.body);
+    let repo = form.get("repo").cloned().unwrap_or_default();
+    if !repo.is_empty() {
+        validate_working_folder(&repo)?;
+    }
+    let lines = |field: &str| -> Vec<String> {
+        form.get(field)
+            .map(String::as_str)
+            .unwrap_or_default()
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect()
+    };
+    let path = desktop_settings_config_path(None)?;
+    let mut overlay = workspace_engine::ConfigOverlay::load_or_default(&path)
+        .map_err(|error| error.to_string())?;
+    let current: Vec<String> = overlay
+        .command_rules
+        .iter()
+        .map(|rule| rule.text())
+        .collect();
+    if current != lines("previous") {
+        return Err(
+            "Your command rules changed since Settings read them. Reload the list and try again."
+                .to_string(),
+        );
+    }
+    let mut rules = Vec::new();
+    for (index, line) in lines("rules").iter().enumerate() {
+        let rule = workspace_engine::CommandRule::parse(line, workspace_engine::RuleSource::User)
+            .map_err(|error| format!("Rule {}: {error}", index + 1))?;
+        rules.push(rule);
+    }
+    overlay.command_rules = rules;
+    overlay.save(&path).map_err(|error| error.to_string())?;
+    let body = command_rules_json(&repo)?;
+    write_response(stream, request, 200, "application/json", &body)
+}
+
+fn command_rule_source_rank(source: workspace_engine::RuleSource) -> usize {
+    use workspace_engine::RuleSource;
+    match source {
+        RuleSource::Repository => 0,
+        RuleSource::Profile => 1,
+        RuleSource::User => 2,
+        RuleSource::Admin => 3,
+        RuleSource::Session => 4,
+    }
+}
+
+fn command_rules_json(repo: &str) -> Result<String, String> {
+    let path = desktop_settings_config_path(None)?;
+    let overlay = workspace_engine::ConfigOverlay::load_or_default(&path)
+        .map_err(|error| error.to_string())?;
+    let own: Vec<String> = overlay
+        .command_rules
+        .iter()
+        .map(|rule| rule.text())
+        .collect();
+    let (config, report) = config_and_report_for_repo(repo)?;
+
+    // The old keys read as rules first, then the `command_rule` lines, as
+    // `CommandPolicy::command_rules` evaluates them.
+    let mut listed: Vec<(workspace_engine::CommandRule, Option<usize>)> = Vec::new();
+    let mut notes = Vec::new();
+    if !repo.is_empty() {
+        let home = env::var_os("HOME")
+            .map(PathBuf::from)
+            .filter(|home| home.is_absolute());
+        let legacy = config.legacy_command_rules(Path::new(repo), home.as_deref(), Some(&report));
+        notes = legacy.deprecation_notes();
+        listed.extend(legacy.rules.into_iter().map(|rule| (rule, None)));
+    }
+    let mut user_index = 0;
+    for rule in &config.command_rules {
+        // The user's lines reach the config in file order and are never
+        // refused, so the n-th user rule is the n-th line of user config.
+        let index = (rule.source == workspace_engine::RuleSource::User).then(|| {
+            user_index += 1;
+            user_index - 1
+        });
+        let editable = index.filter(|index| own.get(*index) == Some(&rule.text()));
+        listed.push((rule.clone(), editable));
+    }
+    let legacy_count = listed.len() - config.command_rules.len();
+    let mut ordered: Vec<(usize, &(workspace_engine::CommandRule, Option<usize>))> =
+        listed.iter().enumerate().collect();
+    ordered.sort_by_key(|(_, (rule, _))| command_rule_source_rank(rule.source));
+    let rules = ordered
+        .iter()
+        .map(|(position, (rule, index))| {
+            format!(
+                "{{\"effect\":\"{}\",\"pattern\":\"{}\",\"directory\":{},\"text\":\"{}\",\"source\":\"{}\",\"line\":{},\"fromOldKey\":{},\"userIndex\":{}}}",
+                rule.effect.as_str(),
+                escape_json(&rule.pattern),
+                rule.directory.as_deref().map_or_else(
+                    || "null".to_string(),
+                    |directory| format!("\"{}\"", escape_json(directory))
+                ),
+                escape_json(&rule.text()),
+                rule.source.as_str(),
+                rule.line
+                    .map_or_else(|| "null".to_string(), |line| line.to_string()),
+                *position < legacy_count,
+                index.map_or_else(|| "null".to_string(), |index| index.to_string()),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let defaults = workspace_engine::BuiltInDefault::ALL
+        .iter()
+        .map(|default| {
+            format!(
+                "{{\"name\":\"{}\",\"description\":\"{}\"}}",
+                default.as_str(),
+                escape_json(default.description())
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    // A repository or profile `allow` never reaches the list (D2); Settings
+    // says it was refused and where.
+    let refused = report
+        .rejected_keys
+        .iter()
+        .map(|key| ("repository", key))
+        .chain(
+            report
+                .profile_rejected_keys
+                .iter()
+                .map(|key| ("profile", key)),
+        )
+        .filter(|(_, key)| key.key == "command_rule")
+        .map(|(source, key)| {
+            format!(
+                "{{\"source\":\"{source}\",\"line\":{}}}",
+                key.line
+                    .map_or_else(|| "null".to_string(), |line| line.to_string())
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let json_strings = |values: &[String]| {
+        values
+            .iter()
+            .map(|value| format!("\"{}\"", escape_json(value)))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    let shell_parameters = config
+        .command_shell_parameters
+        .iter()
+        .map(|parameter| parameter.as_str().to_string())
+        .collect::<Vec<_>>();
+    Ok(format!(
+        "{{\"configPath\":\"{}\",\"defaults\":[{defaults}],\"rules\":[{rules}],\"userRules\":[{}],\"notes\":[{}],\"refused\":[{refused}],\"shellParameters\":[{}]}}",
+        escape_json(&path.to_string_lossy()),
+        json_strings(&own),
+        json_strings(&notes),
+        json_strings(&shell_parameters),
+    ))
+}

@@ -105,6 +105,8 @@ pub(crate) enum Route {
     RepositoryRoots,
     ProjectChecks,
     ProjectChecksSet,
+    CommandRules,
+    CommandRulesSet,
     Symbols,
     SymbolReferences,
     LanguageServers,
@@ -302,6 +304,8 @@ pub(crate) const ROUTES: &[(&str, &str, Route)] = &[
     ("POST", "/api/repository-roots", Route::RepositoryRoots),
     ("GET", "/api/project-checks", Route::ProjectChecks),
     ("POST", "/api/project-checks", Route::ProjectChecksSet),
+    ("GET", "/api/command-rules", Route::CommandRules),
+    ("POST", "/api/command-rules", Route::CommandRulesSet),
     ("GET", "/api/symbols", Route::Symbols),
     ("GET", "/api/symbol-references", Route::SymbolReferences),
     ("GET", "/api/language-servers", Route::LanguageServers),
@@ -481,6 +485,9 @@ impl Route {
             // Spec 109 D9: the user's own config, like `/api/config-set`.
             | Route::ProjectChecks
             | Route::ProjectChecksSet
+            // Spec 111 Task 5: the user's own command rules, in user config.
+            | Route::CommandRules
+            | Route::CommandRulesSet
             | Route::Symbols
             | Route::SymbolReferences
             | Route::LanguageServers

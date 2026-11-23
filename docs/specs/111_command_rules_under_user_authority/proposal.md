@@ -3,7 +3,8 @@
 Status: In progress (specified 2026-11-12; started 2026-11-12, Tasks 1–4
 done: the parser, the rules beside the old policy, the migration of the old
 keys, and the rules deciding with cards and audit naming the rule; Task 3b
-(shell special parameters, D11) done 2026-11-23; Task 5 next; tasks in
+(shell special parameters, D11) done 2026-11-23; Task 5 (Settings: the rule
+list, sources and editing) done 2026-11-23; Task 6 next; tasks in
 [tasks.md](tasks.md))
 Order: 111 of 111
 Plan: none. Written from the owner's design discussion on 2026-11-12 (spec 109

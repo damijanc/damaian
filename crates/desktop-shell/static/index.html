@@ -493,6 +493,10 @@
               <span class="settings-nav-icon sliders-icon" aria-hidden="true"></span>
               <span>General</span>
             </button>
+            <button class="settings-nav-item" type="button" data-settings-page="commands">
+              <span class="settings-nav-icon prompt-icon" aria-hidden="true"></span>
+              <span>Commands</span>
+            </button>
             <button class="settings-nav-item" type="button" data-settings-page="shortcuts">
               <span class="settings-nav-icon keyboard-icon" aria-hidden="true"></span>
               <span>Shortcuts</span>
@@ -817,6 +821,87 @@
                 </button>
               </div>
             </div>
+          </section>
+        </section>
+
+        <section id="settings-page-commands" class="settings-page" data-page="commands">
+          <h2 class="settings-page-title">Commands</h2>
+          <p class="settings-page-hint">
+            Command rules decide whether a command runs without asking, asks you first, or is
+            blocked. Rules are checked top to bottom and the last one that matches decides. A
+            repository's config or a permission profile can only make a command ask or block it,
+            never allow it. Your rules are the <code>command_rule</code> lines in your user
+            configuration, and they decide over everything else.
+          </p>
+          <p id="command-rules-status" class="settings-page-hint"></p>
+          <div id="command-rules-notes" class="policy-warning command-rules-notes" hidden></div>
+          <section class="settings-section" id="command-rules-section">
+            <div class="section-heading">
+              <h3>Rules</h3>
+              <div class="inline-actions">
+                <button id="command-rule-add-btn" class="btn-quiet" type="button">
+                  Add a rule
+                </button>
+              </div>
+            </div>
+            <form id="command-rule-form" class="command-rule-form" hidden>
+              <div class="command-rule-fields">
+                <label class="field">
+                  <span>Effect</span>
+                  <select id="command-rule-effect">
+                    <option value="allow">Allow — run without asking</option>
+                    <option value="ask">Ask — ask me first</option>
+                    <option value="deny">Deny — block it</option>
+                  </select>
+                </label>
+                <label class="field">
+                  <span>Command</span>
+                  <input
+                    id="command-rule-pattern"
+                    type="text"
+                    spellcheck="false"
+                    autocomplete="off"
+                    placeholder="rm -rf /tmp/build/**"
+                  />
+                </label>
+                <label class="field">
+                  <span>Only in directory</span>
+                  <input
+                    id="command-rule-directory"
+                    type="text"
+                    spellcheck="false"
+                    autocomplete="off"
+                    placeholder="Any directory"
+                  />
+                </label>
+              </div>
+              <p class="settings-page-hint">
+                Write one command. In a path, <code>*</code> matches within one folder and
+                <code>**</code> across folders; a last word of <code>*</code> matches any further
+                arguments. Options of programs Damaian knows match in any spelling
+                (<code>-rf</code>, <code>-r -f</code>, <code>--recursive --force</code>). A
+                directory starts with <code>/</code> or <code>~</code>.
+              </p>
+              <p id="command-rule-error" class="command-rule-error" role="alert" hidden></p>
+              <div class="inline-actions">
+                <button id="command-rule-save-btn" class="btn-primary" type="submit">
+                  Save rule
+                </button>
+                <button id="command-rule-cancel-btn" class="btn-quiet" type="button">
+                  Cancel
+                </button>
+              </div>
+            </form>
+            <div id="command-rules-list" class="settings-list-card"></div>
+          </section>
+          <section class="settings-section" id="command-defaults-section">
+            <h3>Damaian's defaults</h3>
+            <p class="settings-page-hint">
+              Damaian blocks these when no rule of yours decides. They cannot be edited here. A
+              rule of yours that allows the command overrides them, and the approval card warns
+              when one does. Commands Damaian does not recognise ask; read-only ones run.
+            </p>
+            <div id="command-defaults-list" class="settings-list-card"></div>
           </section>
         </section>
 
