@@ -3536,11 +3536,22 @@ If an approved Docker command fails:
 
 `enable_semantic_search` is off by default because enabling it downloads an
 embedding model on first use. The download uses `curl`
-(`download_if_missing` in
+(`ensure_verified` in
 [embeddings.rs](../crates/workspace-engine/src/embeddings.rs)) and
 writes to `models/all-MiniLM-L6-v2/`. If that directory is missing or partial,
 the first search after enabling is doing the fetch. Delete the directory to
 force a clean re-download.
+
+Each file comes from a pinned revision on huggingface.co, or from the
+`embedding-model-all-MiniLM-L6-v2-1110a24` release on Damaian's GitHub
+repository when that fails, and is used only if its SHA-256 matches the one
+built into Damaian. When no source works, semantic search falls back to keyword
+search for the rest of that run, and a shell started from a terminal prints
+`Local semantic search disabled: Failed to download <file> …` with each source
+and why it failed: `download failed` (no network, a blocked host) or
+`SHA-256 <actual>, expected <expected>` (the source served different content;
+Damaian does not use it). A network that blocks huggingface.co still works
+through the GitHub copy.
 
 Two more reasons semantic results do not appear yet:
 

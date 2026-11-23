@@ -144,7 +144,7 @@ Because that file arrives with a clone, a repository can only make Damaian *more
 
 The first searches after turning it on also build the repository's vectors, 32 chunks at a time, for at most two seconds per search; until every chunk has a vector, search answers by keyword as before, so a large repository may take a few searches before semantic results appear. **Largest repository to embed**, under the toggle (`semantic_search_max_chunks`, default 100,000 chunks of about 2,400 characters), caps how much it indexes: a repository with more chunks keeps using keyword search, so memory stays bounded at about 1.5 KB per chunk. Only your user (or admin) config sets the cap; a repository cannot raise it.
 
-Turning it on downloads the embedding model on first use, into `models/all-MiniLM-L6-v2/` inside the [data directory](#local-data), so the first search afterwards is slower. If it seems to do nothing, see [Troubleshooting](TROUBLESHOOTING.md#semantic-search-does-nothing).
+Turning it on downloads the embedding model on first use, into `models/all-MiniLM-L6-v2/` inside the [data directory](#local-data), so the first search afterwards is slower. It comes from huggingface.co or, if that fails, from a copy on Damaian's GitHub releases. Damaian checks every file against a fixed SHA-256 before using it, and again each time it loads the model, so a changed, damaged or partial file is downloaded again rather than used. If it seems to do nothing, see [Troubleshooting](TROUBLESHOOTING.md#semantic-search-does-nothing).
 
 ### Language servers
 

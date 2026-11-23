@@ -425,6 +425,8 @@ Added 2026-10-24 after two flakes. Both were real defects, not test artefacts.
   window open by injecting an unreadable identity, and fails on the old code;
   `a_running_child_whose_identity_never_appears_fails_after_the_wait` and
   `a_pid_that_is_not_our_child_fails_without_waiting` pin the two bounds.
+  The full seven-check gate passed in CI on 2026-11-23 (Quality run
+  45176771013, on main with the fix).
 
 `a_reader_racing_registration_and_removal_never_sees_an_unreadable_entry`,
 `registering_a_child_that_already_exited_succeeds_and_records_nothing` and

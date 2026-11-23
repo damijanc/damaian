@@ -123,7 +123,9 @@ function orderedTags() {
   const tags = git("tag")
     .split("\n")
     .map((line) => line.trim())
-    .filter(Boolean);
+    // Only version tags are releases. Other tags name release assets that are
+    // not app versions, such as the embedding model's GitHub mirror.
+    .filter((tag) => /^v\d/.test(tag));
   // No date is read: the layout drops dates, and a `git log` per tag for a
   // field nothing renders is 40-odd subprocesses for nothing.
   const measured = tags.map((tag) => ({
