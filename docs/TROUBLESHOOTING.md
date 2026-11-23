@@ -264,7 +264,7 @@ remove one
 
 | Key | In repository config |
 |-----|----------------------|
-| `shell`, `command_path_from_interactive_shell`, `data_dir`, `allowed_roots`, `secret_patterns`, `audit_enabled`, `block_generated_secrets`, `enable_worker_sessions`, `language_server.<lang>`, `checkpoint_retention_days`, `checkpoint_max_total_bytes`, `checkpoint_census_max_paths`, any `model_*` (including `model_provider.<id>.*`) | Ignored, audited, reported to the user once per repository |
+| `shell`, `command_path_from_interactive_shell`, `data_dir`, `allowed_roots`, `secret_patterns`, `audit_enabled`, `block_generated_secrets`, `enable_worker_sessions`, `language_server.<lang>`, `checkpoint_retention_days`, `checkpoint_max_total_bytes`, `checkpoint_census_max_paths`, `semantic_search_max_chunks`, any `model_*` (including `model_provider.<id>.*`) | Ignored, audited, reported to the user once per repository |
 | `command_allowlist`, `command_allowlist.<repo_id>`, `permission_profile.<repo_id>`, `hook_review.<repo_id>.<hook_id>` | Never honoured: they are the user's decisions, and `Allow Always` writes user scope instead |
 | `hook.<id>.*` | A new hook is kept, and runs only after you review it; one that names a hook you or an admin defined is ignored |
 | `restricted_patterns`, `ignore_patterns`, `command_blocklist` | Added to the user's list, never replacing it |
@@ -3541,6 +3541,23 @@ embedding model on first use. The download uses `curl`
 writes to `models/all-MiniLM-L6-v2/`. If that directory is missing or partial,
 the first search after enabling is doing the fetch. Delete the directory to
 force a clean re-download.
+
+Two more reasons semantic results do not appear yet:
+
+- **The vectors are still being built.** Each search embeds for at most two
+  seconds and answers by keyword until every chunk has a vector. Progress is
+  kept in `vector-index/<repository_id>.bin` inside the data directory, which
+  grows as it fills; a few more searches finish it.
+- **The repository is over the cap.** A repository with more chunks than
+  `semantic_search_max_chunks` (default 100,000) is never embedded and always
+  answers by keyword. A desktop shell run from a terminal prints
+  `Semantic search skipped for <repo>: <n> chunks is over
+  semantic_search_max_chunks` once. Raise the cap in Settings › General if the
+  machine has the memory: each chunk keeps about 1.5 KB.
+
+Versions before 2026-11-23 embedded a whole repository in one call, which
+could take all of the machine's memory on the first semantic search. If that
+happened, update Damaian; the stored vectors need no cleanup.
 
 ### Terminal panel problems
 

@@ -130,7 +130,7 @@ Repository-scoped settings are not edited from Settings. Put repository defaults
 
 Because that file arrives with a clone, a repository can only make Damaian *more* careful, never less:
 
-- `shell`, `command_path_from_interactive_shell`, `data_dir`, `allowed_roots`, `secret_patterns`, `audit_enabled`, `block_generated_secrets`, `enable_worker_sessions`, `checkpoint_retention_days`, `checkpoint_max_total_bytes`, `checkpoint_census_max_paths`, `memory_retention_days`, every `language_server.<language>` key, and every `model_*` key are ignored in repository config. Damaian tells you once, per repository, when a repository tried to set one, and records it in the audit log.
+- `shell`, `command_path_from_interactive_shell`, `data_dir`, `allowed_roots`, `secret_patterns`, `audit_enabled`, `block_generated_secrets`, `enable_worker_sessions`, `checkpoint_retention_days`, `checkpoint_max_total_bytes`, `checkpoint_census_max_paths`, `semantic_search_max_chunks`, `memory_retention_days`, every `language_server.<language>` key, and every `model_*` key are ignored in repository config. Damaian tells you once, per repository, when a repository tried to set one, and records it in the audit log.
 - `restricted_patterns`, `ignore_patterns`, and `command_blocklist` are added to yours rather than replacing them.
 - The `require_approval_for_*` flags can be turned on by a repository, not off. MCP and individual MCP servers can be turned off, not on.
 - `command_allowlist` is never taken from repository config; *Allow Always* writes to your own config instead. See [Allow Always](#allow-always).
@@ -141,6 +141,8 @@ Because that file arrives with a clone, a repository can only make Damaian *more
 ### Semantic search
 
 **Settings → General → Semantic search** turns it on or off (`enable_semantic_search`, off by default). Off, Damaian finds relevant files for a request, and answers the assistant's `search_codebase` tool, by keyword and term overlap. On, it also uses an embedding model for that search, which can find files that use different words for the same idea.
+
+The first searches after turning it on also build the repository's vectors, 32 chunks at a time, for at most two seconds per search; until every chunk has a vector, search answers by keyword as before, so a large repository may take a few searches before semantic results appear. **Largest repository to embed**, under the toggle (`semantic_search_max_chunks`, default 100,000 chunks of about 2,400 characters), caps how much it indexes: a repository with more chunks keeps using keyword search, so memory stays bounded at about 1.5 KB per chunk. Only your user (or admin) config sets the cap; a repository cannot raise it.
 
 Turning it on downloads the embedding model on first use, into `models/all-MiniLM-L6-v2/` inside the [data directory](#local-data), so the first search afterwards is slower. If it seems to do nothing, see [Troubleshooting](TROUBLESHOOTING.md#semantic-search-does-nothing).
 

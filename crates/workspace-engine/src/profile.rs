@@ -388,6 +388,7 @@ pub fn split_profile_keys(overlay: ConfigOverlay) -> (ConfigOverlay, Vec<Rejecte
         checkpoint_max_total_bytes,
         checkpoint_census_max_paths,
         enable_semantic_search,
+        semantic_search_max_chunks,
         enable_worker_sessions,
         agent_max_tool_rounds,
         agent_web_debug_max_tool_rounds,
@@ -490,6 +491,10 @@ pub fn split_profile_keys(overlay: ConfigOverlay) -> (ConfigOverlay, Vec<Rejecte
         (
             "checkpoint_census_max_paths",
             checkpoint_census_max_paths.is_some(),
+        ),
+        (
+            "semantic_search_max_chunks",
+            semantic_search_max_chunks.is_some(),
         ),
         ("max_file_bytes", max_file_bytes.is_some()),
         (

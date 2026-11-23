@@ -565,6 +565,21 @@
               model (about 90&nbsp;MB) from huggingface.co; off, Damaian keeps using keyword and
               term-overlap search, as it does by default.
             </p>
+            <label class="field semantic-search-max-chunks-field">
+              <span>Largest repository to embed (chunks)</span>
+              <input
+                id="semantic-search-max-chunks-input"
+                type="number"
+                min="1"
+                step="1"
+                data-config-key="semantic_search_max_chunks"
+                disabled
+              />
+              <small class="field-note">
+                A chunk is about 2,400 characters of source and keeps about 1.5&nbsp;KB of memory
+                once embedded. A repository with more chunks uses keyword search instead.
+              </small>
+            </label>
           </section>
           <section class="settings-section" id="conversation-section">
             <h3>Conversation</h3>

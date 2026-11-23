@@ -353,6 +353,12 @@ fn weakening_cases() -> Vec<WeakeningCase> {
             Reported("checkpoint_census_max_paths"),
         ),
         case(
+            "semantic_search_max_chunks",
+            "",
+            "semantic_search_max_chunks=100000000\n",
+            Reported("semantic_search_max_chunks"),
+        ),
+        case(
             "max_read_lines",
             "max_read_lines=400\n",
             "max_read_lines=100000\n",

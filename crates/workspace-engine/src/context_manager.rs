@@ -1321,7 +1321,8 @@ pub struct ContextManager {
     path_policy: PathPolicy,
     scanner: SecretScanner,
     data_dir: PathBuf,
-    enable_semantic_search: bool,
+    /// `Some(max chunks)` when semantic search is on, `None` when it is off.
+    semantic_search: Option<usize>,
     repository_map: RepositoryMapSource,
     symbols: SymbolSource,
     /// The shares category budgeting divides the limit by (proposal §5.2).
@@ -1358,7 +1359,7 @@ impl ContextManager {
         path_policy: PathPolicy,
         scanner: SecretScanner,
         data_dir: PathBuf,
-        enable_semantic_search: bool,
+        semantic_search: Option<usize>,
         repository_map: RepositoryMapSource,
         symbols: SymbolSource,
         budget: ContextBudget,
@@ -1368,7 +1369,7 @@ impl ContextManager {
             path_policy,
             scanner,
             data_dir,
-            enable_semantic_search,
+            semantic_search,
             repository_map,
             symbols,
             budget,
@@ -1556,12 +1557,11 @@ impl ContextManager {
             .map(|index| index.keyword_search(prompt, 8))
             .unwrap_or_default();
         let semantic_hits = index
-            .map(|index| {
-                if self.enable_semantic_search {
-                    VectorIndexCache::semantic_search(&self.data_dir, index, prompt, 8)
-                } else {
-                    index.semantic_search(prompt, 8)
+            .map(|index| match self.semantic_search {
+                Some(max_chunks) => {
+                    VectorIndexCache::semantic_search(&self.data_dir, index, prompt, 8, max_chunks)
                 }
+                None => index.semantic_search(prompt, 8),
             })
             .unwrap_or_default();
 

@@ -114,7 +114,9 @@ impl WorkspaceEngine {
             path_policy.clone(),
             scanner.clone(),
             config.data_dir.clone(),
-            config.enable_semantic_search,
+            config
+                .enable_semantic_search
+                .then(|| crate::vector_index::semantic_search_max_chunks(&config)),
             RepositoryMapSource {
                 store: RepositoryMapStore::new(&config.data_dir, audit_log.clone()),
                 command_policy: command_policy.clone(),

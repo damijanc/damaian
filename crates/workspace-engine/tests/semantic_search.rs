@@ -130,7 +130,8 @@ fn vector_index_cache_finds_semantically_related_code_that_keyword_search_misses
     let keyword_hits = index.keyword_search(query, 5);
     let keyword_top_hit = keyword_hits.first().map(|hit| hit.path.as_str());
 
-    let semantic_hits = VectorIndexCache::semantic_search(&config.data_dir, &index, query, 5);
+    let semantic_hits =
+        VectorIndexCache::semantic_search(&config.data_dir, &index, query, 5, 100_000);
     let top_semantic_hit = semantic_hits
         .first()
         .expect("semantic search should return at least one result");
@@ -160,7 +161,7 @@ fn vector_index_cache_finds_semantically_related_code_that_keyword_search_misses
         .modified()
         .unwrap();
     std::thread::sleep(std::time::Duration::from_millis(20));
-    let _ = VectorIndexCache::semantic_search(&config.data_dir, &index, query, 5);
+    let _ = VectorIndexCache::semantic_search(&config.data_dir, &index, query, 5, 100_000);
     let modified_after = fs::metadata(&vector_index_path)
         .unwrap()
         .modified()

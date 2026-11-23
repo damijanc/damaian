@@ -182,6 +182,7 @@ pub fn rule_label(key: &str) -> Option<String> {
         "checkpoint_max_total_bytes" => "Checkpoint storage limit (bytes)",
         "checkpoint_census_max_paths" => "Changed files a command checkpoint covers",
         "enable_semantic_search" => "Semantic search",
+        "semantic_search_max_chunks" => "Most chunks semantic search embeds",
         "enable_worker_sessions" => "Worker sessions",
         "agent_max_tool_rounds" => "Tool rounds per turn",
         "agent_max_exploration_rounds" => "Read-only rounds per turn",

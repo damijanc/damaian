@@ -288,6 +288,7 @@ See [Semantic search](USER_GUIDE.md#semantic-search) and [Language servers](USER
 | Key | Default | Values | What it does | Repository may change it? |
 |---|---|---|---|---|
 | `enable_semantic_search` | `false` | `true`, `false` | Add embedding-based search. Downloads a small model on first use | Yes |
+| `semantic_search_max_chunks` | `100000` | A whole number | Most text chunks (about 2,400 characters each) of one repository that semantic search embeds; a larger repository uses keyword search instead. Each embedded chunk keeps about 1.5 KB in memory and on disk | No |
 | `language_server.<language>` | None | A command line. `<language>` is one of `go`, `java`, `javascript`, `kotlin`, `php`, `python`, `rust`, `typescript` | The language server Damaian starts for that language | No |
 
 ## Web

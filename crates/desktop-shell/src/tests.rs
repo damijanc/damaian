@@ -2463,6 +2463,30 @@ fn app_js_has_a_semantic_search_settings_toggle() {
     );
 }
 
+/// The cap on how large a repository semantic search embeds sits under the
+/// toggle, reads the effective value, and writes only a positive whole number.
+#[test]
+fn settings_offer_the_semantic_search_size_cap() {
+    assert!(
+        super::INDEX_HTML.contains(r#"id="semantic-search-max-chunks-input""#)
+            && super::INDEX_HTML.contains(r#"data-config-key="semantic_search_max_chunks""#),
+        "the Settings page must have the cap field"
+    );
+    let refresh = app_js_function("refreshSemanticSearchEnabled");
+    assert!(
+        refresh.contains(r#"entry.key === "semantic_search_max_chunks""#),
+        "{refresh}"
+    );
+    assert!(
+        super::APP_JS.contains(r#"form({ key: "semantic_search_max_chunks", value })"#),
+        "the cap must write through /api/config-set"
+    );
+    assert!(
+        super::APP_JS.contains(r#"!/^[1-9]\d*$/.test(value)"#),
+        "zero or a non-number must not be saved"
+    );
+}
+
 /// Spec 112 requirement 4 (D7): after a restart the sweep's recovery card is
 /// the one answerable copy of a question, and `restorePendingDecision` frames
 /// it; the transcript's copy keeps the question's text with no answer

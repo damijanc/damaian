@@ -497,6 +497,10 @@ pub struct Config {
     /// embedding model on first use (a one-time network fetch), which the
     /// user should opt into rather than have happen implicitly.
     pub enable_semantic_search: bool,
+    /// The most text chunks of one repository semantic search embeds (spec 02
+    /// §8). Past it the repository uses keyword search, so a monorepo cannot
+    /// hold vectors without limit; each chunk keeps about 1.5 KB.
+    pub semantic_search_max_chunks: u64,
     /// Off by default (spec 57 §5.0). On, every session that is not itself a
     /// worker is told how to write a `worker-prompt` handoff block. Off, the
     /// system prompt is byte-for-byte what it was before the setting existed.
@@ -1564,6 +1568,7 @@ impl Config {
             checkpoint_max_total_bytes,
             checkpoint_census_max_paths,
             enable_semantic_search,
+            semantic_search_max_chunks,
             enable_worker_sessions,
             agent_max_tool_rounds,
             agent_web_debug_max_tool_rounds,
@@ -2632,6 +2637,16 @@ impl Config {
         ) {
             self.checkpoint_census_max_paths = value;
             outcome.record(scope, "checkpoint_census_max_paths", None, false);
+        }
+        if let Some(value) = scoped(
+            semantic_search_max_chunks,
+            "semantic_search_max_chunks",
+            trusted,
+            forbidden,
+            rejected,
+        ) {
+            self.semantic_search_max_chunks = value;
+            outcome.record(scope, "semantic_search_max_chunks", None, false);
         }
 
         // Free: preferences and budgets, with no capability behind them. A
@@ -3849,6 +3864,11 @@ impl Config {
         );
         push_line(
             &mut output,
+            "semantic_search_max_chunks",
+            &self.semantic_search_max_chunks.to_string(),
+        );
+        push_line(
+            &mut output,
             "enable_worker_sessions",
             &self.enable_worker_sessions.to_string(),
         );
@@ -4083,6 +4103,7 @@ impl Default for Config {
             checkpoint_max_total_bytes: 1_073_741_824,
             checkpoint_census_max_paths: 1_000,
             enable_semantic_search: false,
+            semantic_search_max_chunks: 100_000,
             enable_worker_sessions: false,
             enable_index_watcher: true,
             // The segment ceiling (`ABSOLUTE_TOOL_ROUND_CAP`): at 8, a typical
@@ -4257,6 +4278,7 @@ pub struct ConfigOverlay {
     pub checkpoint_max_total_bytes: Option<u64>,
     pub checkpoint_census_max_paths: Option<u64>,
     pub enable_semantic_search: Option<bool>,
+    pub semantic_search_max_chunks: Option<u64>,
     pub enable_worker_sessions: Option<bool>,
     pub agent_max_tool_rounds: Option<u32>,
     pub agent_web_debug_max_tool_rounds: Option<u32>,
@@ -4475,6 +4497,9 @@ classify_overlay_fields! {
     checkpoint_max_total_bytes => Capability,
     checkpoint_census_max_paths => Capability,
     enable_semantic_search => Preference,
+    // A repository raising it could make semantic search hold more memory than
+    // the user allowed, so only user and admin config set it.
+    semantic_search_max_chunks => Capability,
     // Adds text to the user's system prompt; a clone must not (spec 57 §5.8).
     enable_worker_sessions => Capability,
     agent_max_tool_rounds => Preference,
@@ -4852,6 +4877,9 @@ impl ConfigOverlay {
                 self.checkpoint_census_max_paths = Some(parse_u64(key, value)?)
             }
             "enable_semantic_search" => self.enable_semantic_search = Some(parse_bool(key, value)?),
+            "semantic_search_max_chunks" => {
+                self.semantic_search_max_chunks = Some(parse_u64(key, value)?)
+            }
             "enable_worker_sessions" => self.enable_worker_sessions = Some(parse_bool(key, value)?),
             "agent_max_tool_rounds" => {
                 self.agent_max_tool_rounds = Some(parse_round_count(key, value)?)
@@ -5423,6 +5451,7 @@ impl ConfigOverlay {
             checkpoint_max_total_bytes,
             checkpoint_census_max_paths,
             enable_semantic_search,
+            semantic_search_max_chunks,
             enable_worker_sessions,
             agent_max_tool_rounds,
             agent_web_debug_max_tool_rounds,
@@ -5675,6 +5704,13 @@ impl ConfigOverlay {
         }
         if let Some(value) = enable_semantic_search {
             push_line(&mut output, "enable_semantic_search", &value.to_string());
+        }
+        if let Some(value) = semantic_search_max_chunks {
+            push_line(
+                &mut output,
+                "semantic_search_max_chunks",
+                &value.to_string(),
+            );
         }
         if let Some(value) = enable_worker_sessions {
             push_line(&mut output, "enable_worker_sessions", &value.to_string());

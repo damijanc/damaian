@@ -8663,14 +8663,23 @@ async function refreshConversationAutoCompact() {
 // the opposite of conversation_auto_compact's default-on reading above.
 async function refreshSemanticSearchEnabled() {
   const input = $("semantic-search-input");
+  const maxChunks = $("semantic-search-max-chunks-input");
   try {
     const payload = await api(`/api/effective-policy?repo=${encodeURIComponent(repo() || "")}`);
-    const rule = (payload.rules || []).find((entry) => entry.key === "enable_semantic_search");
+    const rules = payload.rules || [];
+    const rule = rules.find((entry) => entry.key === "enable_semantic_search");
     input.checked = rule?.value === "true";
     input.disabled = false;
+    const limit = rules.find((entry) => entry.key === "semantic_search_max_chunks");
+    maxChunks.value = limit?.value ?? "";
+    maxChunks.dataset.effective = maxChunks.value;
+    maxChunks.disabled = !limit;
   } catch {
     input.checked = false;
     input.disabled = true;
+    // Unknown reads as empty and disabled, as the task budget fields do.
+    maxChunks.value = "";
+    maxChunks.disabled = true;
   }
 }
 
@@ -18021,6 +18030,26 @@ $("semantic-search-input").addEventListener("change", async (event) => {
         ? "Semantic search on — the embedding model downloads on first use"
         : "Semantic search off",
     );
+  } catch (error) {
+    toast(errorMessage(error));
+    await refreshSemanticSearchEnabled();
+  }
+});
+
+$("semantic-search-max-chunks-input").addEventListener("change", async (event) => {
+  const input = event.target;
+  const value = String(input.value || "").trim();
+  if (value === input.dataset.effective) return;
+  if (input.validity?.badInput || !/^[1-9]\d*$/.test(value)) {
+    toast("Largest repository to embed must be a whole number above zero");
+    input.value = input.dataset.effective || "";
+    return;
+  }
+  try {
+    await api("/api/config-set", form({ key: "semantic_search_max_chunks", value }));
+    await loadConfigFile();
+    await refreshSemanticSearchEnabled();
+    toast(`Semantic search embeds repositories up to ${value} chunks`);
   } catch (error) {
     toast(errorMessage(error));
     await refreshSemanticSearchEnabled();

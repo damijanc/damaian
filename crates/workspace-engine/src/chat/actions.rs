@@ -618,6 +618,7 @@ impl ChatOrchestrator {
                             &index,
                             query,
                             *limit,
+                            crate::vector_index::semantic_search_max_chunks(&self.config),
                             &allowed,
                         )
                     } else {
