@@ -473,6 +473,8 @@ fn dispatch(
         Route::SessionRename => handle_session_rename(stream, request),
         Route::SessionArchive => handle_session_archive(stream, request, true),
         Route::SessionUnarchive => handle_session_archive(stream, request, false),
+        Route::CommandSessionApproval => handle_command_session_approval(stream, request),
+        Route::SessionApprovalsRevoke => handle_session_approvals_revoke(stream, request),
         Route::SessionMode => handle_session_mode(stream, request),
         // Spec 98 Task 4: the user's explicit protected-path control. Every
         // route is repository-bound, and writes go through the engine's

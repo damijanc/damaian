@@ -23,6 +23,14 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 
+/// One **Approve for this session** in force (spec 109 D5): the exact
+/// command text and the absolute directory it was approved in.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandSessionApproval {
+    pub command: String,
+    pub directory: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Session {
     pub id: String,
@@ -1349,7 +1357,11 @@ impl SessionStore {
                 ARCHIVE_RUNNING_WORKER_REFUSAL.to_string(),
             ));
         }
-        self.set_session_archived(session_id, true)
+        let session = self.set_session_archived(session_id, true)?;
+        // Archiving ends the session's command approvals (spec 109 D5); an
+        // unarchived session starts with none.
+        self.revoke_all_command_session_approvals(session_id, "archived")?;
+        Ok(session)
     }
 
     /// Returns an archived session to the default session list. Unarchiving
@@ -2051,6 +2063,119 @@ impl SessionStore {
             }
         }
         Ok(allowed)
+    }
+
+    /// Records **Approve for this session** of `command` in `directory`
+    /// (spec 109 D5). The caller has checked that the command qualifies;
+    /// this only makes the decision durable, so a restart keeps it.
+    pub fn approve_command_for_session(
+        &self,
+        session_id: &str,
+        command: &str,
+        directory: &str,
+        approved_by: &str,
+    ) -> Result<()> {
+        self.append_session_event(
+            session_id,
+            "command_session_approved",
+            &serde_json::json!({
+                "command": command.trim(),
+                "directory": directory,
+                "approvedBy": approved_by,
+            })
+            .to_string(),
+        )
+    }
+
+    /// Ends one session approval: a covered run changed the repository
+    /// (`reason` `changed_repository`, with the changed paths).
+    pub fn revoke_command_session_approval(
+        &self,
+        session_id: &str,
+        approval: &CommandSessionApproval,
+        reason: &str,
+        changed: &[String],
+    ) -> Result<()> {
+        self.append_session_event(
+            session_id,
+            "command_session_approval_revoked",
+            &serde_json::json!({
+                "command": approval.command,
+                "directory": approval.directory,
+                "reason": reason,
+                "changed": changed,
+            })
+            .to_string(),
+        )
+    }
+
+    /// Ends every session approval of the session (**Revoke session
+    /// approvals**, or archiving it). Writes nothing and returns 0 when there
+    /// is none.
+    pub fn revoke_all_command_session_approvals(
+        &self,
+        session_id: &str,
+        reason: &str,
+    ) -> Result<usize> {
+        let count = self.command_session_approvals(session_id)?.len();
+        if count > 0 {
+            self.append_session_event(
+                session_id,
+                "command_session_approvals_revoked",
+                &serde_json::json!({ "reason": reason, "count": count }).to_string(),
+            )?;
+        }
+        Ok(count)
+    }
+
+    /// The session approvals in force, oldest first (spec 109 D5). Only the
+    /// lines naming these events are parsed, since the policy asks for them
+    /// on every command a session's turn classifies.
+    pub fn command_session_approvals(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<CommandSessionApproval>> {
+        let Ok(content) = fs::read_to_string(self.session_log_path(session_id)) else {
+            return Ok(Vec::new());
+        };
+        let mut approvals: Vec<CommandSessionApproval> = Vec::new();
+        for (index, line) in content.lines().enumerate() {
+            if !line.contains("\"command_session_approv") {
+                continue;
+            }
+            let Some(event) = parse_event(line, index as u64 + 1) else {
+                continue;
+            };
+            let field = |name: &str| {
+                event
+                    .payload
+                    .get(name)
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string)
+            };
+            match event.event_type.as_str() {
+                "command_session_approved" => {
+                    if let (Some(command), Some(directory)) = (field("command"), field("directory"))
+                    {
+                        let approval = CommandSessionApproval { command, directory };
+                        if !approvals.contains(&approval) {
+                            approvals.push(approval);
+                        }
+                    }
+                }
+                "command_session_approval_revoked" => {
+                    if let (Some(command), Some(directory)) = (field("command"), field("directory"))
+                    {
+                        approvals.retain(|approval| {
+                            approval.command != command || approval.directory != directory
+                        });
+                    }
+                }
+                "command_session_approvals_revoked" => approvals.clear(),
+                _ => {}
+            }
+        }
+        Ok(approvals)
     }
 
     /// Appends a memory record to this session's log (spec 28 §5.3).

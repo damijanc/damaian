@@ -201,6 +201,7 @@ See [Permission Profiles](USER_GUIDE.md#permission-profiles), [Commits](USER_GUI
 | `allow_git_branches` | `true` | `true`, `false` | Whether Damaian may create, switch or delete branches | Turn off only |
 | `git_branch_prefix` | `damaian/` | Text, at most 200 characters | The prefix of a suggested branch name | Yes |
 | `allow_browser_diagnostics` | `true` | `true`, `false` | Whether [browser diagnostics](USER_GUIDE.md#browser-diagnostics) may run | Turn off only |
+| `session_command_approval` | `true` | `true`, `false` | Whether a command, check or baseline card may offer [Approve for this session](USER_GUIDE.md#approve-for-this-session) for a command that does not change the repository. Turning it off also stops earlier session approvals applying | Turn off only |
 | `allow_mutating_mcp_tools` | `true` | `true`, `false` | Whether MCP tools that are not marked read-only may be offered | Turn off only |
 
 ## Memory

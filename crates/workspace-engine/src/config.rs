@@ -461,6 +461,9 @@ pub struct Config {
     pub allow_file_edits: bool,
     pub command_access: CommandAccess,
     pub allow_browser_diagnostics: bool,
+    /// Whether a card may offer **Approve for this session** (spec 109 D5).
+    /// A repository may turn it off, never on.
+    pub session_command_approval: bool,
     pub allow_mutating_mcp_tools: bool,
     /// Whether this checkout may create commits at all (spec 35 §5.8). A
     /// commit is the first write to the user's repository, so it is a
@@ -1560,6 +1563,7 @@ impl Config {
             allow_file_edits,
             command_access,
             allow_browser_diagnostics,
+            session_command_approval,
             allow_mutating_mcp_tools,
             allow_git_commits,
             allow_git_branches,
@@ -1969,6 +1973,12 @@ impl Config {
                 "allow_browser_diagnostics",
                 &mut self.allow_browser_diagnostics,
                 allow_browser_diagnostics,
+                false,
+            ),
+            (
+                "session_command_approval",
+                &mut self.session_command_approval,
+                session_command_approval,
                 false,
             ),
             (
@@ -3821,6 +3831,11 @@ impl Config {
         );
         push_line(
             &mut output,
+            "session_command_approval",
+            &self.session_command_approval.to_string(),
+        );
+        push_line(
+            &mut output,
             "allow_mutating_mcp_tools",
             &self.allow_mutating_mcp_tools.to_string(),
         );
@@ -4100,6 +4115,7 @@ impl Default for Config {
             allow_file_edits: true,
             command_access: CommandAccess::All,
             allow_browser_diagnostics: true,
+            session_command_approval: true,
             allow_mutating_mcp_tools: true,
             allow_git_commits: true,
             allow_git_branches: true,
@@ -4270,6 +4286,7 @@ pub struct ConfigOverlay {
     pub allow_file_edits: Option<bool>,
     pub command_access: Option<CommandAccess>,
     pub allow_browser_diagnostics: Option<bool>,
+    pub session_command_approval: Option<bool>,
     pub allow_mutating_mcp_tools: Option<bool>,
     pub allow_git_commits: Option<bool>,
     /// Spec 36 D1: branch mutation is its own capability, beside commits, so a
@@ -4484,6 +4501,8 @@ classify_overlay_fields! {
     allow_file_edits => Capability,
     command_access => Capability,
     allow_browser_diagnostics => Capability,
+    // Spec 109 D5: a clone may turn **Approve for this session** off, never on.
+    session_command_approval => Capability,
     allow_mutating_mcp_tools => Capability,
     // Spec 35: a commit is the first write to the user's repository, so a
     // clone may refuse it and may never grant it.
@@ -4855,6 +4874,9 @@ impl ConfigOverlay {
             }
             "allow_browser_diagnostics" => {
                 self.allow_browser_diagnostics = Some(parse_bool(key, value)?)
+            }
+            "session_command_approval" => {
+                self.session_command_approval = Some(parse_bool(key, value)?)
             }
             "allow_mutating_mcp_tools" => {
                 self.allow_mutating_mcp_tools = Some(parse_bool(key, value)?)
@@ -5448,6 +5470,7 @@ impl ConfigOverlay {
             allow_file_edits,
             command_access,
             allow_browser_diagnostics,
+            session_command_approval,
             allow_mutating_mcp_tools,
             allow_git_commits,
             allow_git_branches,
@@ -5671,6 +5694,9 @@ impl ConfigOverlay {
         }
         if let Some(value) = allow_browser_diagnostics {
             push_line(&mut output, "allow_browser_diagnostics", &value.to_string());
+        }
+        if let Some(value) = session_command_approval {
+            push_line(&mut output, "session_command_approval", &value.to_string());
         }
         if let Some(value) = allow_mutating_mcp_tools {
             push_line(&mut output, "allow_mutating_mcp_tools", &value.to_string());

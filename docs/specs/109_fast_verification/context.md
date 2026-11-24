@@ -305,6 +305,60 @@ partly fixed by spec 107 D3), 86 (main-checkout test-process overhead) and 89
     payload carries `sessionApprovable` and the reason when not). A run that
     happens under it shows "Approved for this session" in its row. Baseline and
     check batch cards offer it per check.
+  - *How Task 5 read it (2026-11-24).* Settled while building it:
+    - *Which causes qualify.* `Unknown` and `Setting` for
+      `require_approval_for_risky_commands` only. `Setting` for
+      `require_approval_for_all_commands` refuses it, because spec 111 D13
+      keeps an allowed command asking while that key is on, so a session
+      rule could not lift it. `RuleAsks` refuses it: a rule that asks every
+      time (the user's, or a repository's tightening) is not lifted by a
+      session approval. `HookRequested` refuses it too. A command that
+      already runs without asking is not offered it.
+    - *The hint list grew.* `rm -rf src`, `mv`, `cp`, `git add` and the like
+      reach the policy only as `Unknown` inside the repository, so with
+      `is_source_writing_command` as it was they would have qualified. File
+      utilities whose job is to change files (`rm`, `rmdir`, `mv`, `cp`,
+      `touch`, `mkdir`, `ln`, `truncate`, `tee`, `install`, `patch`,
+      `unlink`, the writing `git` subcommands, `sed -i`, `perl -i`) and
+      `--bless` / `--update-snapshots` joined it. Still a hint list, not the
+      definition.
+    - *Git only.* The backstop reads Git, so outside a Git checkout the option
+      is not offered. Its state is `HEAD` plus `git --no-optional-locks status
+      --porcelain=v1 -z --untracked-files=all` with each listed path's content
+      hash (`session_approval::RepositoryState`); Damaian's own data
+      directory is left out when it lives inside the repository, since the
+      audit and session log are written while the command runs. A state Git
+      cannot read after the run counts as a change.
+    - *How the policy knows the session.* Thread-scoped, like the turn's
+      cancel token: `session_approval::with_session`, set by the engine's turn
+      entry points (`run_agentic_turn`, `verify_due`,
+      `resume_after_check_decision`, `resume_after_command_decision…`), so
+      every runner a turn reaches sees it without a signature change.
+      `CommandPolicy::command_rules` appends the session's approvals as
+      `CommandRule::session` rules last; outside a scope (the CLI, a settings
+      route, a detached card) there are none, which only means it asks.
+      `session_command_approval=false` from any scope drops them as well.
+    - *Events.* `command_session_approved {command, directory, approvedBy}`,
+      `command_session_approval_revoked {command, directory, reason,
+      changed}` and `command_session_approvals_revoked {reason, count}`
+      (Revoke, or archive). Unarchiving does not restore them.
+    - *Recording before running.* The card's choice calls `POST
+      /api/command-session-approval` (the engine checks the stored proposal
+      qualifies, writes the event and audits `command_approved_for_session`),
+      then approves the card through its ordinary route, so no decision
+      route or payload changed; that run is the first one the backstop
+      checks. A covered run that needed no card is run with `approvedBy =
+      session_approval` (audited on `stored_command_executed`).
+    - *Reporting a revocation.* The command's tool result gets the line, and
+      the outermost turn scope appends it to the turn's response, which covers
+      a check run by the verification loop as well. The session event and the
+      audit record are the durable record.
+    - *UI.* The command card's approval ⋮ (the existing escalation overflow,
+      where *Always allow* sits) carries **Approve for this session**; a check
+      or baseline card a **For this session** box per check beside *Always
+      allow*; both session ⋮ menus (the sidebar row's and the header's)
+      **Revoke session approvals**. Not offered on a worker's card or on a
+      detached (crash-recovered) card, which has no turn to scope it to.
 - **D6 — reuse (recommended).** Before proposing a check, if a `CheckRun` of the
   same identity is not stale, reuse it (no command, no card) and say so in the
   report.

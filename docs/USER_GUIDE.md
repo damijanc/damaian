@@ -2065,6 +2065,16 @@ The decision is stored in your config rather than in the repository because Dama
 
 *Allow Always* is not offered for blocked commands, for commands containing shell control syntax such as `|`, `&&`, or `>`, for a command a rule cannot say exactly (one containing `*`, which a rule reads as a wildcard, or one that cannot be analysed, such as `echo $HOME`), when `require_approval_for_all_commands` is set, or on a [worker's](#worker-sessions) command card. To allow such a command, write the rule yourself in **Settings → Commands**. An allowed command is still refused in Ask, Plan and Review modes ([Working Modes](#working-modes)).
 
+### Approve for this session
+
+A test, build or lint command such as `cargo test`, `stack test` or `go test ./...` asks every time while *Ask before test, build and lint commands* is on. When such a command does not change the repository, its approval card's ⋮ menu offers **Approve for this session**, and a check or baseline card offers **For this session** beside each check. Choosing it runs the command now and lets that exact command, in that exact directory, run without a card for the rest of this session. Its row in the conversation then reads *Ran `…` (approved for this session)*.
+
+Which commands are offered it does not depend on a list of languages or tools. It follows from why Damaian asks: only a command it asks about because it does not know the program, or because checks ask first, is offered it. A command is never offered it when it chains or redirects (`&&`, `|`, `;`, `>`), may use the network, runs Docker, reaches outside the repository, cannot be analysed (`make $TARGET`), is blocked, is something a rule of yours asks about every time, or is a known writer of files (a formatter without `--check`, anything with `--fix` or `--write`, `rm`, `mv`, `git add`, `sed -i`, …). It is not offered while *Ask before every command* is on, outside a Git checkout, or on a worker's card.
+
+After every run it covers, Damaian compares the repository before and after (Git's view of changed and untracked files, so ignored build output such as `target/` does not count). If the run changed anything, the approval is revoked at once, the turn says which files changed, and the next run asks again.
+
+It is never an *Always allow*: nothing is written to your config, another session or another directory still asks, and a new session starts with none. A restart keeps it. It ends when you archive or delete the session, or choose **Revoke session approvals** in the session's ⋮ menu. A repository may turn the option off with `session_command_approval=false`, which also stops earlier session approvals applying; it cannot turn it on. To let a command run without asking in every session, write a rule in **Settings → Commands** instead.
+
 ## Repository Roots
 
 A repository can hold several projects: a Cargo workspace and its member crates, or `packages/api` (Node) beside `packages/web`. Damaian calls each one a *root*. Each root has its own languages, manifests, entry points, test directories, `AGENTS.md` files and commands. A root's commands run in that root's directory, so `npm test` found in `packages/api` runs in `packages/api`, where its `package.json` is.

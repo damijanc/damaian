@@ -55,6 +55,8 @@ pub(crate) enum Route {
     SessionRename,
     SessionArchive,
     SessionUnarchive,
+    CommandSessionApproval,
+    SessionApprovalsRevoke,
     SessionMode,
     ContextPin,
     ContextRestriction,
@@ -206,6 +208,16 @@ pub(crate) const ROUTES: &[(&str, &str, Route)] = &[
     ("POST", "/api/session-rename", Route::SessionRename),
     ("POST", "/api/session-archive", Route::SessionArchive),
     ("POST", "/api/session-unarchive", Route::SessionUnarchive),
+    (
+        "POST",
+        "/api/command-session-approval",
+        Route::CommandSessionApproval,
+    ),
+    (
+        "POST",
+        "/api/session-approvals-revoke",
+        Route::SessionApprovalsRevoke,
+    ),
     ("POST", "/api/session-mode", Route::SessionMode),
     ("POST", "/api/context-pin", Route::ContextPin),
     (
@@ -458,6 +470,10 @@ impl Route {
             | Route::SessionArchive
             | Route::SessionDelete
             | Route::SessionUnarchive
+            // Spec 109 D5: records or ends a session approval and runs
+            // nothing; the approved run goes through its own resume route.
+            | Route::CommandSessionApproval
+            | Route::SessionApprovalsRevoke
             | Route::SessionMode
             | Route::ContextPin
             | Route::ContextRestriction
@@ -610,6 +626,8 @@ mod tests {
             "/api/sessions",
             "/api/session",
             "/api/session-archive",
+            "/api/command-session-approval",
+            "/api/session-approvals-revoke",
             "/api/session-delete",
             "/api/session-rename",
             "/api/config-set",

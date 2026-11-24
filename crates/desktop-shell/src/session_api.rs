@@ -753,6 +753,67 @@ pub(crate) fn handle_session_archive(
     write_response(stream, request, status, "application/json", &body)
 }
 
+/// `POST /api/command-session-approval` (spec 109 D5): **Approve for this
+/// session** of a command, check or baseline card's proposal. Records the
+/// session approval of the exact command in its exact directory, after the
+/// engine checks it qualifies under the repository's config; the client then
+/// approves the card as usual, and that run is the first one it covers.
+pub(crate) fn handle_command_session_approval(
+    stream: &mut TcpStream,
+    request: &Request,
+) -> Result<(), String> {
+    let form = parse_form(&request.body);
+    let session_id = required_form(&form, "session_id")?;
+    let proposal_id = required_form(&form, "proposal_id")?;
+    let repo = required_form(&form, "repo")?;
+    let engine = engine_for_repo(&repo)?;
+    let (status, body) = match engine.validation_orchestrator.approve_for_session(
+        &session_id,
+        &proposal_id,
+        "desktop_user",
+    ) {
+        Ok(approval) => (
+            200,
+            serde_json::json!({
+                "approved": true,
+                "command": approval.command,
+                "directory": approval.directory,
+            })
+            .to_string(),
+        ),
+        Err(error) => (
+            409,
+            serde_json::json!({ "error": error.to_string() }).to_string(),
+        ),
+    };
+    write_response(stream, request, status, "application/json", &body)
+}
+
+/// `POST /api/session-approvals-revoke` (spec 109 D5): **Revoke session
+/// approvals** from the session ⋮ menu. Answers how many it ended.
+pub(crate) fn handle_session_approvals_revoke(
+    stream: &mut TcpStream,
+    request: &Request,
+) -> Result<(), String> {
+    let form = parse_form(&request.body);
+    let session_id = required_form(&form, "session_id")?;
+    let engine = match form.get("repo").filter(|repo| !repo.is_empty()) {
+        Some(repo) => engine_for_repo(repo)?,
+        None => default_engine()?,
+    };
+    let revoked = engine
+        .validation_orchestrator
+        .revoke_session_approvals(&session_id, "desktop_user")
+        .map_err(|error| error.to_string())?;
+    write_response(
+        stream,
+        request,
+        200,
+        "application/json",
+        &serde_json::json!({ "revoked": revoked }).to_string(),
+    )
+}
+
 /// Spec 110 requirement 3: archive and delete are the only actions refused on
 /// a working session. The body names what it is doing, so the user knows what
 /// to stop. Checked before anything is read or written.

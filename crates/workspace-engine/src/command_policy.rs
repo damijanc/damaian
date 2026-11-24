@@ -266,6 +266,9 @@ impl DecidingRule {
         if self.source == "default" {
             return format!("Damaian's default: {}", self.rule);
         }
+        if self.source == "session" {
+            return "Approved for this session".to_string();
+        }
         let verb = match self.effect.as_str() {
             "allow" => "Allowed by",
             "ask" => "Asked by",
@@ -396,7 +399,7 @@ pub struct CommandPolicy {
 }
 
 /// `$HOME`, when it names an absolute directory.
-fn home_directory() -> Option<PathBuf> {
+pub(crate) fn home_directory() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .filter(|home| home.is_absolute())
@@ -463,7 +466,59 @@ impl CommandPolicy {
             .legacy_command_rules(repository_root, self.home.as_deref(), self.report.as_ref())
             .rules;
         rules.extend(self.config.command_rules.iter().cloned());
+        rules.extend(self.session_rules());
         rules
+    }
+
+    /// The approvals of the session whose turn runs on this thread, as
+    /// session rules (spec 109 D5, spec 111 D2), consulted last. None when no
+    /// turn set a session, or when config turned the option off: a
+    /// repository that disables it also stops earlier approvals applying.
+    fn session_rules(&self) -> Vec<CommandRule> {
+        if !self.config.session_command_approval {
+            return Vec::new();
+        }
+        let Some(session_id) = crate::session_approval::current_session() else {
+            return Vec::new();
+        };
+        crate::session::SessionStore::new(&self.config.data_dir)
+            .command_session_approvals(&session_id)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|approval| {
+                CommandRule::session(
+                    &approval.command,
+                    Path::new(&approval.directory),
+                    self.home.as_deref(),
+                    self.config.shell_parameters(),
+                )
+                .ok()
+            })
+            .collect()
+    }
+
+    /// Whether **Approve for this session** may be offered for `command` in
+    /// `working_directory` (spec 109 D5): `Ok` when it may, otherwise why
+    /// not, in words for the card.
+    pub fn session_approvable(
+        &self,
+        command: &str,
+        repository_root: &Path,
+        working_directory: &Path,
+    ) -> std::result::Result<(), String> {
+        let classification = self.classify_at(command, repository_root, working_directory);
+        match session_approval_refusal(
+            &self.config,
+            &classification.command,
+            &classification.causes,
+            classification.blocked,
+            classification.requires_approval,
+            repository_root,
+            working_directory,
+        ) {
+            None => Ok(()),
+            Some(reason) => Err(reason),
+        }
     }
 
     /// The policy configuration in effect, so callers that need to reason
@@ -1227,6 +1282,81 @@ pub fn allow_always_eligible(config: &Config, command: &str, blocked: bool) -> b
             crate::command_rules::RuleSource::User,
         )
         .is_ok()
+}
+
+/// Why **Approve for this session** is not offered for a command the policy
+/// classified with `causes` (spec 109 D5), or `None` when it is. Decided
+/// from why the policy asks, never from a list of languages or tools: a
+/// command qualifies only when Damaian does not know what its program does
+/// (`Unknown`) or the ask-before-checks setting asks (`Setting`), it is not a
+/// known writer of source files, and the repository is a Git checkout, so the
+/// backstop can see what each run changed.
+pub fn session_approval_refusal(
+    config: &Config,
+    command: &str,
+    causes: &[ApprovalCause],
+    blocked: bool,
+    requires_approval: bool,
+    repository_root: &Path,
+    working_directory: &Path,
+) -> Option<String> {
+    if !config.session_command_approval {
+        return Some("Approve for this session is turned off".to_string());
+    }
+    if blocked {
+        return Some("the command is blocked".to_string());
+    }
+    if !requires_approval {
+        return Some("the command runs without asking".to_string());
+    }
+    if config.require_approval_for_all_commands {
+        return Some("every command asks, because Ask before every command is on".to_string());
+    }
+    for cause in causes {
+        let refusal = match cause {
+            ApprovalCause::Unknown { .. } => continue,
+            ApprovalCause::Setting { key, .. } if key == "require_approval_for_risky_commands" => {
+                continue;
+            }
+            ApprovalCause::ShellControl { .. } => {
+                "it uses shell control (`&&`, `|`, `;` or a redirect)"
+            }
+            ApprovalCause::Network { .. } => "it may use the network",
+            ApprovalCause::Docker => "it runs Docker",
+            ApprovalCause::HighRisk { .. } => "it can change your system or repository",
+            ApprovalCause::OutsideRepository { .. } => "it reaches outside the repository",
+            ApprovalCause::RestrictedPath { .. } => "it reads a path the policy restricts",
+            ApprovalCause::RuleAsks { .. } => "a command rule asks for it every time",
+            ApprovalCause::Unanalysable { .. } => "Damaian cannot analyse it",
+            ApprovalCause::HookRequested { .. } => "a hook asked for approval",
+            ApprovalCause::Setting { .. } => "a setting asks before every command",
+            ApprovalCause::ProfileBlocked { .. }
+            | ApprovalCause::Blocklisted { .. }
+            | ApprovalCause::Destructive { .. }
+            | ApprovalCause::RuleDenied { .. }
+            | ApprovalCause::BuiltInDefault { .. } => "the command is blocked",
+        };
+        return Some(refusal.to_string());
+    }
+    if is_source_writing_command(command) {
+        return Some(
+            "it writes or removes files (a formatter, a `--fix`, or a program like `rm`)"
+                .to_string(),
+        );
+    }
+    if !crate::session_approval::is_git_checkout(repository_root) {
+        return Some(
+            "the repository is not a Git checkout, so Damaian cannot check what a run changed"
+                .to_string(),
+        );
+    }
+    CommandRule::session(
+        command,
+        working_directory,
+        home_directory().as_deref(),
+        config.shell_parameters(),
+    )
+    .err()
 }
 
 /// Whether `command_access` lets this command run. `Local` judges the text,
@@ -2809,6 +2939,53 @@ pub(crate) fn is_validation_command(command: &str) -> bool {
         || command.starts_with("cargo test")
 }
 
+/// Whether `command` is a formatter, fixer, generator or file utility known
+/// to write or remove files even though the policy asks about it only as an
+/// unknown program or a check. A check-only invocation (`--check`, `--dry-run`)
+/// writes nothing.
+///
+/// Spec 109 D5: such a command is never offered **Approve for this
+/// session**. A hint list that may grow, not the definition of what
+/// qualifies: the backstop after every covered run is.
+pub(crate) fn is_source_writing_command(command: &str) -> bool {
+    let normalized = command.trim().to_ascii_lowercase();
+    if normalized.contains("--check") || normalized.contains("--dry-run") {
+        return false;
+    }
+    let starts =
+        |prefix: &str| normalized == prefix || normalized.starts_with(&format!("{prefix} "));
+    starts("cargo fmt")
+        || starts("rustfmt")
+        || starts("gofmt")
+        || starts("goimports")
+        || starts("prettier")
+        || starts("biome format")
+        || starts("black")
+        || starts("isort")
+        || starts("clang-format")
+        || starts("swiftformat")
+        || starts("dart format")
+        || starts("npm run format")
+        || starts("npm run fmt")
+        || starts("npm run build")
+        || starts("yarn format")
+        || starts("pnpm format")
+        || normalized.contains(" --fix")
+        || normalized.contains(" --write")
+        || normalized.contains(" --bless")
+        || normalized.contains(" --update-snapshots")
+        // Programs whose job is to change files, which the policy may only
+        // call unknown inside the repository.
+        || [
+            "rm", "rmdir", "mv", "cp", "touch", "mkdir", "ln", "truncate", "tee", "install",
+            "patch", "unlink", "git add", "git rm", "git mv", "git apply", "git restore",
+            "git stash", "git clean", "git am", "git cherry-pick", "git revert", "git tag",
+        ]
+        .into_iter()
+        .any(starts)
+        || ((starts("sed") || starts("perl")) && normalized.contains(" -i"))
+}
+
 fn is_docker_command(command: &str) -> bool {
     command == "docker"
         || command.starts_with("docker ")
@@ -3758,5 +3935,83 @@ mod tests {
                 .is_none()
         );
         assert!(escaping_path_outside_root("git status --short", root, root).is_none());
+    }
+
+    /// Spec 109 D5: the writer hint list. Every entry is never offered
+    /// **Approve for this session**; a check-only spelling of a formatter is
+    /// not a writer.
+    #[test]
+    fn known_writers_are_source_writing_and_check_spellings_are_not() {
+        for command in [
+            "cargo fmt",
+            "cargo fmt --all",
+            "rustfmt src/lib.rs",
+            "gofmt -w .",
+            "goimports -w .",
+            "prettier src",
+            "biome format .",
+            "black .",
+            "isort .",
+            "clang-format -i a.c",
+            "swiftformat .",
+            "dart format .",
+            "npm run format",
+            "npm run fmt",
+            "npm run build",
+            "yarn format",
+            "pnpm format",
+            "cargo clippy --fix",
+            "eslint --fix .",
+            "prettier --write .",
+            "cargo insta test --bless",
+            "playwright test --update-snapshots",
+            "rm -rf build",
+            "rmdir build",
+            "mv a b",
+            "cp a b",
+            "touch a",
+            "mkdir a",
+            "ln -s a b",
+            "truncate -s 0 a",
+            "tee a",
+            "install -m 644 a b",
+            "patch -p1",
+            "unlink a",
+            "git add .",
+            "git rm a",
+            "git mv a b",
+            "git apply x.patch",
+            "git restore a",
+            "git stash",
+            "git clean -n",
+            "git am x.patch",
+            "git cherry-pick abc",
+            "git revert abc",
+            "git tag v1",
+            "sed -i s/a/b/ f",
+            "perl -i -pe s/a/b/ f",
+        ] {
+            assert!(
+                crate::command_policy::is_source_writing_command(command),
+                "{command}"
+            );
+        }
+        for command in [
+            "cargo fmt --all -- --check",
+            "prettier --check .",
+            "black --check .",
+            "rustfmt --check src/lib.rs",
+            "cargo test",
+            "stack test",
+            "go test ./...",
+            "sed s/a/b/ f",
+            "rmx",
+            "cargo build --dry-run",
+        ] {
+            assert!(
+                !crate::command_policy::is_source_writing_command(command),
+                "{command}"
+            );
+        }
     }
 }

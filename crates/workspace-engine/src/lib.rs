@@ -57,6 +57,7 @@ pub mod repository_trust;
 pub mod request_preparation;
 pub mod secret_scanner;
 pub mod session;
+pub mod session_approval;
 pub mod shell_path;
 pub mod stagnation;
 pub mod steering;
@@ -284,10 +285,11 @@ pub use request_preparation::{
 pub use secret_scanner::{Redaction, SecretFinding, SecretScanner};
 pub use session::{
     ARCHIVE_RUNNING_WORKER_REFUSAL, ActionMarker, ArchivedFilter, CallModel, ChatMessage,
-    ConsumedWorkerReturn, ContextPin, ContinuedTask, DanglingAction, ExportFormat, HandedPlan,
-    PatchFileDecision, PendingApprovalRef, PlanApproval, SearchOptions, Session, SessionSearchHit,
-    SessionSearchResult, SessionStore, Task, TaskModel, TaskStatus, TaskTerminalSettlement,
-    TaskUsage, TurnNotes, WorkerRecord, WorkerReturn, validate_plan_approval,
+    CommandSessionApproval, ConsumedWorkerReturn, ContextPin, ContinuedTask, DanglingAction,
+    ExportFormat, HandedPlan, PatchFileDecision, PendingApprovalRef, PlanApproval, SearchOptions,
+    Session, SessionSearchHit, SessionSearchResult, SessionStore, Task, TaskModel, TaskStatus,
+    TaskTerminalSettlement, TaskUsage, TurnNotes, WorkerRecord, WorkerReturn,
+    validate_plan_approval,
 };
 pub use stagnation::{
     RepairStall, RepairStallReason, detect_repair_stall, proposed_patch_digest, repair_state_entry,

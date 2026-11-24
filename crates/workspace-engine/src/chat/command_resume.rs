@@ -33,6 +33,40 @@ impl ChatOrchestrator {
         sink: &mut TurnSink<'_>,
         decision_options: ResumeDecisionOptions,
     ) -> Result<ChatTurnResult> {
+        // Spec 109 D5: the paused turn's session, for the approvals the
+        // command policy adds and the backstop around a covered run.
+        let Some(session_id) = PausedTurns::new(&self.config.data_dir).session_id(proposal_id)
+        else {
+            return self.resume_after_command_decision_in_scope(
+                proposal_id,
+                approved,
+                approved_by,
+                model_adapter,
+                sink,
+                decision_options,
+            );
+        };
+        in_session_scope(&session_id, || {
+            self.resume_after_command_decision_in_scope(
+                proposal_id,
+                approved,
+                approved_by,
+                model_adapter,
+                sink,
+                decision_options,
+            )
+        })
+    }
+
+    fn resume_after_command_decision_in_scope(
+        &self,
+        proposal_id: &str,
+        approved: bool,
+        approved_by: &str,
+        model_adapter: &mut dyn ModelAdapter,
+        sink: &mut TurnSink<'_>,
+        decision_options: ResumeDecisionOptions,
+    ) -> Result<ChatTurnResult> {
         let pending = self.pending_commands.take(proposal_id)?;
         let turn_notes = TurnNotesState::from_pending(&pending);
         // Every pause shares the pending-turn file, and each resume loads
@@ -361,7 +395,7 @@ impl ChatOrchestrator {
                     record.execution.purpose,
                 ));
                 after_tool_termination = Some(record.execution.termination);
-                sandbox_command_context(&record.execution)
+                command_context_with_revocation(&record)
             } else {
                 self.validation_orchestrator
                     .reject_proposal(proposal_id, approved_by)?;
