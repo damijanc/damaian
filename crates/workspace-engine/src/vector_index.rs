@@ -511,6 +511,8 @@ mod tests {
                     declarations: Vec::new(),
                     imports: Vec::new(),
                     terms: Vec::new(),
+                    name_terms: Vec::new(),
+                    symbol_terms: Vec::new(),
                     chunks: (0..chunks_per_file)
                         .map(|ordinal| TextChunk {
                             ordinal,

@@ -31,6 +31,7 @@ pub mod hooks;
 pub mod ignore;
 pub mod index_cache;
 pub mod indexer;
+mod keyword_rank;
 pub mod language;
 pub mod lsp;
 pub mod mcp;

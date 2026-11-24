@@ -43,6 +43,11 @@ pub struct FileRecord {
     pub declarations: Vec<Declaration>,
     pub imports: Vec<String>,
     pub terms: Vec<String>,
+    /// The path's parts, sorted and unique, and the same for every symbol
+    /// name: what search's naming check binary-searches, so a query does not
+    /// split thousands of symbol names again for every file (spec 02 §8).
+    pub name_terms: Vec<String>,
+    pub symbol_terms: Vec<String>,
     pub chunks: Vec<TextChunk>,
 }
 
@@ -90,36 +95,7 @@ impl RepositoryIndex {
         limit: usize,
         allowed: &dyn Fn(&str) -> bool,
     ) -> Vec<SearchResult> {
-        let query_terms = search_terms(query);
-        let demote_tests = !query_mentions_tests(&query_terms);
-        let mut scored = self
-            .files
-            .iter()
-            .filter(|record| allowed(&record.path))
-            .filter_map(|record| {
-                let score = demoted(
-                    score_record(record, &query_terms),
-                    demote_tests && is_test_path(&record.path),
-                );
-                (score > 0).then(|| {
-                    let chunk = best_keyword_chunk(record, &query_terms);
-                    SearchResult {
-                        path: record.path.clone(),
-                        language: record.language.clone(),
-                        symbols: record.symbols.clone(),
-                        imports: record.imports.clone(),
-                        score,
-                        snippet: chunk
-                            .map(|chunk| chunk.text.chars().take(500).collect())
-                            .unwrap_or_default(),
-                        lines: chunk.map(|chunk| chunk.lines),
-                    }
-                })
-            })
-            .collect::<Vec<_>>();
-        sort_results(&mut scored, demote_tests);
-        scored.truncate(limit);
-        scored
+        crate::keyword_rank::rank(self, query, limit, allowed)
     }
 
     pub fn semantic_search(&self, query: &str, limit: usize) -> Vec<SearchResult> {
@@ -136,43 +112,7 @@ impl RepositoryIndex {
         limit: usize,
         allowed: &dyn Fn(&str) -> bool,
     ) -> Vec<SearchResult> {
-        let query_terms = search_terms(query);
-        let demote_tests = !query_mentions_tests(&query_terms);
-        let mut scored = Vec::new();
-        for record in self.files.iter().filter(|record| allowed(&record.path)) {
-            let demote = demote_tests && is_test_path(&record.path);
-            let file_terms = tokenize(&format!("{} {}", record.path, record.symbols.join(" ")));
-            for chunk in &record.chunks {
-                let text_terms = tokenize(&chunk.text);
-                // A chunk is a hit only if its own text holds a term. The path
-                // and symbols are the whole file's, so counting them alone made
-                // every chunk of a matching file tie, and the hits were its
-                // first chunks rather than the one that matched. They still
-                // raise the score of a chunk that does match.
-                if !query_terms.iter().any(|term| text_terms.contains(term)) {
-                    continue;
-                }
-                let score = demoted(
-                    query_terms
-                        .iter()
-                        .filter(|term| text_terms.contains(*term) || file_terms.contains(*term))
-                        .count(),
-                    demote,
-                );
-                scored.push(SearchResult {
-                    path: record.path.clone(),
-                    language: record.language.clone(),
-                    symbols: record.symbols.clone(),
-                    imports: record.imports.clone(),
-                    score,
-                    snippet: chunk.text.chars().take(500).collect(),
-                    lines: Some(chunk.lines),
-                });
-            }
-        }
-        sort_results(&mut scored, demote_tests);
-        scored.truncate(limit);
-        scored
+        crate::keyword_rank::rank_chunks(self, query, limit, allowed)
     }
 }
 
@@ -237,31 +177,6 @@ pub(crate) fn is_test_path(path: &str) -> bool {
         || stem.starts_with("test_")
         || file.contains(".test.")
         || file.contains(".spec.")
-}
-
-/// A test file's score is halved, rounding up so a hit never vanishes,
-/// unless the query is about tests. Test files are large and cover every
-/// behaviour, so on equal footing they crowd out the code they test.
-pub(crate) fn demoted(score: usize, demote: bool) -> usize {
-    if demote { score.div_ceil(2) } else { score }
-}
-
-/// Highest score first; on a tie a non-test file before a test file when
-/// tests are demoted, then by path, so the order is total.
-fn sort_results(results: &mut [SearchResult], demote_tests: bool) {
-    results.sort_by(|left, right| {
-        right
-            .score
-            .cmp(&left.score)
-            .then_with(|| {
-                if demote_tests {
-                    is_test_path(&left.path).cmp(&is_test_path(&right.path))
-                } else {
-                    std::cmp::Ordering::Equal
-                }
-            })
-            .then(left.path.cmp(&right.path))
-    });
 }
 
 #[derive(Debug, Clone)]
@@ -448,10 +363,12 @@ impl ProjectIndexer {
             size: metadata.len(),
             modified_time_ms,
             content_hash: sha256(&bytes),
+            name_terms: crate::keyword_rank::index_terms(relative_path),
+            symbol_terms: crate::keyword_rank::index_terms(&symbols.join(" ")),
             symbols,
             declarations,
             imports,
-            terms: tokenize(&format!("{relative_path} {indexed_content}")),
+            terms: crate::keyword_rank::index_terms(&format!("{relative_path} {indexed_content}")),
             chunks: chunk_text(&indexed_content, 2400),
         });
         Ok(())
@@ -514,53 +431,6 @@ fn chunk_text(content: &str, max_chunk_chars: usize) -> Vec<TextChunk> {
     chunks
 }
 
-/// The chunk a keyword hit points at: the one holding the most query terms,
-/// the earliest on a tie. A file scored only on its path or symbols has no
-/// chunk that holds a term, and gets its first chunk, as the snippet always did.
-fn best_keyword_chunk<'a>(record: &'a FileRecord, query_terms: &[String]) -> Option<&'a TextChunk> {
-    let mut best: Option<(usize, &TextChunk)> = None;
-    for chunk in &record.chunks {
-        let chunk_terms = tokenize(&chunk.text);
-        let matched = query_terms
-            .iter()
-            .filter(|term| chunk_terms.contains(*term))
-            .count();
-        if matched > 0 && best.is_none_or(|(most, _)| matched > most) {
-            best = Some((matched, chunk));
-        }
-    }
-    best.map(|(_, chunk)| chunk)
-        .or_else(|| record.chunks.first())
-}
-
-fn score_record(record: &FileRecord, query_terms: &[String]) -> usize {
-    let searchable = format!(
-        "{} {} {} {}",
-        record.path,
-        record.language,
-        record.symbols.join(" "),
-        record.imports.join(" ")
-    )
-    .to_ascii_lowercase();
-    let mut score = 0;
-    for term in query_terms {
-        if record.path.to_ascii_lowercase().contains(term) {
-            score += 5;
-        }
-        if record
-            .symbols
-            .iter()
-            .any(|symbol| symbol.to_ascii_lowercase().contains(term))
-        {
-            score += 4;
-        }
-        if searchable.contains(term) || record.terms.contains(term) {
-            score += 2;
-        }
-    }
-    score
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -576,7 +446,9 @@ mod tests {
             symbols: symbols.iter().map(|symbol| symbol.to_string()).collect(),
             declarations: Vec::new(),
             imports: Vec::new(),
-            terms: tokenize(&format!("{path} {text}")),
+            terms: crate::keyword_rank::index_terms(&format!("{path} {text}")),
+            name_terms: crate::keyword_rank::index_terms(path),
+            symbol_terms: crate::keyword_rank::index_terms(&symbols.join(" ")),
             chunks: chunk_text(text, 2400),
         }
     }
@@ -656,7 +528,18 @@ mod tests {
     /// test files ahead of the code they test.
     #[test]
     fn source_outranks_sentence_named_tests_unless_the_query_is_about_tests() {
-        let files = vec![
+        // Rarity needs a corpus: in a real repository "user", "code" and
+        // "part" are everywhere, which is what makes them weak evidence.
+        let mut files = (1..=8)
+            .map(|number| {
+                record(
+                    &format!("src/module_{number}.rs"),
+                    &["helper"],
+                    "// Part of the code that serves the user.\nfn helper() {}\n",
+                )
+            })
+            .collect::<Vec<_>>();
+        files.extend([
             record(
                 "src/tests.rs",
                 &[
@@ -670,7 +553,7 @@ mod tests {
                 &["ApprovalDecision", "record_approval"],
                 "pub fn record_approval(user: &User) -> ApprovalDecision { todo!() }\n",
             ),
-        ];
+        ]);
         let index = index(files);
 
         let question = index.keyword_search("what part of the code is the user approval", 8);
