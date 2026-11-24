@@ -16,10 +16,10 @@ use workspace_engine::{
     CancelToken, CategoryUsage, ChatTurnResult, ClientError, CollectionSource, Config,
     ConfigOverlay, ContentKind, ContextBudget, ContextCategory, ContextItem, ContextKind,
     ContextManifest, ContextPlan, ContextRequest, ConvertedResponse, CurlModelTransport,
-    ExclusionRecord, ExternalReference, ExternalUrl, LimitSource, LineRange, MockModelAdapter,
-    ModelAdapter, ModelMessage, ModelRequest, OpenAICompatibleAdapter, PlanStep, ProcessRegistry,
-    Provenance, RepositoryIndex, StepStatus, Symbol, SymbolIndexStore, TaskPlan, TokenEstimate,
-    TurnProgress, TurnSink, UsageSource, WorkspaceEngine,
+    DEFAULT_CONTEXT_TOKEN_BUDGET, ExclusionRecord, ExternalReference, ExternalUrl, LimitSource,
+    LineRange, MockModelAdapter, ModelAdapter, ModelMessage, ModelRequest, OpenAICompatibleAdapter,
+    PlanStep, ProcessRegistry, Provenance, RepositoryIndex, StepStatus, Symbol, SymbolIndexStore,
+    TaskPlan, TokenEstimate, TurnProgress, TurnSink, UsageSource, WorkspaceEngine,
 };
 
 static COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -1664,13 +1664,27 @@ fn with_no_observed_profile_the_limit_is_the_config_budget_labelled_declared() {
     let repo = fixture_repo("declared-limit");
     let engine = WorkspaceEngine::new(test_config(&repo));
 
-    let plan = assemble(&engine, &repo, "repo_declared", "Review", &[], None, None);
+    // The config's budget, not `assemble`'s fixed 16,000 fixture limit: the two
+    // matched only while 16,000 was also the default.
+    let plan = assemble_with_limit(
+        &engine,
+        &repo,
+        "repo_declared",
+        "Review",
+        &[],
+        None,
+        None,
+        engine.config.context_token_budget(),
+    );
 
     assert_eq!(
         plan.manifest.limit.tokens,
         engine.config.context_token_budget()
     );
-    assert_eq!(plan.manifest.limit.tokens, 16_000);
+    assert_eq!(
+        plan.manifest.limit.tokens,
+        DEFAULT_CONTEXT_TOKEN_BUDGET as usize
+    );
     assert_eq!(plan.manifest.limit.source, LimitSource::Declared);
     assert_eq!(plan.manifest.limit.safety_margin_bps, 0);
     assert_eq!(plan.manifest.limit.window, None);

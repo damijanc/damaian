@@ -557,7 +557,9 @@ does, and fails on any failed assertion or when none was evaluated.
   (spec 71). The context budget likewise stays at the 16,000-token default:
   context is re-sent and re-billed every round, and spec 71's per-provider
   override raises it. The `max_output_tokens: None` comment in `live_config`
-  holds only for providers that have a built-in ceiling.
+  holds only for providers that have a built-in ceiling. *Reversed 2026-11-24:*
+  the default is now 64,000 (spec 26 §7, "Default budget"), because at 16k a
+  real repository's root `AGENTS.md` and its search results could not both fit.
 
 Nothing from the 2026-10-25 run remains open. The fixes and the decision above
 reached `main` on 2026-10-30, and the full seven-check gate passed in CI on

@@ -6193,13 +6193,14 @@ fn context_token_budget_follows_the_selected_model() {
         config.context_token_budget()
     };
 
-    // A 1M-token context window earns more than the legacy 16k.
     assert_eq!(budget_for("deepseek", "deepseek-v4-flash"), 64_000);
     assert_eq!(budget_for("deepseek", "deepseek-v4-pro"), 64_000);
 
-    // Everything else keeps the previous hardcoded behavior.
-    assert_eq!(budget_for("deepseek", "deepseek-chat"), 16_000);
-    assert_eq!(budget_for("openai", "gpt-4.1"), 16_000);
+    // Everything else gets the default, 64,000 since 2026-11-24 (was 16,000).
+    let default = DEFAULT_CONTEXT_TOKEN_BUDGET as usize;
+    assert_eq!(default, 64_000);
+    assert_eq!(budget_for("deepseek", "deepseek-chat"), default);
+    assert_eq!(budget_for("openai", "gpt-4.1"), default);
     assert_eq!(
         Config::default().context_token_budget(),
         DEFAULT_CONTEXT_TOKEN_BUDGET as usize

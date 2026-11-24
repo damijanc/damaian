@@ -64,7 +64,8 @@ form moved to another provider.
 - DeepSeek with `deepseek-v4-flash` first shows `Default: 65,536` and
   `Default: 64,000`.
 - OpenAI shows `Default: none sent, the provider decides` and
-  `Default: 16,000`.
+  `Default: 16,000`. (`Default: 64,000` since 2026-11-24, when
+  `DEFAULT_CONTEXT_TOKEN_BUDGET` rose; see spec 26 §7, "Default budget".)
 - Listing `deepseek-v4-flash` and `deepseek-chat` shows the per-model note;
   listing only V4 models hides it.
 - A configured value still fills the field and wins, as before.

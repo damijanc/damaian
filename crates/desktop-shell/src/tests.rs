@@ -5259,7 +5259,10 @@ fn provider_token_defaults_answers_per_model() {
     assert_eq!(deepseek["models"][0]["maxOutputTokens"], 65_536);
     assert_eq!(deepseek["models"][0]["contextTokenBudget"], 64_000);
     assert_eq!(deepseek["models"][1]["maxOutputTokens"], 8_192);
-    assert_eq!(deepseek["models"][1]["contextTokenBudget"], 16_000);
+    assert_eq!(
+        deepseek["models"][1]["contextTokenBudget"],
+        workspace_engine::DEFAULT_CONTEXT_TOKEN_BUDGET
+    );
     // Spec 79: the window is its own field, known only for V4.
     assert_eq!(deepseek["models"][0]["contextWindow"], 1_000_000);
     assert!(deepseek["models"][1]["contextWindow"].is_null());

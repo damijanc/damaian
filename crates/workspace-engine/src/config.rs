@@ -17,10 +17,13 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 /// Repository-context budget used when neither the provider config nor the
-/// built-in per-model table specifies one. Matches the value that was
-/// previously hardcoded at the two `build_context` call sites, so a config
-/// that says nothing behaves exactly as before.
-pub const DEFAULT_CONTEXT_TOKEN_BUDGET: u32 = 16_000;
+/// built-in per-model table specifies one. It was 16,000, the value once
+/// hardcoded at the `build_context` call sites, until 2026-11-24: at 16k a
+/// real repository's search ranges filled their share and its root
+/// `AGENTS.md` (~6.7k tokens here) could not fit (spec 26 §7). 64,000 matches
+/// the built-in `deepseek-v4` budget. It is still capped by the model's
+/// window where that is known.
+pub const DEFAULT_CONTEXT_TOKEN_BUDGET: u32 = 64_000;
 
 pub const DEFAULT_IGNORE_PATTERNS: &[&str] = &[
     ".git/",

@@ -141,7 +141,7 @@ Because that file arrives with a clone, a repository can only make Damaian *more
 
 ### Semantic search
 
-**Settings → General → Semantic search** turns it on or off (`enable_semantic_search`, off by default). Off, Damaian finds relevant files for a request, and answers the assistant's `search_codebase` tool, by keyword and term overlap. On, it also uses an embedding model for that search, which can find files that use different words for the same idea.
+**Settings → General → Semantic search** turns it on or off (`enable_semantic_search`, off by default). Off, Damaian finds relevant files for a request, and answers the assistant's `search_codebase` tool, by keyword and term overlap. On, it also uses an embedding model for that search, which can find files that use different words for the same idea. Either way, common words such as "what", "the" or "is" are ignored, and test files rank at half their score unless your query mentions tests ("test", "tests", "testing", "spec"), so a question about how something works finds the code before the tests that exercise it.
 
 The first search in a repository after turning it on starts building that repository's vectors, 32 chunks at a time. A small repository is done within that search; a larger one carries on in the background, at roughly 75 chunks a second on an Apple silicon Mac (about a minute and a half for a repository of 400,000 lines), and search answers by keyword until it finishes. Building uses the processor heavily while it runs, but its memory stays a few hundred MB whatever the repository's size. **Largest repository to embed**, under the toggle (`semantic_search_max_chunks`, default 100,000 chunks of about 2,400 characters), caps how much it indexes: a repository with more chunks keeps using keyword search, so memory stays bounded at about 1.5 KB per chunk. Only your user (or admin) config sets the cap; a repository cannot raise it.
 
@@ -307,9 +307,9 @@ Do not put the model's window into **Context per turn**. A budget of `1000000` m
 Leave a field blank to use the built-in default for the selected model. A blank field shows that default as its placeholder, for the first model in the provider's **Models** list — `Default: 64,000`, or `Default: none sent, the provider decides` for an output ceiling Damaian does not send. When the listed models have different defaults, a note under the fields lists each one. The defaults are:
 
 - `deepseek-v4-flash` and `deepseek-v4-pro`: 65536 output tokens, 64000 context per turn, a 1000000 window.
-- `deepseek-chat` and `deepseek-reasoner` (retired aliases): 8192 output tokens, 16000 context per turn, no known window.
-- Other DeepSeek models: 8192 output tokens, 16000 context budget.
-- All other models: no output cap is sent, and the context budget is 16000.
+- `deepseek-chat` and `deepseek-reasoner` (retired aliases): 8192 output tokens, 64000 context per turn, no known window.
+- Other DeepSeek models: 8192 output tokens, 64000 context budget.
+- All other models: no output cap is sent, and the context budget is 64000. A model whose window is smaller than that needs **Context per turn** set below its window, because Damaian only knows the window of the DeepSeek V4 models.
 
 The built-in context budgets are deliberately well below what these models technically accept. DeepSeek's V4 models allow up to 384000 output tokens and a 1M-token context window, but requesting the maximum on every turn is rarely worth the cost. Raise the values if your repository or your patches need more.
 
@@ -323,7 +323,7 @@ Setting a value higher than the model actually allows causes the provider to rej
 
 ### What goes into context
 
-Every request is assembled the same way. The collected items are sent in one `Repository context:` block, followed by the conversation under `Recent conversation:` — a summary of older messages when one exists, then the most recent messages that fit the conversation window (each cut to 2,000 characters) — followed by your message under `User request:`. Your message appears once. Within the repository block each item is one section headed `--- <source>: <path> ---`; a fetched page has no path, so its header names the URL and fetch time instead. The source labels are listed in [Reading a turn's context manifest](TROUBLESHOOTING.md#reading-a-turns-context-manifest). Items are added in a fixed order: the files you named or added, the `AGENTS.md` files that apply to the collected paths, the root project rules, the repository map, symbol hints, hook context, a carried plan, keyword and semantic search hits, any page fetched in an earlier turn, and last any recalled memory. A line range would append `:start-end` to the path; no source produces one yet, so every item is a whole file or a rendered block. A one-shot edit request sends the same items under its own `User edit request:` heading, which comes first because that request makes a single call.
+Every request is assembled the same way. The collected items are sent in one `Repository context:` block, followed by the conversation under `Recent conversation:` — a summary of older messages when one exists, then the most recent messages that fit the conversation window (each cut to 2,000 characters) — followed by your message under `User request:`. Your message appears once. Within the repository block each item is one section headed `--- <source>: <path> ---`; a fetched page has no path, so its header names the URL and fetch time instead. The source labels are listed in [Reading a turn's context manifest](TROUBLESHOOTING.md#reading-a-turns-context-manifest). Items are added in a fixed order: the files you named or added, the `AGENTS.md` files that apply to the collected paths, the root project rules, the repository map, symbol hints, hook context, a carried plan, keyword and semantic search hits, any page fetched in an earlier turn, and last any recalled memory. A search hit or a pinned range appends `:start-end` to the path; everything else is a whole file or a rendered block. A one-shot edit request sends the same items under its own `User edit request:` heading, which comes first because that request makes a single call.
 
 Your message is secret-scanned before it is sent, and so is every earlier message replayed under `Recent conversation:`. Sessions store messages as you typed them, so this is what keeps a credential from an older turn out of a later request: a detected value is replaced by Damaian's redaction marker rather than sent in cleartext.
 
@@ -472,7 +472,7 @@ removed while the turn was paused.
 
 A long conversation cannot be sent whole on every turn. Damaian keeps a
 **conversation window** of recent messages — 25% of the context budget by
-default, so roughly 4,000 tokens on a 16,000-token budget — and represents
+default, so roughly 16,000 tokens on a 64,000-token budget — and represents
 everything older with one **summary**. The window is measured in tokens rather
 than messages, so a conversation of short messages keeps more turns in view than
 one of long messages.

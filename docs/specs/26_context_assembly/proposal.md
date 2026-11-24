@@ -1111,8 +1111,26 @@ see dropped is included from unspent budget. New:
 `context_manager.rs`). `memory_is_dropped_before_file_content_under_pressure`
 and the zero-share memory test pass unchanged, covering the unassigned-share
 and switched-off cases. Backfill cannot help where the window really is
-contested: at the CLI's default 16k limit the original prompt's search results
+contested: at the then-default 16k budget the original prompt's search results
 fill their share, and `AGENTS.md` still does not fit.
+
+**Default budget (2026-11-24).** That 16k was `DEFAULT_CONTEXT_TOKEN_BUDGET`,
+the budget of every model without a built-in one (all but the DeepSeek V4
+models), not a CLI limit. It is now 64,000, the V4 models' built-in budget;
+spec 18 had kept 16k because context is re-sent and re-billed every round,
+and that cost is accepted. At 64k the original prompt includes the root
+`AGENTS.md` (6,715 tokens) with all four instruction files and 15 search
+ranges, 19,918 tokens in all. The budget is still capped by the model's window
+only where the window is known, which today is only the V4 models, so a model
+with a smaller window needs its budget set by hand; the user guide says so. The
+conversation window, 25% of the budget, grows with it, from 4,000 to 16,000
+tokens. Tests that had 16,000 written in now read the constant; the
+conversation-compaction tests in `desktop-shell` and the eval scenario
+`compaction_keeps_a_stated_constraint` scale their `conversation_window_share`
+by a quarter so their windows keep their old token sizes; and
+`with_no_observed_profile_the_limit_is_the_config_budget_labelled_declared`
+now passes the config's budget rather than relying on `assemble`'s fixed 16,000
+fixture limit equalling the default.
 
 ### Known open points (2026-10-25)
 

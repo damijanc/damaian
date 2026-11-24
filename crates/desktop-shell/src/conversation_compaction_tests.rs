@@ -29,7 +29,9 @@ fn temp_repo() -> PathBuf {
 fn engine(repo: &Path) -> WorkspaceEngine {
     WorkspaceEngine::new(Config {
         data_dir: repo.join(".damaian"),
-        conversation_window_share: 100,
+        // 0.25% of the 64,000-token default budget: a 160-token window, as
+        // 1% of the old 16,000 default was.
+        conversation_window_share: 25,
         enable_index_watcher: false,
         ..Config::default()
     })
@@ -138,11 +140,11 @@ fn the_boundary_counts_match_the_prompt_when_a_plan_reminder_is_present() {
     let repo = temp_repo();
     let engine = WorkspaceEngine::new(Config {
         data_dir: repo.join(".damaian"),
-        // 0.5% of 16,000 tokens: 80, so a 12-message seed is only partly in
+        // 0.13% of 64,000 tokens: 83, so a 12-message seed is only partly in
         // view and the notice has something to count. Automatic
         // compaction is off so the first request is the ask, not a summary
         // call.
-        conversation_window_share: 50,
+        conversation_window_share: 13,
         conversation_auto_compact: false,
         enable_index_watcher: false,
         ..Config::default()

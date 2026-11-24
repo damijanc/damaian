@@ -175,18 +175,28 @@ impl VectorIndex {
         SyncState::Complete
     }
 
+    /// `demote_tests` halves a test file's similarity before ranking, as
+    /// keyword search halves its score (`indexer::demoted`).
     fn search(
         &self,
         query_vector: &[f32],
         index: &RepositoryIndex,
         limit: usize,
         allowed: &dyn Fn(&str) -> bool,
+        demote_tests: bool,
     ) -> Vec<SearchResult> {
         let mut scored: Vec<(f32, &StoredChunkVector)> = self
             .entries
             .iter()
             .filter(|entry| allowed(&entry.path))
-            .map(|entry| (cosine_similarity(query_vector, &entry.vector), entry))
+            .map(|entry| {
+                let similarity = cosine_similarity(query_vector, &entry.vector);
+                if demote_tests && crate::indexer::is_test_path(&entry.path) {
+                    (similarity * 0.5, entry)
+                } else {
+                    (similarity, entry)
+                }
+            })
             .collect();
         scored.sort_by(|left, right| {
             right
@@ -422,7 +432,13 @@ impl VectorIndexCache {
         } = &mut *cached;
         let mut save = |vectors: &VectorIndex| vectors.save(path);
         match vectors.sync(index, model, max_chunks, SYNC_BUDGET, &mut save) {
-            SyncState::Complete => vectors.search(&query_vector, index, limit, allowed),
+            SyncState::Complete => vectors.search(
+                &query_vector,
+                index,
+                limit,
+                allowed,
+                !crate::indexer::query_mentions_tests(&crate::indexer::search_terms(query)),
+            ),
             SyncState::Partial => {
                 drop(cached);
                 fill_in_background(entry, index.clone(), model, max_chunks);

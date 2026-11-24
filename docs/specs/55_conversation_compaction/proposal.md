@@ -570,7 +570,8 @@ both are stated as such rather than inferred.
 ### Measurements and decisions
 
 - **Window size:** `conversation_window_share` defaults to `0.25`, so a
-  default 16,000-token budget gives a 4,000-token conversation window. The
+  default 16,000-token budget gives a 4,000-token conversation window (since
+  2026-11-24 the default budget is 64,000, so 16,000; spec 26 §7). The
   deterministic scenarios set `0.01` so a seeded conversation crosses it; in
   real use the default is the number to read. It is also the automatic
   threshold, because a threshold that does not equal the window could trigger a

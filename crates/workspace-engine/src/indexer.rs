@@ -90,13 +90,17 @@ impl RepositoryIndex {
         limit: usize,
         allowed: &dyn Fn(&str) -> bool,
     ) -> Vec<SearchResult> {
-        let query_terms = tokenize(query);
+        let query_terms = search_terms(query);
+        let demote_tests = !query_mentions_tests(&query_terms);
         let mut scored = self
             .files
             .iter()
             .filter(|record| allowed(&record.path))
             .filter_map(|record| {
-                let score = score_record(record, &query_terms);
+                let score = demoted(
+                    score_record(record, &query_terms),
+                    demote_tests && is_test_path(&record.path),
+                );
                 (score > 0).then(|| {
                     let chunk = best_keyword_chunk(record, &query_terms);
                     SearchResult {
@@ -113,12 +117,7 @@ impl RepositoryIndex {
                 })
             })
             .collect::<Vec<_>>();
-        scored.sort_by(|left, right| {
-            right
-                .score
-                .cmp(&left.score)
-                .then(left.path.cmp(&right.path))
-        });
+        sort_results(&mut scored, demote_tests);
         scored.truncate(limit);
         scored
     }
@@ -137,9 +136,11 @@ impl RepositoryIndex {
         limit: usize,
         allowed: &dyn Fn(&str) -> bool,
     ) -> Vec<SearchResult> {
-        let query_terms = tokenize(query);
+        let query_terms = search_terms(query);
+        let demote_tests = !query_mentions_tests(&query_terms);
         let mut scored = Vec::new();
         for record in self.files.iter().filter(|record| allowed(&record.path)) {
+            let demote = demote_tests && is_test_path(&record.path);
             let file_terms = tokenize(&format!("{} {}", record.path, record.symbols.join(" ")));
             for chunk in &record.chunks {
                 let text_terms = tokenize(&chunk.text);
@@ -151,10 +152,13 @@ impl RepositoryIndex {
                 if !query_terms.iter().any(|term| text_terms.contains(term)) {
                     continue;
                 }
-                let score = query_terms
-                    .iter()
-                    .filter(|term| text_terms.contains(*term) || file_terms.contains(*term))
-                    .count();
+                let score = demoted(
+                    query_terms
+                        .iter()
+                        .filter(|term| text_terms.contains(*term) || file_terms.contains(*term))
+                        .count(),
+                    demote,
+                );
                 scored.push(SearchResult {
                     path: record.path.clone(),
                     language: record.language.clone(),
@@ -166,15 +170,98 @@ impl RepositoryIndex {
                 });
             }
         }
-        scored.sort_by(|left, right| {
-            right
-                .score
-                .cmp(&left.score)
-                .then(left.path.cmp(&right.path))
-        });
+        sort_results(&mut scored, demote_tests);
         scored.truncate(limit);
         scored
     }
+}
+
+/// Words that say nothing about which file is meant. Every large file holds
+/// them, and test functions are named as sentences
+/// (`a_command_the_stop_ended_is_named_…`), so as query terms they matched
+/// symbols in nearly every test file and decided the ranking: a question about
+/// user approval returned nine test files in its top ten. Search queries only;
+/// [`tokenize`] itself is shared with memory recall and stays as it is.
+const SEARCH_STOP_WORDS: &[&str] = &[
+    "a", "about", "an", "and", "are", "as", "at", "be", "by", "can", "do", "does", "for", "from",
+    "how", "i", "if", "in", "is", "it", "its", "me", "my", "of", "on", "or", "our", "so", "that",
+    "the", "their", "there", "this", "to", "we", "what", "when", "where", "which", "who", "why",
+    "with", "you", "your",
+];
+
+/// A query's terms for search: [`tokenize`] without [`SEARCH_STOP_WORDS`].
+/// A query made only of stop-words keeps them, so it still searches for
+/// something rather than for nothing.
+pub(crate) fn search_terms(query: &str) -> Vec<String> {
+    let terms = tokenize(query);
+    let meaningful = terms
+        .iter()
+        .filter(|term| !SEARCH_STOP_WORDS.contains(&term.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    if meaningful.is_empty() {
+        terms
+    } else {
+        meaningful
+    }
+}
+
+/// Whether the query asks about tests, in which case test files are not
+/// demoted: "where is the approval test" should still find it first.
+pub(crate) fn query_mentions_tests(query_terms: &[String]) -> bool {
+    query_terms.iter().any(|term| {
+        matches!(
+            term.as_str(),
+            "test" | "tests" | "testing" | "spec" | "specs"
+        )
+    })
+}
+
+/// Whether a repository path is a test file by the common conventions: a
+/// `tests`, `test`, `__tests__` or `spec` directory, a Rust `tests.rs` or
+/// `*_tests.rs`, and `*_test.*`, `test_*.*`, `*.test.*` or `*.spec.*` names.
+pub(crate) fn is_test_path(path: &str) -> bool {
+    let path = path.to_ascii_lowercase();
+    let mut segments = path.split('/').collect::<Vec<_>>();
+    let file = segments.pop().unwrap_or_default();
+    if segments
+        .iter()
+        .any(|segment| matches!(*segment, "tests" | "test" | "__tests__" | "spec"))
+    {
+        return true;
+    }
+    let stem = file.split('.').next().unwrap_or_default();
+    stem == "tests"
+        || stem.ends_with("_tests")
+        || stem.ends_with("_test")
+        || stem.starts_with("test_")
+        || file.contains(".test.")
+        || file.contains(".spec.")
+}
+
+/// A test file's score is halved, rounding up so a hit never vanishes,
+/// unless the query is about tests. Test files are large and cover every
+/// behaviour, so on equal footing they crowd out the code they test.
+pub(crate) fn demoted(score: usize, demote: bool) -> usize {
+    if demote { score.div_ceil(2) } else { score }
+}
+
+/// Highest score first; on a tie a non-test file before a test file when
+/// tests are demoted, then by path, so the order is total.
+fn sort_results(results: &mut [SearchResult], demote_tests: bool) {
+    results.sort_by(|left, right| {
+        right
+            .score
+            .cmp(&left.score)
+            .then_with(|| {
+                if demote_tests {
+                    is_test_path(&left.path).cmp(&is_test_path(&right.path))
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            })
+            .then(left.path.cmp(&right.path))
+    });
 }
 
 #[derive(Debug, Clone)]
@@ -472,4 +559,126 @@ fn score_record(record: &FileRecord, query_terms: &[String]) -> usize {
         }
     }
     score
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn record(path: &str, symbols: &[&str], text: &str) -> FileRecord {
+        FileRecord {
+            repository_id: "repo_test".to_string(),
+            path: path.to_string(),
+            language: "rust".to_string(),
+            size: text.len() as u64,
+            modified_time_ms: 0,
+            content_hash: String::new(),
+            symbols: symbols.iter().map(|symbol| symbol.to_string()).collect(),
+            declarations: Vec::new(),
+            imports: Vec::new(),
+            terms: tokenize(&format!("{path} {text}")),
+            chunks: chunk_text(text, 2400),
+        }
+    }
+
+    fn index(files: Vec<FileRecord>) -> RepositoryIndex {
+        RepositoryIndex {
+            repository_id: "repo_test".to_string(),
+            root_path: PathBuf::from("/repo"),
+            indexed_at_ms: 0,
+            files,
+            skipped: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn chunks_carry_the_lines_they_span() {
+        let text = (1..=300)
+            .map(|line| format!("line number {line:04} of the fixture\n"))
+            .collect::<String>();
+        let chunks = chunk_text(&text, 2400);
+        assert!(chunks.len() > 1);
+        assert_eq!(chunks[0].lines.start, 1);
+        for pair in chunks.windows(2) {
+            // Consecutive chunks share or adjoin a line, so adjacent hits merge.
+            assert!(pair[1].lines.start <= pair[0].lines.end + 1, "{pair:?}");
+        }
+        assert_eq!(chunks.last().unwrap().lines.end, 300);
+        for chunk in &chunks {
+            let first = chunk.text.lines().next().unwrap();
+            let line = text.lines().nth(chunk.lines.start - 1).unwrap();
+            assert!(
+                line.ends_with(first),
+                "{first:?} is not on line {}",
+                chunk.lines.start
+            );
+        }
+    }
+
+    #[test]
+    fn stop_words_are_not_search_terms_unless_they_are_all_there_is() {
+        assert_eq!(
+            search_terms("what part of the code is responsible for user approval"),
+            ["approval", "code", "part", "responsible", "user"]
+        );
+        assert_eq!(search_terms("what is the"), ["is", "the", "what"]);
+    }
+
+    #[test]
+    fn test_paths_are_recognised_by_common_conventions() {
+        for path in [
+            "crates/workspace-engine/tests/foundation.rs",
+            "crates/desktop-shell/src/tests.rs",
+            "crates/desktop-shell/src/responsive_tests.rs",
+            "crates/desktop-shell/src/tests/worker_turns.rs",
+            "pkg/upload_test.go",
+            "test_upload.py",
+            "web/__tests__/upload.js",
+            "web/upload.test.ts",
+            "web/upload.spec.ts",
+            "spec/upload_spec.rb",
+        ] {
+            assert!(is_test_path(path), "{path}");
+        }
+        for path in [
+            "crates/workspace-engine/src/command_policy.rs",
+            "src/contest.rs",
+            "src/attestation.rs",
+            "docs/specs/26_context_assembly/proposal.md",
+            "src/testing_utils_inner/latest.rs",
+        ] {
+            assert!(!is_test_path(path), "{path}");
+        }
+    }
+
+    /// The defect this demotion fixes: test functions named as sentences
+    /// matched every stop-word, so a question about approval returned the
+    /// test files ahead of the code they test.
+    #[test]
+    fn source_outranks_sentence_named_tests_unless_the_query_is_about_tests() {
+        let files = vec![
+            record(
+                "src/tests.rs",
+                &[
+                    "the_approval_is_what_the_user_gave_for_the_command",
+                    "an_approval_for_the_user_is_part_of_the_code",
+                ],
+                "fn the_approval_is_what_the_user_gave_for_the_command() { approval(); }\n",
+            ),
+            record(
+                "src/approval.rs",
+                &["ApprovalDecision", "record_approval"],
+                "pub fn record_approval(user: &User) -> ApprovalDecision { todo!() }\n",
+            ),
+        ];
+        let index = index(files);
+
+        let question = index.keyword_search("what part of the code is the user approval", 8);
+        assert_eq!(question[0].path, "src/approval.rs", "{question:?}");
+        let question = index.semantic_search("what part of the code is the user approval", 8);
+        assert_eq!(question[0].path, "src/approval.rs", "{question:?}");
+
+        let about_tests = index.keyword_search("approval tests", 8);
+        assert_eq!(about_tests[0].path, "src/tests.rs", "{about_tests:?}");
+    }
 }
