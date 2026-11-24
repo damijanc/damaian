@@ -17,7 +17,12 @@ context_window = 60000
 # count cut legitimately drops older *unpinned* rounds between them. The
 # byte-identical pin check lives in
 # `tests/within_turn_request_preparation.rs`'s R7 regressions instead.
+# Search results are switched off: this window is sized for the reads and the
+# fixed request overhead alone. Since spec 26's 2026-11-24 change a search hit
+# reaches the context as its matched lines, and the seeded blobs match this
+# prompt, so retrieval would otherwise share the window being measured.
 config_overlay = """
+context_budget.search_results=0
 agent_max_tool_rounds=8
 agent_max_exploration_rounds=24
 worker_task_budget_action_rounds=8

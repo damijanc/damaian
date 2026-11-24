@@ -950,6 +950,61 @@ fn keyword_hits_are_ordered_before_semantic_hits() {
     fs::remove_dir_all(repo).unwrap();
 }
 
+/// §5.4, 2026-11-24: a search hit is the chunk it matched, as a line range,
+/// not its whole file. The probe sits at line 1501 of a ~16k-token file whose
+/// first line the hit must not carry.
+#[test]
+fn a_search_hit_is_collected_as_the_lines_it_matched() {
+    let repo = temp_dir("hit-as-range");
+    let mut content = String::from("// FIRSTLINE\n");
+    for line in 2..=3000 {
+        if line == 1501 {
+            content.push_str("pub fn rangeprobe() {}\n");
+        } else {
+            content.push_str(&format!("let filler_{line} = {line};\n"));
+        }
+    }
+    write_fixture(&repo, "src/big.rs", &content);
+    let engine = WorkspaceEngine::new(test_config(&repo));
+    let index = engine.indexer.index_repository(&repo).unwrap();
+
+    let hit = index
+        .keyword_search("rangeprobe", 8)
+        .into_iter()
+        .find(|hit| hit.path == "src/big.rs")
+        .expect("the probe file is a keyword hit");
+    let lines = hit.lines.expect("a hit carries its chunk's lines");
+    assert!(
+        lines.start <= 1501 && 1501 <= lines.end && lines.start > 1,
+        "{lines:?}"
+    );
+    assert!(hit.snippet.contains("rangeprobe"), "{}", hit.snippet);
+
+    let plan = assemble(
+        &engine,
+        &repo,
+        &index.repository_id,
+        "rangeprobe",
+        &[],
+        Some(&index),
+        None,
+    );
+    let items = plan
+        .items
+        .iter()
+        .filter(|item| item.path.as_deref() == Some("src/big.rs"))
+        .collect::<Vec<_>>();
+    assert_eq!(items.len(), 1, "{:?}", plan.manifest.excluded);
+    let item = items[0];
+    assert_eq!(item.category, ContextCategory::SearchResults);
+    let range = item.range.expect("the hit is included as a range");
+    assert!(range.start <= 1501 && 1501 <= range.end, "{range:?}");
+    assert!(item.content.contains("rangeprobe"));
+    assert!(!item.content.contains("FIRSTLINE"));
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
 #[test]
 fn a_keyword_hit_and_a_semantic_hit_for_one_path_become_one_item() {
     let repo = temp_dir("hit-dedup");

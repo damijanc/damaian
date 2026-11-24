@@ -215,6 +215,7 @@ impl VectorIndex {
                     // count-based score in combined result lists.
                     score: (score.max(0.0) * 1000.0) as usize,
                     snippet: chunk.text.chars().take(500).collect(),
+                    lines: Some(chunk.lines),
                 })
             })
             .collect()
@@ -499,6 +500,7 @@ mod tests {
                             ordinal,
                             start: 0,
                             end: 0,
+                            lines: crate::file_access::LineRange { start: 1, end: 1 },
                             text: format!("file {file} chunk {ordinal}"),
                             text_hash: format!("hash-{file}-{ordinal}"),
                         })

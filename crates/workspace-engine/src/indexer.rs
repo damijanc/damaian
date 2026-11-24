@@ -1,6 +1,7 @@
 use crate::audit::AuditLog;
 use crate::config::{Config, DEFAULT_IGNORE_PATTERNS};
 use crate::error::Result;
+use crate::file_access::LineRange;
 use crate::hash::{now_millis, repository_id_for_root, sha256};
 use crate::ignore::{is_ignored_by_rules, parse_ignore_patterns};
 use crate::language::{
@@ -16,6 +17,12 @@ pub struct TextChunk {
     pub ordinal: usize,
     pub start: usize,
     pub end: usize,
+    /// The lines the chunk spans, 1-based and inclusive, counted in the
+    /// redacted text it was cut from. A multi-line secret collapsed by
+    /// redaction shifts the lines after it, so a range can land a few lines
+    /// early in such a file; context assembly reads it from the file as it is
+    /// now, which already tolerates a file edited since indexing.
+    pub lines: LineRange,
     pub text: String,
     pub text_hash: String,
 }
@@ -53,6 +60,10 @@ pub struct SearchResult {
     pub imports: Vec<String>,
     pub score: usize,
     pub snippet: String,
+    /// The lines of the chunk `snippet` was taken from, so a hit can be
+    /// collected as that range rather than as the whole file. `None` only for
+    /// a file with no content, which has no chunk.
+    pub lines: Option<LineRange>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,17 +97,19 @@ impl RepositoryIndex {
             .filter(|record| allowed(&record.path))
             .filter_map(|record| {
                 let score = score_record(record, &query_terms);
-                (score > 0).then(|| SearchResult {
-                    path: record.path.clone(),
-                    language: record.language.clone(),
-                    symbols: record.symbols.clone(),
-                    imports: record.imports.clone(),
-                    score,
-                    snippet: record
-                        .chunks
-                        .first()
-                        .map(|chunk| chunk.text.chars().take(500).collect())
-                        .unwrap_or_default(),
+                (score > 0).then(|| {
+                    let chunk = best_keyword_chunk(record, &query_terms);
+                    SearchResult {
+                        path: record.path.clone(),
+                        language: record.language.clone(),
+                        symbols: record.symbols.clone(),
+                        imports: record.imports.clone(),
+                        score,
+                        snippet: chunk
+                            .map(|chunk| chunk.text.chars().take(500).collect())
+                            .unwrap_or_default(),
+                        lines: chunk.map(|chunk| chunk.lines),
+                    }
                 })
             })
             .collect::<Vec<_>>();
@@ -127,27 +140,30 @@ impl RepositoryIndex {
         let query_terms = tokenize(query);
         let mut scored = Vec::new();
         for record in self.files.iter().filter(|record| allowed(&record.path)) {
+            let file_terms = tokenize(&format!("{} {}", record.path, record.symbols.join(" ")));
             for chunk in &record.chunks {
-                let chunk_terms = tokenize(&format!(
-                    "{} {} {}",
-                    record.path,
-                    record.symbols.join(" "),
-                    chunk.text
-                ));
+                let text_terms = tokenize(&chunk.text);
+                // A chunk is a hit only if its own text holds a term. The path
+                // and symbols are the whole file's, so counting them alone made
+                // every chunk of a matching file tie, and the hits were its
+                // first chunks rather than the one that matched. They still
+                // raise the score of a chunk that does match.
+                if !query_terms.iter().any(|term| text_terms.contains(term)) {
+                    continue;
+                }
                 let score = query_terms
                     .iter()
-                    .filter(|term| chunk_terms.contains(*term))
+                    .filter(|term| text_terms.contains(*term) || file_terms.contains(*term))
                     .count();
-                if score > 0 {
-                    scored.push(SearchResult {
-                        path: record.path.clone(),
-                        language: record.language.clone(),
-                        symbols: record.symbols.clone(),
-                        imports: record.imports.clone(),
-                        score,
-                        snippet: chunk.text.chars().take(500).collect(),
-                    });
-                }
+                scored.push(SearchResult {
+                    path: record.path.clone(),
+                    language: record.language.clone(),
+                    symbols: record.symbols.clone(),
+                    imports: record.imports.clone(),
+                    score,
+                    snippet: chunk.text.chars().take(500).collect(),
+                    lines: Some(chunk.lines),
+                });
             }
         }
         scored.sort_by(|left, right| {
@@ -380,22 +396,54 @@ fn chunk_text(content: &str, max_chunk_chars: usize) -> Vec<TextChunk> {
     }
     let mut chunks = Vec::new();
     let mut start = 0;
+    let mut start_line = 1;
     while start < content.len() {
         let mut end = (start + max_chunk_chars).min(content.len());
         while !content.is_char_boundary(end) {
             end -= 1;
         }
         let text = content[start..end].to_string();
+        let newlines = text.matches('\n').count();
+        // A chunk ending on its newline does not reach into the next line.
+        let end_line = if text.ends_with('\n') {
+            start_line + newlines - 1
+        } else {
+            start_line + newlines
+        };
         chunks.push(TextChunk {
             ordinal: chunks.len(),
             start,
             end,
+            lines: LineRange {
+                start: start_line,
+                end: end_line,
+            },
             text_hash: sha256(text.as_bytes()),
             text,
         });
+        start_line += newlines;
         start = end;
     }
     chunks
+}
+
+/// The chunk a keyword hit points at: the one holding the most query terms,
+/// the earliest on a tie. A file scored only on its path or symbols has no
+/// chunk that holds a term, and gets its first chunk, as the snippet always did.
+fn best_keyword_chunk<'a>(record: &'a FileRecord, query_terms: &[String]) -> Option<&'a TextChunk> {
+    let mut best: Option<(usize, &TextChunk)> = None;
+    for chunk in &record.chunks {
+        let chunk_terms = tokenize(&chunk.text);
+        let matched = query_terms
+            .iter()
+            .filter(|term| chunk_terms.contains(*term))
+            .count();
+        if matched > 0 && best.is_none_or(|(most, _)| matched > most) {
+            best = Some((matched, chunk));
+        }
+    }
+    best.map(|(_, chunk)| chunk)
+        .or_else(|| record.chunks.first())
 }
 
 fn score_record(record: &FileRecord, query_terms: &[String]) -> usize {

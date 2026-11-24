@@ -9,7 +9,12 @@ context_window = 40000
 # compacted around them. The missing read cannot be compacted at all, so it is
 # the pinned result the harness compares; it must never be dropped or turned
 # into data the model could treat as an instruction.
+# Search results are switched off: this window is sized for the reads and the
+# fixed request overhead alone. Since spec 26's 2026-11-24 change a search hit
+# reaches the context as its matched lines, and the seeded blobs match this
+# prompt, so retrieval would otherwise share the window being measured.
 config_overlay = """
+context_budget.search_results=0
 agent_max_tool_rounds=8
 agent_max_exploration_rounds=24
 """

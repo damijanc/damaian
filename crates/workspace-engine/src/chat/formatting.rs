@@ -102,8 +102,14 @@ pub(super) fn format_search_results(results: &[SearchResult]) -> String {
     results
         .iter()
         .map(|result| {
+            // The snippet is only the chunk's first 500 characters; the line
+            // range is what lets the model read the rest of the match.
+            let lines = result
+                .lines
+                .map(|lines| format!(" lines {}-{}", lines.start, lines.end))
+                .unwrap_or_default();
             format!(
-                "{} (score {})\n{}",
+                "{}{lines} (score {})\n{}",
                 result.path,
                 result.score,
                 truncate_for_prompt(&result.snippet, 500)

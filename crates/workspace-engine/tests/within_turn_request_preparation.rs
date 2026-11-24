@@ -769,7 +769,10 @@ fn a_read_compacted_away_can_be_performed_again() {
             Vec::new(),
         ],
     );
-    let (result, progress) = run_turn(&engine, &repo, "Read and reread.", &mut adapter);
+    // A prompt that shares no term with `big.txt`: "read" would make search
+    // collect several of its chunks into the context, and this window is sized
+    // for the two reads alone.
+    let (result, progress) = run_turn(&engine, &repo, "Twice, please.", &mut adapter);
     result.expect("the turn should finish");
     let saw_second_exploration = progress.iter().any(|event| {
         matches!(

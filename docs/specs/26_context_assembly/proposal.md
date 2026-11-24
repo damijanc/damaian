@@ -376,8 +376,13 @@ Two rules make the allocation useful rather than merely tidy:
   configured share is zero is switched off: it receives no allocation and
   passes the released remainder on rather than intercepting it, so
   `context_budget.*=0` means "do not spend budget here" (spec 30 C15).
-- **A category over its share is truncated within itself**, dropping its
-  lowest-priority members (§5.3) rather than stealing from another category. A
+- **A category over its share is truncated within itself**, rather than
+  stealing from another category. Members are offered what is left in priority
+  order (§5.3), and a member that does not fit is dropped **alone**: the members
+  after it are still offered the remainder. A lower-priority member therefore
+  never displaces a higher one, but can use space a higher one was too large to
+  take. (Until 2026-11-24 the first member that did not fit also dropped every
+  member after it; see §7, "Skip, don't stop".) A
   block item (map, symbols, plan state) is first re-rendered at the smaller
   ceiling, because `render_for_model` already takes one; only a block that cannot
   render a single line is excluded.
@@ -450,7 +455,13 @@ Merging preserves the highest-priority `provenance` among the merged items
 partly from a language-server symbol is not downgraded by being merged with a
 heuristic one.
 
-**Producers today: none** (checked 2026-10-25). No collection source yields a
+**Producers since 2026-11-24: search hits and session pins.** A keyword or
+semantic hit is collected as the line range of the index chunk it matched
+(about 2,400 characters), not as its whole file; see §7, "Search hits as
+ranges". Spec 27's pins were the first producer. The rest of this paragraph is
+the state on 2026-10-25.
+
+**Producers then: none** (checked 2026-10-25). No collection source yielded a
 `LineRange`: `indexer::SearchResult` has a path and a snippet, and
 `symbol_index::Symbol` has one starting line and is collected as a block (§2).
 Task 3 therefore implements the rules as `merge_file_ranges` plus
@@ -1004,12 +1015,81 @@ is this machine's run-to-run variance rather than a change (the developer Mac's
 process launches stall intermittently; the same variance is recorded in
 `docs/DEVELOPMENT.md`).
 
+### Search results reach the model (2026-11-24)
+
+Automatic retrieval was contributing nothing on a real repository. Of the 139
+`context_assembled` events in one development machine's audit log, 82 had
+search candidates and kept none of them, and the same 82 dropped the root
+`AGENTS.md`. One turn on `damaian-client` shows why: `search_results` had 37,322
+tokens, its own share plus the carry, and its first candidate was the whole of
+`crates/desktop-shell/src/tests.rs`, about 90k tokens. Two rules combined.
+
+**Skip, don't stop.** `apply_budget` set an `exhausted` flag on the first item
+that did not fit and dropped every later item of the category unexamined, so
+`SECURITY.md` (12k) and spec 31's proposal (9k) went with the 90k file. The same
+rule dropped `README.md`, `package.json` and `Cargo.toml` from `instructions`
+because the 6.7k `AGENTS.md` ahead of them was just over its 6.4k share. Each
+item is now offered the remainder and dropped alone (§5.2). §5.3's ordering is
+unchanged: a semantic hit is still offered space only after every keyword hit
+has had its turn, so it can never displace one. Blocks were already
+re-rendered to fit and are unaffected.
+
+**Search hits as ranges.** Every hit was collected whole although the index
+had matched one chunk. `TextChunk` now records the lines it spans (`lines`,
+1-based inclusive, counted in the redacted text it was cut from) and
+`SearchResult` carries them (`lines`). A semantic hit points at its chunk; a
+keyword hit, which is scored per file, points at the chunk holding the most
+query terms, or the first chunk when it matched only on path or symbols
+(`best_keyword_chunk`). `build_context` passes the range to `add_file`, so hits
+go through `flush_file_ranges`: hits in one file merge, a file also mentioned in
+the prompt absorbs them, and each included hit carries its `lineRange`. The
+`search_codebase` tool output prints the same range after the path, so the
+model can read the rest of a match by line.
+
+Ranges exposed a fault in the term-overlap fallback that `semantic_search` uses
+when the embedding model is off, which is the default. It scored each chunk on
+the file's path and symbols as well as its own text, so in a file whose symbol
+matched, every chunk tied and the eight hits were the file's first eight
+chunks, lines 1–883 in the test fixture, wherever the match was. A fallback hit
+now needs a query term in the chunk's own text; the path and symbols only raise
+its score.
+
+Two tests changed. `a_restricted_prompt_mention_is_excluded_at_collection`
+recorded the refusal twice, whole for the mention and ranged for the hit, so
+`push_exclusion` now treats a whole-path record as covering any range of that
+path for the same reason. `a_read_compacted_away_can_be_performed_again` sized
+its 10k window for an empty context, and its prompt "Read and reread." now
+collects ~4.9k tokens of the fixture's own `big.txt`; its prompt no longer
+shares a term with the file. Three eval scenarios
+(`bounded_worker_long_read_reread`, `bounded_worker_default_message_limit`,
+`bounded_worker_pinned_safety_state`) sized their windows the same way and
+ended in `task_compaction_cannot_fit`; each now sets
+`context_budget.search_results=0`, since they measure compaction against the
+fixed request overhead and retrieval silently contributed nothing when they were
+calibrated. The deterministic tier then passes all 66 scenarios, as it did
+before the change, with every aggregate unchanged except latency noise and the
+whole-request token estimate (1,565,535 → 1,561,866). New:
+`an_oversized_item_does_not_drop_the_smaller_items_after_it` (unit, in
+`context_manager.rs`) and `a_search_hit_is_collected_as_the_lines_it_matched`
+(`tests/context_assembly.rs`).
+
+Two limits are accepted rather than fixed. A multi-line secret collapsed by
+redaction moves the lines counted after it, so in such a file a range can land
+early by the collapsed lines; `ReadWindow::ContextRange` reads the file as it is
+now, as it already does for a file edited since indexing. And chunks are cut at
+2,400 characters, not at declarations, so a range can start or end mid-function.
+Consecutive chunks share or adjoin a line, so two adjacent hits merge under
+`GUTTER = 2`, which answers the open question below for search hits; nothing yet
+measures non-adjacent clusters.
+
 ### Known open points (2026-10-25)
 
 None of these blocks acceptance; each is recorded so a later spec does not
 rediscover it:
 
-- **No automatic collection source yields a `LineRange`.** Spec 27's session
+- **Closed 2026-11-24: search hits yield `LineRange`s** (§7, "Search hits as
+  ranges"). Prompt mentions and instructions are still whole-file. The 2026-10-26
+  note follows. Spec 27's session
   pins became the first producer on 2026-10-26: a pinned range reads through
   `ReadWindow::ContextRange` and can merge or be absorbed by a whole-file item.
   Automatic collection (prompt mentions, search hits, instructions) is still

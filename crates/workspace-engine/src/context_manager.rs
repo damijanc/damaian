@@ -1740,13 +1740,16 @@ impl ContextManager {
             (CollectionSource::KeywordHit, &keyword_hits),
             (CollectionSource::SemanticHit, &semantic_hits),
         ] {
+            // A hit is the chunk that matched, not the file around it: whole
+            // files put a 90k-token test file where 60 matching lines belonged,
+            // and nothing fit. Hits in one file merge in `flush_file_ranges`.
             for hit in hits {
                 self.add_file(
                     repository_root,
                     repository_id,
                     task_id,
                     &hit.path,
-                    None,
+                    hit.lines,
                     None,
                     source,
                     ContextKind::RetrievedFile,
@@ -1762,9 +1765,9 @@ impl ContextManager {
         }
 
         // After collection, so ranges for one path can merge and a whole-file
-        // item from an earlier stage can absorb them. A session pin is the one
-        // production source that can ask for a range (spec 27 §5.4); automatic
-        // collection is still whole-file.
+        // item from an earlier stage can absorb them. Search hits and session
+        // pins (spec 27 §5.4) ask for ranges; mentions and instructions are
+        // still whole-file.
         self.flush_file_ranges(
             repository_root,
             repository_id,
@@ -1899,14 +1902,14 @@ impl ContextManager {
             let mut used = 0usize;
             let mut kept = 0usize;
             let mut truncated = false;
-            let mut exhausted = false;
 
+            // Every item is offered what is left, in priority order. An item
+            // that does not fit is dropped alone: stopping at the first miss let
+            // one 90k-token file drop every smaller hit behind it, which left
+            // most real turns with no search results and no `AGENTS.md`. A
+            // lower-priority item still never displaces a higher one; it can
+            // only use space the higher one was too large to take.
             for index in self.priority_order(category, &pending, &indices[category as usize]) {
-                if exhausted {
-                    budget_exclusion(&mut excluded, &pending[index], category);
-                    truncated = true;
-                    continue;
-                }
                 match &pending[index] {
                     PendingItem::Item(item) => {
                         if used + item.tokens <= allocation {
@@ -1916,7 +1919,6 @@ impl ContextManager {
                         } else {
                             budget_exclusion(&mut excluded, &pending[index], category);
                             truncated = true;
-                            exhausted = true;
                         }
                     }
                     PendingItem::Block(block) => {
@@ -1981,7 +1983,6 @@ impl ContextManager {
                         } else {
                             budget_exclusion(&mut excluded, &pending[index], category);
                             truncated = true;
-                            exhausted = true;
                         }
                     }
                 }
@@ -2454,10 +2455,14 @@ fn restriction_admits(path: &str, selected: &str) -> bool {
 /// identity beyond its category, so two path-less items in different categories
 /// (a block and a fetched page) are two facts rather than one.
 fn push_exclusion(excluded: &mut Vec<ExclusionRecord>, record: ExclusionRecord) {
+    // A whole-path record (`range: None`) already covers any range of that
+    // path for the same reason: a restricted file mentioned in the prompt and
+    // also matched by search is one refusal, not two.
     let duplicate = excluded.iter().any(|existing| {
         existing.reason == record.reason
             && existing.path == record.path
-            && existing.range == record.range
+            && (existing.range == record.range
+                || (existing.range.is_none() && record.path.is_some()))
             && (record.path.is_some() || existing.category == record.category)
     });
     if !duplicate {
@@ -3440,6 +3445,76 @@ mod tests {
             "{:?}",
             plan.manifest.excluded
         );
+
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    /// §5.2, 2026-11-24: an item too large for what is left is dropped alone.
+    /// The first item here is over the whole share; the two after it fit and
+    /// must survive, where the old loop stopped at the first miss.
+    #[test]
+    fn an_oversized_item_does_not_drop_the_smaller_items_after_it() {
+        let (engine, repo) = memory_repo("skip-oversized", |config| {
+            for category in ContextCategory::BUDGETED {
+                config.context_budget.set_share(category, 0);
+            }
+            config
+                .context_budget
+                .set_share(ContextCategory::SearchResults, 1_000);
+        });
+        let hit = |path: &str, tokens: usize| {
+            PendingItem::Item(ContextItem {
+                category: ContextCategory::SearchResults,
+                kind: ContextKind::RetrievedFile,
+                path: Some(path.to_string()),
+                range: None,
+                content: "x".repeat(tokens * 4),
+                tokens,
+                redaction_status: "clean".to_string(),
+                provenance: None,
+                root_path: None,
+                origin: None,
+            })
+        };
+        let plan = engine
+            .context_manager
+            .apply_budget(
+                "repo_skip",
+                "task_skip",
+                vec![
+                    hit("huge.rs", 500),
+                    hit("small.rs", 40),
+                    hit("other.rs", 40),
+                ],
+                EffectiveLimit::declared(1_000),
+                Vec::new(),
+                None,
+                Vec::new(),
+            )
+            .expect("the budget pass should succeed");
+
+        let kept = plan
+            .items
+            .iter()
+            .filter_map(|item| item.path.as_deref())
+            .collect::<Vec<_>>();
+        assert_eq!(kept, ["small.rs", "other.rs"]);
+        let dropped = plan
+            .manifest
+            .excluded
+            .iter()
+            .filter(|record| record.reason == ExclusionReason::CategoryBudgetExhausted)
+            .filter_map(|record| record.path.as_deref())
+            .collect::<Vec<_>>();
+        assert_eq!(dropped, ["huge.rs"]);
+        let usage = plan
+            .manifest
+            .categories
+            .iter()
+            .find(|usage| usage.category == ContextCategory::SearchResults)
+            .expect("the category is always reported");
+        assert_eq!((usage.used, usage.items), (80, 2));
+        assert!(usage.truncated);
 
         fs::remove_dir_all(repo).unwrap();
     }
