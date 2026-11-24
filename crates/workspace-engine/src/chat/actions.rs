@@ -597,6 +597,11 @@ impl ChatOrchestrator {
                 semantic,
                 limit,
             } => {
+                let summary = if *semantic {
+                    format!("Searched codebase semantically for \"{query}\"")
+                } else {
+                    format!("Searched codebase for \"{query}\"")
+                };
                 let index = match crate::index_cache::IndexCache::get_or_build(
                     &self.indexer,
                     repository_root,
@@ -604,7 +609,7 @@ impl ChatOrchestrator {
                     Ok(index) => index,
                     Err(error) => {
                         return (
-                            format!("Searched codebase for \"{query}\""),
+                            summary,
                             format!("Cannot search the codebase: {error}"),
                             ActionOutcome::Failed,
                         );
@@ -633,7 +638,7 @@ impl ChatOrchestrator {
                     ""
                 };
                 (
-                    format!("Searched codebase for \"{query}\""),
+                    summary,
                     format!("{}{note}", format_search_results(&results)),
                     // A search that matched nothing still ran. "No results"
                     // is an answer, not a failure.

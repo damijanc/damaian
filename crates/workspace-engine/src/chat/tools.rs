@@ -502,8 +502,17 @@ fn tool_action_marker_unscoped(
             ("search_content", pattern.clone(), side_effecting)
         }
         ToolAction::EditFile { summary, .. } => ("edit_file", summary.clone(), side_effecting),
-        ToolAction::SearchCodebase { query, .. } => {
-            ("search_codebase", query.clone(), side_effecting)
+        // Keyword is the default and keeps the bare query, so only a semantic
+        // search adds to the reference; without it the log cannot say which ran.
+        ToolAction::SearchCodebase {
+            query, semantic, ..
+        } => {
+            let reference = if *semantic {
+                format!("{query} mode=semantic")
+            } else {
+                query.clone()
+            };
+            ("search_codebase", reference, side_effecting)
         }
         ToolAction::ReadGitStatus { .. } => ("read_git_status", String::new(), side_effecting),
         ToolAction::ReadGitDiff {

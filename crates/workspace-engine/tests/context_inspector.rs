@@ -1792,6 +1792,69 @@ fn read_git_diff_refuses_paths_outside_the_session_restriction() {
     fs::remove_dir_all(repo).unwrap();
 }
 
+/// Spec 02 §8: a session log must say whether a codebase search was semantic.
+/// The keyword default keeps its old reference and transcript line.
+#[test]
+fn a_semantic_codebase_search_records_its_mode() {
+    let repo = fixture_repo("search-mode-recorded");
+    write_fixture(&repo, "src/lib.rs", "fn needle() {}\n");
+    let mut config = test_config(&repo);
+    config.model_providers.push(native_tool_provider());
+    let engine = WorkspaceEngine::new(config);
+    let index = engine.indexer.index_repository(&repo).unwrap();
+    let session = engine
+        .session_store
+        .create_session(&index.repository_id, "Search mode")
+        .unwrap();
+
+    tool_results_in_session(
+        &engine,
+        &repo,
+        &session.id,
+        &[
+            ("search_codebase", r#"{"query":"needle"}"#),
+            ("search_codebase", r#"{"query":"needle","mode":"semantic"}"#),
+        ],
+    );
+
+    let log = fs::read_to_string(
+        engine
+            .config
+            .data_dir
+            .join("sessions")
+            .join(format!("{}.jsonl", session.id)),
+    )
+    .unwrap();
+    let references = log
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .filter(|event| {
+            event["eventType"] == "action_started"
+                && event["payload"]["action"] == "search_codebase"
+        })
+        .map(|event| event["payload"]["ref"].as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(references, ["needle", "needle mode=semantic"]);
+
+    let summaries = engine
+        .session_store
+        .read_messages(&session.id)
+        .unwrap()
+        .into_iter()
+        .filter(|message| message.content.starts_with("Searched codebase"))
+        .map(|message| message.content)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        summaries,
+        [
+            "Searched codebase for \"needle\"",
+            "Searched codebase semantically for \"needle\"",
+        ]
+    );
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
 #[test]
 fn the_search_cap_counts_only_matches_inside_the_restriction() {
     let repo = fixture_repo("restricted-search-cap");

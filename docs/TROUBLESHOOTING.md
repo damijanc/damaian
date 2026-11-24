@@ -1208,6 +1208,15 @@ Replay a conversation:
 jq -r 'select(.eventType=="message_appended") | "[\(.payload.role)] \(.payload.content)"' "$SESSION_FILE"
 ```
 
+List the tools the assistant called, with each call's reference (a path, a
+pattern, a query). A `search_codebase` reference ending in ` mode=semantic` was
+an embedding search; a bare query was a keyword search. Sessions written before
+that suffix existed do not record which mode ran:
+
+```bash
+jq -r 'select(.eventType=="action_started") | "\(.payload.action) \(.payload.ref)"' "$SESSION_FILE"
+```
+
 Follow task state, which is how you spot a turn that died mid-flight — a task
 whose last status is not `complete`, `failed`, `cancelled`,
 `tool_budget_exhausted` or `token_budget_exhausted` never finished. The
