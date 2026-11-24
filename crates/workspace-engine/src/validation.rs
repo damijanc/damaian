@@ -2,7 +2,8 @@ use crate::audit::AuditLog;
 use crate::cancel::CancelToken;
 use crate::command_policy::{
     ApprovalCause, CommandClassification, CommandPolicy, CommandRisk, DecidingRule,
-    allow_always_eligible, relative_location, root_qualified_allowlist_entry,
+    allow_always_eligible, home_directory, relative_location, root_qualified_allowlist_entry,
+    session_approval_refusal,
 };
 use crate::command_purpose::{CommandPurpose, command_purpose};
 use crate::command_rules::{CommandRule, RuleEffect, RuleSource};
@@ -12,6 +13,8 @@ use crate::error::{ClientError, Result};
 use crate::hash::{create_id, now_millis, repository_id_for_root};
 use crate::path_policy::PathPolicy;
 use crate::repository_map::{RepositoryMap, RootOverride};
+use crate::session::{CommandSessionApproval, SessionStore};
+use crate::session_approval::RepositoryState;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -53,6 +56,10 @@ pub struct CommandRunRecord {
     pub stdout_ref: PathBuf,
     pub stderr_ref: PathBuf,
     pub summary_ref: PathBuf,
+    /// The run was covered by an **Approve for this session** and changed
+    /// the repository, so the approval was revoked (spec 109 D5): the paths
+    /// it changed. `None` for every other run.
+    pub session_approval_revoked: Option<Vec<String>>,
 }
 
 /// Resolves a model-requested, repository-relative working directory into the
@@ -141,6 +148,7 @@ impl CommandStore {
             stdout_ref,
             stderr_ref,
             summary_ref,
+            session_approval_revoked: None,
         })
     }
 
@@ -525,6 +533,18 @@ impl ValidationOrchestrator {
                 "Command proposal requires explicit approval before execution".to_string(),
             ));
         }
+        // Spec 109 D5: a run a session approval covers — one that runs
+        // without a card because of it, or the run the user approved for
+        // the session — is checked before and after.
+        let covered = self.covering_session_approval(&proposal);
+        let approved_by = match &covered {
+            Some(_) if !approved => "session_approval",
+            _ => approved_by,
+        };
+        let data_dir = self.command_policy.config().data_dir.clone();
+        let capture =
+            || RepositoryState::capture(Path::new(&proposal.repository_root), Some(&data_dir));
+        let before = covered.as_ref().and_then(|_| capture());
         let execution = self.command_runner.run_at(
             &proposal.command,
             &proposal.repository_root,
@@ -539,7 +559,7 @@ impl ValidationOrchestrator {
                 purpose: proposal.purpose,
             },
         )?;
-        let record = self.command_store.save_execution(&proposal, &execution)?;
+        let mut record = self.command_store.save_execution(&proposal, &execution)?;
         self.audit_log.record(
             "stored_command_executed",
             &[
@@ -550,9 +570,175 @@ impl ValidationOrchestrator {
                 ("purpose", execution.purpose.as_str().to_string()),
                 ("stdoutRef", record.stdout_ref.to_string_lossy().to_string()),
                 ("stderrRef", record.stderr_ref.to_string_lossy().to_string()),
+                ("approvedBy", approved_by.to_string()),
             ],
         )?;
+        if let Some((session_id, approval)) = covered {
+            let after = capture();
+            let changed = match (&before, &after) {
+                (Some(before), Some(after)) => before.changed_since(after),
+                // A state Git could not read is not evidence the run kept
+                // the repository unchanged.
+                _ => vec!["(the repository state could not be read)".to_string()],
+            };
+            if !changed.is_empty() {
+                self.revoke_session_approval(&session_id, &approval, &proposal, &changed)?;
+                record.session_approval_revoked = Some(changed);
+            }
+        }
         Ok(record)
+    }
+
+    /// The session approval covering `proposal` in the session whose turn
+    /// runs on this thread, if one does: the policy, with that session's
+    /// rules, lets it run because of a session rule.
+    fn covering_session_approval(
+        &self,
+        proposal: &CommandProposal,
+    ) -> Option<(String, CommandSessionApproval)> {
+        let session_id = crate::session_approval::current_session()?;
+        let approvals = self
+            .session_store()
+            .command_session_approvals(&session_id)
+            .ok()?;
+        if approvals.is_empty() {
+            return None;
+        }
+        let classification = self.command_policy.classify_at(
+            &proposal.command,
+            Path::new(&proposal.repository_root),
+            Path::new(&proposal.working_directory),
+        );
+        let rule = classification
+            .rule
+            .filter(|rule| rule.source == "session")?;
+        let config = self.command_policy.config();
+        approvals
+            .into_iter()
+            .find(|approval| {
+                CommandRule::session(
+                    &approval.command,
+                    Path::new(&approval.directory),
+                    home_directory().as_deref(),
+                    config.shell_parameters(),
+                )
+                .is_ok_and(|candidate| candidate.text() == rule.rule)
+            })
+            .map(|approval| (session_id, approval))
+    }
+
+    fn session_store(&self) -> SessionStore {
+        SessionStore::new(&self.command_policy.config().data_dir)
+    }
+
+    /// Records **Approve for this session** for a stored proposal (spec 109
+    /// D5), after checking it qualifies: the exact command in the exact
+    /// directory, for `session_id` only. The caller runs the command next,
+    /// as for an ordinary approval.
+    pub fn approve_for_session(
+        &self,
+        session_id: &str,
+        proposal_id: &str,
+        approved_by: &str,
+    ) -> Result<CommandSessionApproval> {
+        let proposal = self.command_store.load_proposal(proposal_id)?;
+        if let Some(refusal) = self.session_approval_refusal(&proposal) {
+            return Err(ClientError::PolicyBlocked(format!(
+                "Cannot approve `{}` for this session: {refusal}",
+                proposal.command
+            )));
+        }
+        let directory =
+            crate::command_policy::normalize_lexically(Path::new(&proposal.working_directory))
+                .to_string_lossy()
+                .into_owned();
+        let approval = CommandSessionApproval {
+            command: proposal.command.trim().to_string(),
+            directory,
+        };
+        self.session_store().approve_command_for_session(
+            session_id,
+            &approval.command,
+            &approval.directory,
+            approved_by,
+        )?;
+        self.audit_log.record(
+            "command_approved_for_session",
+            &[
+                ("actor", approved_by.to_string()),
+                ("sessionId", session_id.to_string()),
+                ("proposalId", proposal.id.clone()),
+                ("command", approval.command.clone()),
+                ("workingDirectory", approval.directory.clone()),
+            ],
+        )?;
+        Ok(approval)
+    }
+
+    /// Why a stored proposal is not offered **Approve for this session**, or
+    /// `None` when it is; judged from the causes it was stored with.
+    pub fn session_approval_refusal(&self, proposal: &CommandProposal) -> Option<String> {
+        session_approval_refusal(
+            self.command_policy.config(),
+            &proposal.command,
+            &proposal.causes,
+            proposal.blocked,
+            proposal.requires_approval,
+            Path::new(&proposal.repository_root),
+            Path::new(&proposal.working_directory),
+        )
+    }
+
+    /// Ends every session approval of `session_id` (**Revoke session
+    /// approvals**); the number ended.
+    pub fn revoke_session_approvals(&self, session_id: &str, revoked_by: &str) -> Result<usize> {
+        let count = self
+            .session_store()
+            .revoke_all_command_session_approvals(session_id, "revoked_by_user")?;
+        if count > 0 {
+            self.audit_log.record(
+                "command_session_approval_revoked",
+                &[
+                    ("actor", revoked_by.to_string()),
+                    ("sessionId", session_id.to_string()),
+                    ("reason", "revoked_by_user".to_string()),
+                    ("count", count.to_string()),
+                ],
+            )?;
+        }
+        Ok(count)
+    }
+
+    fn revoke_session_approval(
+        &self,
+        session_id: &str,
+        approval: &CommandSessionApproval,
+        proposal: &CommandProposal,
+        changed: &[String],
+    ) -> Result<()> {
+        self.session_store().revoke_command_session_approval(
+            session_id,
+            approval,
+            "changed_repository",
+            changed,
+        )?;
+        self.audit_log.record(
+            "command_session_approval_revoked",
+            &[
+                ("actor", "system".to_string()),
+                ("sessionId", session_id.to_string()),
+                ("proposalId", proposal.id.clone()),
+                ("command", approval.command.clone()),
+                ("workingDirectory", approval.directory.clone()),
+                ("reason", "changed_repository".to_string()),
+                ("changed", changed.join(",")),
+            ],
+        )?;
+        crate::session_approval::push_notice(session_approval_revoked_note(
+            &approval.command,
+            changed,
+        ));
+        Ok(())
     }
 
     /// Runs a stored proposal in a copy of its repository instead of the
@@ -798,6 +984,24 @@ fn exact_user_rule(command: &str, directory: &str) -> Option<CommandRule> {
     .ok()?;
     let read_back = CommandRule::parse(&rule.text(), RuleSource::User).ok()?;
     (read_back == rule).then_some(rule)
+}
+
+/// The line a turn reports when a covered run changed the repository.
+pub fn session_approval_revoked_note(command: &str, changed: &[String]) -> String {
+    const SHOWN: usize = 5;
+    let mut paths = changed
+        .iter()
+        .take(SHOWN)
+        .map(|path| format!("`{path}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if changed.len() > SHOWN {
+        paths.push_str(&format!(" and {} more", changed.len() - SHOWN));
+    }
+    format!(
+        "`{command}` changed the repository ({paths}), so its approval for this session is \
+         revoked; Damaian will ask before running it again."
+    )
 }
 
 fn proposal_from_classification(

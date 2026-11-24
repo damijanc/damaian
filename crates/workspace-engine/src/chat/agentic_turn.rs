@@ -262,8 +262,52 @@ impl ChatOrchestrator {
         })
     }
 
+    /// One agentic turn, run as `session`'s turn (spec 109 D5): the command
+    /// policy adds the session's approvals, and a revocation made during the
+    /// turn is reported in its response.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn run_agentic_turn(
+        &self,
+        repository_root: &Path,
+        session: Session,
+        task: Task,
+        context_files: Vec<String>,
+        messages: Vec<ModelMessage>,
+        action_rounds: u32,
+        exploration_rounds: u32,
+        turn_notes: TurnNotesState,
+        completed_tool_rounds: CompletedToolTracker,
+        step_evidence: Vec<crate::plan::Evidence>,
+        plan_reminder_sent: bool,
+        model_adapter: &mut dyn ModelAdapter,
+        sink: &mut TurnSink<'_>,
+        turn_options: ChatTurnOptions,
+        segment_pause: Option<&TaskSegmentPauseState>,
+    ) -> Result<ChatTurnResult> {
+        let session_id = session.id.clone();
+        in_session_scope(&session_id, || {
+            self.run_agentic_turn_in_scope(
+                repository_root,
+                session,
+                task,
+                context_files,
+                messages,
+                action_rounds,
+                exploration_rounds,
+                turn_notes,
+                completed_tool_rounds,
+                step_evidence,
+                plan_reminder_sent,
+                model_adapter,
+                sink,
+                turn_options,
+                segment_pause,
+            )
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_agentic_turn_in_scope(
         &self,
         repository_root: &Path,
         session: Session,

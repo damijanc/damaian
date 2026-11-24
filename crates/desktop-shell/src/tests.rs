@@ -9631,3 +9631,118 @@ fn app_js_lists_and_edits_command_rules_in_settings() {
     );
     assert!(super::APP_JS.contains("\"Delete command rule?\""));
 }
+
+/// Spec 109 D5: `/api/command-session-approval` records **Approve for this
+/// session** for a stored proposal that qualifies and refuses one that does
+/// not; `/api/session-approvals-revoke` ends the session's approvals and says
+/// how many. Neither runs anything.
+#[test]
+fn session_approval_routes_record_refuse_and_revoke() {
+    let repo = temp_shell_repo("session-approval-routes");
+    let git = |args: &[&str]| {
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+    };
+    git(&["init", "-q"]);
+    let repo_str = repo.to_string_lossy().to_string();
+    let engine = engine_for_repo(&repo_str).unwrap();
+    let qualifies = engine
+        .validation_orchestrator
+        .propose_command(&repo, "stack test", "test proposal")
+        .unwrap();
+    let chain = engine
+        .validation_orchestrator
+        .propose_command(&repo, "stack test && stack build", "test proposal")
+        .unwrap();
+    let (port, token) = serve_for_test();
+
+    let approved = post_fields_for_test(
+        port,
+        &token,
+        "/api/command-session-approval",
+        &[
+            ("repo", &repo_str),
+            ("session_id", "session_routes"),
+            ("proposal_id", &qualifies.id),
+        ],
+    );
+    assert!(approved.starts_with("HTTP/1.1 200"), "{approved}");
+    assert_eq!(json_of(&approved)["command"], "stack test");
+    let refused = post_fields_for_test(
+        port,
+        &token,
+        "/api/command-session-approval",
+        &[
+            ("repo", &repo_str),
+            ("session_id", "session_routes"),
+            ("proposal_id", &chain.id),
+        ],
+    );
+    assert!(refused.starts_with("HTTP/1.1 409"), "{refused}");
+    assert!(
+        json_of(&refused)["error"]
+            .as_str()
+            .unwrap()
+            .contains("shell control")
+    );
+    assert_eq!(
+        engine
+            .session_store
+            .command_session_approvals("session_routes")
+            .unwrap()
+            .len(),
+        1
+    );
+
+    let revoked = post_fields_for_test(
+        port,
+        &token,
+        "/api/session-approvals-revoke",
+        &[("repo", &repo_str), ("session_id", "session_routes")],
+    );
+    assert!(revoked.starts_with("HTTP/1.1 200"), "{revoked}");
+    assert_eq!(json_of(&revoked)["revoked"], 1);
+    assert!(
+        engine
+            .session_store
+            .command_session_approvals("session_routes")
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// Spec 109 D5: the command card offers **Approve for this session** in its
+/// approval overflow and a check or baseline card per check, only when the
+/// payload says the command qualifies; both record the approval before the
+/// ordinary approval runs it. The session ⋮ menus carry **Revoke session
+/// approvals**.
+#[test]
+fn app_js_offers_approve_for_this_session_and_its_revoke() {
+    let app = super::APP_JS;
+    assert!(app.contains("if (proposal.sessionApprovable && !decide && !detached) {"));
+    assert!(app.contains("label: \"Approve for this session\","));
+    assert!(app.contains(
+        "if (sessionApproval) await approveForSession(proposalRepo, proposal.proposalId);"
+    ));
+    assert!(app.contains("if (check.sessionApprovable && !decide) {"));
+    assert!(app.contains(
+        "for (const proposalId of forSession) await approveForSession(batchRepo, proposalId);"
+    ));
+    assert!(app.contains("\"/api/command-session-approval\","));
+    assert!(app.contains("\"/api/session-approvals-revoke\","));
+    assert!(app.contains("label: \"Revoke session approvals\","));
+    assert_eq!(
+        app.matches("        revokeSessionApprovalsMenuItem(projectPath, session")
+            .count(),
+        2,
+        "both session ⋮ menus"
+    );
+}

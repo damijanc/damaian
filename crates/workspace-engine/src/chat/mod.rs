@@ -662,3 +662,29 @@ mod memory_proposal_tests;
 #[cfg(test)]
 #[path = "tests/paused_turn_session_tests.rs"]
 mod paused_turn_session_tests;
+
+/// Runs `work` as `session_id`'s turn (spec 109 D5). The outermost scope
+/// appends what the turn revoked to the response, so the user reads it where
+/// the turn reports; nested scopes leave that to it.
+pub(super) fn in_session_scope(
+    session_id: &str,
+    work: impl FnOnce() -> Result<ChatTurnResult>,
+) -> Result<ChatTurnResult> {
+    let outermost = crate::session_approval::current_session().is_none();
+    if outermost {
+        crate::session_approval::take_notices();
+    }
+    let mut outcome = crate::session_approval::with_session(session_id, work);
+    if outermost {
+        let notices = crate::session_approval::take_notices();
+        if let Ok(result) = &mut outcome {
+            for notice in notices {
+                if !result.response.is_empty() {
+                    result.response.push_str("\n\n");
+                }
+                result.response.push_str(&notice);
+            }
+        }
+    }
+    outcome
+}

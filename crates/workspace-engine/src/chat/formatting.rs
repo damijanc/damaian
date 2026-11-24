@@ -25,6 +25,15 @@ pub(super) fn agent_command_proposal(
     config: &Config,
     proposal: &CommandProposal,
 ) -> AgentCommandProposal {
+    let session_refusal = crate::command_policy::session_approval_refusal(
+        config,
+        &proposal.command,
+        &proposal.causes,
+        proposal.blocked,
+        proposal.requires_approval,
+        Path::new(&proposal.repository_root),
+        Path::new(&proposal.working_directory),
+    );
     AgentCommandProposal {
         id: proposal.id.clone(),
         command: proposal.command.clone(),
@@ -40,6 +49,8 @@ pub(super) fn agent_command_proposal(
         reason: proposal.reason.clone(),
         allow_always: allow_always_eligible(config, &proposal.command, proposal.blocked),
         allow_browser_diagnostics_for_session: false,
+        session_approvable: session_refusal.is_none(),
+        session_approval_refusal: session_refusal.unwrap_or_default(),
         directory: Path::new(&proposal.working_directory)
             .strip_prefix(&proposal.repository_root)
             .map(|relative| relative.to_string_lossy().to_string())
@@ -207,6 +218,15 @@ pub(super) fn tool_call_summary(command_request: &CommandRequest) -> String {
     )
 }
 
+/// [`tool_call_summary`] for a run **Approve for this session** let through
+/// (spec 109 D5). Still starts "Ran `", which the transcript groups on.
+pub(super) fn session_approved_call_summary(command_request: &CommandRequest) -> String {
+    format!(
+        "Ran `{}` (approved for this session) — {}",
+        command_request.command, command_request.reason
+    )
+}
+
 /// Repository-relative file paths under the configured ignore rules, walked
 /// the way the indexer walks (`indexer.rs`).
 pub(super) fn repository_files(repository_root: &Path, ignore_patterns: &[String]) -> Vec<String> {
@@ -278,4 +298,21 @@ pub(super) fn session_title(prompt: &str) -> String {
     } else {
         title
     }
+}
+
+/// A command's tool result, with the line saying its session approval was
+/// revoked when the run changed the repository (spec 109 D5), so the model
+/// knows the next run will ask.
+pub(super) fn command_context_with_revocation(
+    record: &crate::validation::CommandRunRecord,
+) -> String {
+    let mut context = sandbox_command_context(&record.execution);
+    if let Some(changed) = &record.session_approval_revoked {
+        context.push_str("\n\n");
+        context.push_str(&crate::validation::session_approval_revoked_note(
+            &record.execution.command,
+            changed,
+        ));
+    }
+    context
 }

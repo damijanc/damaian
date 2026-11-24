@@ -274,7 +274,7 @@ impl ChatOrchestrator {
                 cx.task,
                 &record.execution,
             )?;
-            let command_context = sandbox_command_context(&record.execution);
+            let command_context = command_context_with_revocation(&record);
             // The exit code is in hand right here, one statement before
             // the marker is finished. Nothing downstream can recover it
             // — `CommandExecution` is never persisted to the session log
@@ -288,8 +288,19 @@ impl ChatOrchestrator {
                 )
                 .unwrap_or_else(|| record.execution.working_directory.clone()),
             );
+            // Spec 109 D5: a run that needed no card because of a session
+            // approval says so in its row.
+            let summary = if proposal
+                .rule
+                .as_ref()
+                .is_some_and(|rule| rule.source == "session")
+            {
+                session_approved_call_summary(&command_request)
+            } else {
+                tool_call_summary(&command_request)
+            };
             (
-                tool_call_summary(&command_request),
+                summary,
                 command_context,
                 ActionOutcome::CommandExit(exit_code, record.execution.purpose),
             )

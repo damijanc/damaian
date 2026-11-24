@@ -246,6 +246,8 @@ pub(super) fn mcp_approval_proposal(
         // config is the knob for making these stop prompting.
         allow_always: false,
         allow_browser_diagnostics_for_session: false,
+        session_approvable: false,
+        session_approval_refusal: String::new(),
         directory: String::new(),
     }
 }
@@ -293,6 +295,8 @@ pub(super) fn web_diagnostic_approval_proposal(
         // The session grant covers loopback only, so a remote URL is never
         // offered it: each remote diagnostic is approved on its own.
         allow_browser_diagnostics_for_session: !call.is_low_risk() && call.targets_loopback(),
+        session_approvable: false,
+        session_approval_refusal: String::new(),
         directory: String::new(),
     }
 }

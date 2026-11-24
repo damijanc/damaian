@@ -373,6 +373,12 @@ pub struct AgentCommandProposal {
     /// This is intentionally separate from command allowlisting: it writes a
     /// session event, not repository or user config.
     pub allow_browser_diagnostics_for_session: bool,
+    /// Whether the Approve button may offer **Approve for this session**
+    /// (spec 109 D5): the command qualifies by why the policy asks.
+    pub session_approvable: bool,
+    /// Why it is not offered, in words for the card; empty when it is, and
+    /// for a call that is not a local command.
+    pub session_approval_refusal: String,
     /// Where the command runs, relative to the repository root; empty at the
     /// root and for a call that is not a local command. A check card shows it,
     /// since two checks can share a command and differ only here (spec 90).

@@ -359,7 +359,7 @@ pub(crate) fn command_proposal_json(result: &ChatTurnResult) -> String {
 /// cause or `Allow Always` answer from the command it names.
 fn agent_command_json(proposal: &workspace_engine::AgentCommandProposal) -> String {
     format!(
-        "{{\"proposalId\":\"{}\",\"command\":\"{}\",\"prompt\":\"{}\",\"risk\":\"{}\",\"requiresApproval\":{},\"blocked\":{},\"cause\":\"{}\",\"reason\":\"{}\",\"allowAlways\":{},\"allowBrowserDiagnosticsForSession\":{},\"directory\":\"{}\"}}",
+        "{{\"proposalId\":\"{}\",\"command\":\"{}\",\"prompt\":\"{}\",\"risk\":\"{}\",\"requiresApproval\":{},\"blocked\":{},\"cause\":\"{}\",\"reason\":\"{}\",\"allowAlways\":{},\"allowBrowserDiagnosticsForSession\":{},\"sessionApprovable\":{},\"sessionApprovalRefusal\":\"{}\",\"directory\":\"{}\"}}",
         escape_json(&proposal.id),
         escape_json(&proposal.command),
         escape_json(&proposal.prompt),
@@ -370,6 +370,8 @@ fn agent_command_json(proposal: &workspace_engine::AgentCommandProposal) -> Stri
         escape_json(&proposal.reason),
         proposal.allow_always,
         proposal.allow_browser_diagnostics_for_session,
+        proposal.session_approvable,
+        escape_json(&proposal.session_approval_refusal),
         escape_json(&proposal.directory)
     )
 }

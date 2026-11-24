@@ -3438,6 +3438,138 @@ fn browser_diagnostic_session_approval_allows_later_scenarios() {
     fs::remove_dir_all(repo).unwrap();
 }
 
+/// Spec 109 D5: **Approve for this session** on a command card runs it, and
+/// the next turn's proposal of the same command in the same directory runs
+/// without a card, its row saying why. A run that then changes a tracked file
+/// loses the approval, and the turn says so.
+#[test]
+fn a_command_approved_for_the_session_runs_without_a_card_until_a_run_changes_a_file() {
+    use std::os::unix::fs::PermissionsExt;
+    let repo = temp_dir("chat-command-session-approval");
+    write_fixture(&repo, "README.md", "# Project\n");
+    write_fixture(&repo, ".gitignore", ".damaian/\ntarget/\n");
+    write_fixture(
+        &repo,
+        "bin/check",
+        "#!/bin/sh\nmkdir -p target && echo built > target/out\nif [ -f write-source ]; then echo changed > README.md; fi\necho checked\n",
+    );
+    fs::set_permissions(repo.join("bin/check"), fs::Permissions::from_mode(0o755)).unwrap();
+    run_git(&repo, &["init", "-q"]);
+    run_git(&repo, &["add", "."]);
+    run_git(
+        &repo,
+        &[
+            "-c",
+            "user.email=t@example.com",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-qm",
+            "init",
+        ],
+    );
+    let mut config = test_config(&repo);
+    config.model_providers.push(native_tool_provider());
+    let engine = WorkspaceEngine::new(config);
+    let check_call = ToolCall {
+        id: "call_check".to_string(),
+        name: "run_command".to_string(),
+        arguments_json: "{\"command\":\"bin/check\",\"reason\":\"Run the project check\"}"
+            .to_string(),
+    };
+    let mut adapter = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![String::new()],
+        vec![vec![check_call.clone()]],
+    );
+    let mut on_token = |_token: &str| {};
+    let first = engine
+        .chat_orchestrator
+        .ask(&repo, "Run the check.", &[], &mut adapter, &mut on_token)
+        .unwrap();
+    let proposal = first.command_proposal.expect("an unknown program asks");
+    assert!(proposal.session_approvable, "{proposal:?}");
+    assert!(proposal.session_approval_refusal.is_empty());
+
+    engine
+        .validation_orchestrator
+        .approve_for_session(&first.session.id, &proposal.id, "test_user")
+        .unwrap();
+    let mut resume_adapter = MockModelAdapter::new("The check passed.");
+    let resumed = resume_command_decision_with_options(
+        &engine,
+        &proposal.id,
+        true,
+        ResumeDecisionOptions::default(),
+        &mut resume_adapter,
+    );
+    assert!(resumed.command_proposal.is_none());
+
+    let ask_again = |adapter: &mut MockModelAdapter| {
+        let cancel = CancelToken::new();
+        let mut on_token = |_token: &str| {};
+        let mut on_progress = |_event: TurnProgress| {};
+        let mut sink = TurnSink {
+            on_token: &mut on_token,
+            on_progress: &mut on_progress,
+            cancel: &cancel,
+            steering: None,
+        };
+        engine
+            .chat_orchestrator
+            .ask_with_session(
+                &repo,
+                "Run the check again.",
+                &[],
+                Some(&first.session.id),
+                adapter,
+                &mut sink,
+            )
+            .unwrap()
+    };
+    let mut second_adapter = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![String::new(), "It passed again.".to_string()],
+        vec![vec![check_call.clone()], Vec::new()],
+    );
+    let second = ask_again(&mut second_adapter);
+    assert!(second.command_proposal.is_none(), "no card the second time");
+    let messages = engine
+        .session_store
+        .read_messages(&first.session.id)
+        .unwrap();
+    assert!(
+        messages.iter().any(|message| message
+            .content
+            .starts_with("Ran `bin/check` (approved for this session)")),
+        "{messages:?}"
+    );
+    let audit_log = fs::read_to_string(repo.join(".damaian/audit/events.jsonl")).unwrap();
+    assert!(audit_log.contains("command_approved_for_session"));
+    assert!(audit_log.contains("session_approval"));
+
+    // This run changes a tracked file: the approval is revoked and the turn
+    // reports it; the next proposal asks again.
+    fs::write(repo.join("write-source"), "").unwrap();
+    let mut third_adapter = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![String::new(), "Done.".to_string()],
+        vec![vec![check_call.clone()], Vec::new()],
+    );
+    let third = ask_again(&mut third_adapter);
+    assert!(third.command_proposal.is_none());
+    assert!(
+        third
+            .response
+            .contains("`bin/check` changed the repository (`README.md`)"),
+        "{}",
+        third.response
+    );
+    let mut fourth_adapter =
+        MockModelAdapter::new_sequence_with_tool_calls(vec![String::new()], vec![vec![check_call]]);
+    let fourth = ask_again(&mut fourth_adapter);
+    assert!(fourth.command_proposal.is_some(), "it asks again");
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
 // Spec 12 §5.4: "Allow browser diagnostics for this session" covers loopback
 // only. After it is granted, a remote URL still needs its own approval, is
 // not offered the grant, and cannot extend it at resume.

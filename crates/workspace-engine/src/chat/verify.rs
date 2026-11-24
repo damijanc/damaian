@@ -31,8 +31,11 @@ impl ChatOrchestrator {
         sink: &mut TurnSink<'_>,
     ) -> Result<ChatTurnResult> {
         let repository_root = repository_root.as_ref();
-        let result = self.verify_due_report(repository_root, session_id, model_adapter, sink)?;
-        self.continue_task_after_verification(repository_root, result, model_adapter, sink)
+        in_session_scope(session_id, || {
+            let result =
+                self.verify_due_report(repository_root, session_id, model_adapter, sink)?;
+            self.continue_task_after_verification(repository_root, result, model_adapter, sink)
+        })
     }
 
     fn verify_due_report(
@@ -525,22 +528,25 @@ impl ChatOrchestrator {
         sink: &mut TurnSink<'_>,
     ) -> Result<ChatTurnResult> {
         let pending = self.pending_commands.load(batch_id)?;
-        // A failed check's baseline uses the same card and the same resume
-        // route (spec 109 D1). It records baselines, then finishes the
-        // verification that was waiting to classify its failures.
-        if pending.failure_baseline.is_some() {
-            return self.resume_failure_baseline(
-                batch_id,
-                decisions,
-                approved_by,
-                model_adapter,
-                sink,
-            );
-        }
-        let repository_root = PathBuf::from(&pending.repository_root);
-        let result =
-            self.check_decision_report(batch_id, decisions, approved_by, model_adapter, sink)?;
-        self.continue_task_after_verification(&repository_root, result, model_adapter, sink)
+        let session_id = pending.session.id.clone();
+        in_session_scope(&session_id, || {
+            // A failed check's baseline uses the same card and the same resume
+            // route (spec 109 D1). It records baselines, then finishes the
+            // verification that was waiting to classify its failures.
+            if pending.failure_baseline.is_some() {
+                return self.resume_failure_baseline(
+                    batch_id,
+                    decisions,
+                    approved_by,
+                    model_adapter,
+                    sink,
+                );
+            }
+            let repository_root = PathBuf::from(&pending.repository_root);
+            let result =
+                self.check_decision_report(batch_id, decisions, approved_by, model_adapter, sink)?;
+            self.continue_task_after_verification(&repository_root, result, model_adapter, sink)
+        })
     }
 
     /// Parks a verification on the card for its failed checks' baselines

@@ -12422,6 +12422,7 @@ function toggleSessionMenu(projectPath, session, anchorEl) {
           onSelect: runSessionAction(() => exportSessionDownload(session)),
         },
         sessionArchiveMenuItem(projectPath, session),
+        revokeSessionApprovalsMenuItem(projectPath, session),
       ],
       [
         {
@@ -12445,6 +12446,41 @@ function sessionArchiveMenuItem(projectPath, session, { disabled = false } = {})
     disabled,
     onSelect: runSessionAction(() => setSessionArchived(projectPath, session, !archived)),
   };
+}
+
+// Spec 109 D5: ends every **Approve for this session** of the session. Kept
+// beside Archive, which ends them too.
+function revokeSessionApprovalsMenuItem(projectPath, session, { disabled = false } = {}) {
+  return {
+    label: "Revoke session approvals",
+    action: "revoke-session-approvals",
+    disabled,
+    onSelect: runSessionAction(async () => {
+      const payload = await api(
+        "/api/session-approvals-revoke",
+        form({ repo: projectPath || "", session_id: session.id }),
+      );
+      toast(
+        payload.revoked
+          ? `Revoked ${payload.revoked} session ${payload.revoked === 1 ? "approval" : "approvals"}`
+          : "This session has no approved commands",
+      );
+    }),
+  };
+}
+
+// Records **Approve for this session** of a stored proposal (spec 109 D5)
+// before the card's ordinary approval runs it; the engine refuses a command
+// that does not qualify.
+async function approveForSession(proposalRepo, proposalId) {
+  await api(
+    "/api/command-session-approval",
+    form({
+      repo: proposalRepo,
+      proposal_id: proposalId,
+      session_id: currentSessionId || "",
+    }),
+  );
 }
 
 function renderSessionOptions(sessions = []) {
@@ -13704,8 +13740,23 @@ function createCheckBatchCard(
       grant.append(always, document.createTextNode(" Always allow"));
       row.append(grant);
     }
+    // Spec 109 D5: per check, only where the engine says it qualifies.
+    let forSession = null;
+    if (check.sessionApprovable && !decide) {
+      const grant = document.createElement("label");
+      grant.className = "check-batch-allow";
+      grant.title = "Runs without asking until the session ends; revoked if a run changes files";
+      forSession = document.createElement("input");
+      forSession.type = "checkbox";
+      forSession.disabled = true;
+      run.addEventListener("change", () => {
+        forSession.disabled = !run.checked;
+      });
+      grant.append(forSession, document.createTextNode(" For this session"));
+      row.append(grant);
+    }
     list.append(row);
-    return { check, run, always };
+    return { check, run, always, forSession };
   });
 
   const actions = document.createElement("div");
@@ -13754,6 +13805,9 @@ function createCheckBatchCard(
       .filter(({ run, always }) => run.checked && always?.checked)
       .map(({ check }) => check.proposalId)
       .join("\n");
+    const forSession = rows
+      .filter(({ run, forSession }) => run.checked && forSession?.checked)
+      .map(({ check }) => check.proposalId);
     card.classList.add("submitted");
     // Spec 109 D7: while the checks run, the card shows the turn's running
     // state with Cancel where its buttons were. The row follows the running
@@ -13771,6 +13825,7 @@ function createCheckBatchCard(
         await decide(decisions);
         return;
       }
+      for (const proposalId of forSession) await approveForSession(batchRepo, proposalId);
       if (decisions.some((decision) => decision.approved)) runningListeners.add(showRunning);
       await runVerificationStream(
         (handlers) =>
@@ -16187,6 +16242,15 @@ function createCommandApprovalPreview(
       onSelect: () => runWithGrant({ always: true }, "Command allowed for this project"),
     });
   }
+  // Spec 109 D5: offered only when the engine says the command qualifies. A
+  // detached card has no turn whose session the approval could belong to.
+  if (proposal.sessionApprovable && !decide && !detached) {
+    menuItems.push({
+      label: "Approve for this session",
+      hint: "This command here, until the session ends; revoked if a run changes files",
+      onSelect: () => runWithGrant({ sessionApproval: true }, "Approved for this session"),
+    });
+  }
   if (proposal.allowBrowserDiagnosticsForSession && !decide) {
     menuItems.push({
       label: "Allow for this session",
@@ -16229,6 +16293,7 @@ function createCommandApprovalPreview(
   async function resolveCommandProposal(approved, options = {}) {
     const always = options.always === true;
     const allowBrowserDiagnosticsForSession = options.allowBrowserDiagnosticsForSession === true;
+    const sessionApproval = options.sessionApproval === true;
     runButton.disabled = true;
     rejectButton.disabled = true;
     if (overflowButton) overflowButton.disabled = true;
@@ -16303,6 +16368,7 @@ function createCommandApprovalPreview(
       return;
     }
 
+    if (sessionApproval) await approveForSession(proposalRepo, proposal.proposalId);
     const assistantMessage = appendChatMessage("assistant", "");
     const indicator = startTurnIndicator(assistantMessage);
     let assistantText = "";
@@ -16375,6 +16441,9 @@ function createCommandApprovalPreview(
     } else if (allowBrowserDiagnosticsForSession) {
       output.textContent =
         "Browser diagnostics allowed for this session — see the assistant's answer above.";
+    } else if (sessionApproval) {
+      output.textContent =
+        "Approved for this session — see the assistant's answer above. It runs without asking until the session ends or a run changes files.";
     } else if (always) {
       output.textContent =
         "Command approved and added to this project's allowlist — see the assistant's answer above.";
@@ -17199,6 +17268,7 @@ function toggleThreadMenu(anchorEl) {
           onSelect: runSessionAction(() => exportSessionDownload(session)),
         },
         sessionArchiveMenuItem(projectPath, session, { disabled: noSession }),
+        revokeSessionApprovalsMenuItem(projectPath, session, { disabled: noSession }),
       ],
       [
         {

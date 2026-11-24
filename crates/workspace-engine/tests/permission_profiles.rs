@@ -583,6 +583,14 @@ fn weakening_cases() -> Vec<WeakeningCase> {
             "allow_browser_diagnostics=true\n",
             Reported("allow_browser_diagnostics"),
         ),
+        // Spec 109 D5: a clone may turn **Approve for this session** off,
+        // never on.
+        case(
+            "session_command_approval",
+            "session_command_approval=false\n",
+            "session_command_approval=true\n",
+            Reported("session_command_approval"),
+        ),
         case(
             "allow_mutating_mcp_tools",
             "allow_mutating_mcp_tools=false\n",
