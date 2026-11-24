@@ -1890,6 +1890,10 @@ impl ContextManager {
         // could never turn one off — the assumption the test helper that zeroes
         // every share already makes.
         let mut carry = 0usize;
+        // Items that did not fit their category's allocation, in category
+        // pipeline order and then priority order. Recorded as exclusions only
+        // after the backfill below has had its chance at them.
+        let mut dropped: Vec<(ContextCategory, usize)> = Vec::new();
         for category in ContextCategory::BUDGETED {
             let share = self.budget.share(category);
             // Integer basis points all the way: no float decides inclusion.
@@ -1917,7 +1921,7 @@ impl ContextManager {
                             kept += 1;
                             placed[index] = Some(item.clone());
                         } else {
-                            budget_exclusion(&mut excluded, &pending[index], category);
+                            dropped.push((category, index));
                             truncated = true;
                         }
                     }
@@ -2001,6 +2005,54 @@ impl ContextManager {
                 truncated,
                 estimated: true,
             });
+        }
+
+        // Backfill (§5.2): the carry flows forward only, so the first category
+        // never sees what later ones leave unspent. A 6.7k `AGENTS.md` was
+        // dropped for missing its 6.4k share by 300 tokens in a turn that used
+        // 1k of 64k. Whatever the last category released is offered to the
+        // dropped items in the same order the pass used, so a higher-priority
+        // category still gets the leftovers first and memory gets them last.
+        // A switched-off category (share 0) stays off.
+        let mut spare = carry;
+        let mut still_dropped = Vec::new();
+        for (category, index) in dropped {
+            let PendingItem::Item(item) = &pending[index] else {
+                continue;
+            };
+            if self.budget.share(category) != 0 && item.tokens <= spare {
+                spare -= item.tokens;
+                placed[index] = Some(item.clone());
+                if let Some(usage) = categories
+                    .iter_mut()
+                    .find(|usage| usage.category == category)
+                {
+                    usage.allocated += item.tokens;
+                    usage.used += item.tokens;
+                    usage.items += 1;
+                }
+            } else {
+                still_dropped.push((category, index));
+            }
+        }
+        // A category whose every dropped item was backfilled is no longer
+        // truncated, unless a block in it was re-rendered short or dropped.
+        for usage in categories.iter_mut() {
+            usage.truncated = usage.truncated
+                && (still_dropped
+                    .iter()
+                    .any(|(category, _)| *category == usage.category)
+                    || excluded.iter().any(|record| {
+                        record.category == usage.category
+                            && matches!(
+                                record.reason,
+                                ExclusionReason::Truncated
+                                    | ExclusionReason::CategoryBudgetExhausted
+                            )
+                    }));
+        }
+        for (category, index) in still_dropped {
+            budget_exclusion(&mut excluded, &pending[index], category);
         }
 
         // Only an included memory item keeps its manifest row. A dropped entry
@@ -3515,6 +3567,93 @@ mod tests {
             .expect("the category is always reported");
         assert_eq!((usage.used, usage.items), (80, 2));
         assert!(usage.truncated);
+
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    /// §5.2 backfill: an instruction file over its own share is included from
+    /// what later categories left unspent, and the backfill goes in pipeline
+    /// order, so instructions are served before memory. Shares here: 100
+    /// tokens of instructions, 100 of search results that nothing uses, 10 of
+    /// memory; 210 reach the end of the pass unspent.
+    #[test]
+    fn unspent_budget_backfills_dropped_items_in_category_order() {
+        let (engine, repo) = memory_repo("backfill", |config| {
+            for category in ContextCategory::BUDGETED {
+                config.context_budget.set_share(category, 0);
+            }
+            config
+                .context_budget
+                .set_share(ContextCategory::Instructions, 1_000);
+            config
+                .context_budget
+                .set_share(ContextCategory::SearchResults, 1_000);
+            config
+                .context_budget
+                .set_share(ContextCategory::Memory, 100);
+        });
+        let item = |category, kind, path: &str, tokens: usize| {
+            PendingItem::Item(ContextItem {
+                category,
+                kind,
+                path: Some(path.to_string()),
+                range: None,
+                content: "x".repeat(tokens * 4),
+                tokens,
+                redaction_status: "clean".to_string(),
+                provenance: None,
+                root_path: None,
+                origin: None,
+            })
+        };
+        let plan = engine
+            .context_manager
+            .apply_budget(
+                "repo_backfill",
+                "task_backfill",
+                vec![
+                    item(
+                        ContextCategory::Instructions,
+                        ContextKind::AgentInstruction,
+                        "AGENTS.md",
+                        150,
+                    ),
+                    item(ContextCategory::Memory, ContextKind::Memory, "memory", 250),
+                ],
+                EffectiveLimit::declared(1_000),
+                Vec::new(),
+                None,
+                Vec::new(),
+            )
+            .expect("the budget pass should succeed");
+
+        let kept = plan
+            .items
+            .iter()
+            .filter_map(|item| item.path.as_deref())
+            .collect::<Vec<_>>();
+        assert_eq!(kept, ["AGENTS.md"]);
+        let dropped = plan
+            .manifest
+            .excluded
+            .iter()
+            .filter(|record| record.reason == ExclusionReason::CategoryBudgetExhausted)
+            .filter_map(|record| record.path.as_deref())
+            .collect::<Vec<_>>();
+        assert_eq!(dropped, ["memory"]);
+        let usage = |category| {
+            plan.manifest
+                .categories
+                .iter()
+                .find(|usage| usage.category == category)
+                .copied()
+                .expect("every category is reported")
+        };
+        let instructions = usage(ContextCategory::Instructions);
+        assert_eq!((instructions.used, instructions.items), (150, 1));
+        assert!(instructions.used <= instructions.allocated);
+        assert!(!instructions.truncated, "{instructions:?}");
+        assert!(usage(ContextCategory::Memory).truncated);
 
         fs::remove_dir_all(repo).unwrap();
     }

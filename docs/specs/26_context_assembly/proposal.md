@@ -382,7 +382,16 @@ Two rules make the allocation useful rather than merely tidy:
   after it are still offered the remainder. A lower-priority member therefore
   never displaces a higher one, but can use space a higher one was too large to
   take. (Until 2026-11-24 the first member that did not fit also dropped every
-  member after it; see §7, "Skip, don't stop".) A
+  member after it; see §7, "Skip, don't stop".)
+- **Unspent budget backfills dropped members** (2026-11-24). The carry flows
+  forward only, so without this the first category never sees what later
+  categories leave unspent. After the last category, the final carry is offered
+  to the members the pass dropped, in the same order the pass used: category
+  pipeline order, then priority within the category. A member that fits is
+  included and its tokens are added to its category's `allocated` and `used`;
+  one that does not stays `CategoryBudgetExhausted`. Only released allocation is
+  spent, never basis points the shares leave unassigned, and a category with a
+  zero share is never backfilled. See §7, "Backfill". A
   block item (map, symbols, plan state) is first re-rendered at the smaller
   ceiling, because `render_for_model` already takes one; only a block that cannot
   render a single line is excluded.
@@ -1081,6 +1090,29 @@ now, as it already does for a file edited since indexing. And chunks are cut at
 Consecutive chunks share or adjoin a line, so two adjacent hits merge under
 `GUTTER = 2`, which answers the open question below for search hits; nothing yet
 measures non-adjacent clusters.
+
+**Backfill (2026-11-24, later the same day).** Skipping let `README.md`,
+`package.json` and `Cargo.toml` back into `instructions`, but not the root
+`AGENTS.md` itself: at 6.7k tokens it is over the 10% share at a 64k limit
+(6.4k), and `instructions` is the first category, so the carry, which flows
+forward only, never reaches it. In the turn that showed this the context used
+1,085 of 64,000 tokens. Raising the default share was rejected: it would only
+move the threshold, and every repository's `AGENTS.md` is a different size.
+Instead `apply_budget` collects the members it drops, and after the last
+category offers the final carry to them in pass order (§5.2). The rule keeps
+§5.2's guarantees: no category's share is spent on another, memory is still
+served last, and `context_budget.*=0` still switches a category off.
+`allocated` includes what the backfill added, so `used <= allocated` still
+holds. A share is therefore a cap only when the budget is contested.
+`each_category_stops_at_its_configured_share` relied on the old cap and is now
+`a_category_over_its_share_takes_only_unspent_budget`: the README.md it used to
+see dropped is included from unspent budget. New:
+`unspent_budget_backfills_dropped_items_in_category_order` (unit, in
+`context_manager.rs`). `memory_is_dropped_before_file_content_under_pressure`
+and the zero-share memory test pass unchanged, covering the unassigned-share
+and switched-off cases. Backfill cannot help where the window really is
+contested: at the CLI's default 16k limit the original prompt's search results
+fill their share, and `AGENTS.md` still does not fit.
 
 ### Known open points (2026-10-25)
 

@@ -1286,7 +1286,7 @@ fn unpinned_collection_sources_still_yield_whole_files() {
 // ---- Task 4: per-category budgets and the effective limit ----
 
 #[test]
-fn each_category_stops_at_its_configured_share() {
+fn a_category_over_its_share_takes_only_unspent_budget() {
     let repo = fixture_repo("share-cap");
     let engine = WorkspaceEngine::new(config_with_shares(
         &repo,
@@ -1320,12 +1320,30 @@ fn each_category_stops_at_its_configured_share() {
             usage.category
         );
     }
+    // The share (0.91% of ~991 tokens, 9) holds only the explicit file. The
+    // mentioned README.md is over it, and since 2026-11-24 (§5.2's backfill)
+    // comes back from what later categories left unspent rather than being
+    // dropped while most of the window sits empty; the backfill is added to
+    // `allocated`, so `used <= allocated` above still holds.
     let file_ranges = usage(&plan, ContextCategory::FileRanges);
-    assert!(file_ranges.truncated, "{file_ranges:?}");
-    assert_eq!(file_ranges.allocated, 9, "0.91% of ~991 tokens");
-    assert_eq!(
-        file_ranges.used, 9,
-        "the explicit file only, at the code ratio's estimate for src/lib.rs"
+    assert!(file_ranges.allocated > 9, "{file_ranges:?}");
+    assert!(!file_ranges.truncated, "{file_ranges:?}");
+    let backfilled = plan
+        .items
+        .iter()
+        .filter(|item| item.category == ContextCategory::FileRanges)
+        .map(|item| item.tokens)
+        .collect::<Vec<_>>();
+    assert_eq!(backfilled.len(), 2, "{:?}", plan.manifest.excluded);
+    assert_eq!(backfilled[0], 9, "src/lib.rs at the code ratio's estimate");
+    assert_eq!(file_ranges.used, backfilled.iter().sum::<usize>());
+    assert!(
+        !plan.manifest.excluded.iter().any(|record| {
+            record.category == ContextCategory::FileRanges
+                && record.reason == ExclusionReason::CategoryBudgetExhausted
+        }),
+        "{:?}",
+        plan.manifest.excluded
     );
 
     fs::remove_dir_all(repo).unwrap();

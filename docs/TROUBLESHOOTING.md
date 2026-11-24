@@ -1067,7 +1067,7 @@ Inside the manifest:
 | `assembledAtMs` | When it was assembled. The only time-dependent field; it never reaches the prompt. |
 | `limit` | The token limit categories divided, and where it came from — see [Declared and observed limits](#declared-and-observed-limits). |
 | `totalTokens` | Sum of the included items' estimated tokens. |
-| `categories` | One entry per category **in budget order**: `category`, `allocated` (after redistribution from earlier categories), `used`, `items`, `truncated`, `estimated`. `estimated` is always `true` for assembly: the figure is the estimator's, never a provider measurement. |
+| `categories` | One entry per category **in budget order**: `category`, `allocated` (after redistribution from earlier categories, plus anything the end-of-pass backfill gave its dropped items), `used`, `items`, `truncated`, `estimated`. `estimated` is always `true` for assembly: the figure is the estimator's, never a provider measurement. |
 | `included` | One entry per item: `category`, `kind`, `path`, `lineRange`, `tokens`, `rootPath`, `provenance`. `kind` is the source label the prompt header shows (`explicit_file`, `retrieved_file`, `agent_instruction`, `project_rule`, `hook_context`, `repository_map`, `symbols`, `plan_state`, `memory`); your own message is listed as `user_prompt` with no path. `category` is the budget bucket, which is not always the same thing: a search hit is `kind: retrieved_file` but `category: search_results`. The entry records where the item came from and how big it was, never its text. |
 | `excluded` | One entry per item left out or shortened: `reason`, `path`, `lineRange`, `category`, `detail`. |
 | `conversationSummary` | The #55 summary this turn sent, when it has one: `tokens`, `messages`, `throughSeq`, `factsOnly`. It is not an `included` item because it travels inside `Recent conversation:`; `null` when there is no summary. |
@@ -1080,10 +1080,11 @@ root itself, `"packages/api"` a nested root from the repository map. It is
 context, a carried plan) and for a file whose owning root could not be resolved,
 including when no repository map could be loaded.
 
-`lineRange` is `null` for every item today. The field and the range-merge
-machinery exist, but no collection source produces a line range yet: a search
-hit contributes the whole file, and the symbols block is one rendered block.
-Until a source does, `deduplicated_into_range` records cannot appear either.
+`lineRange` is set on a search hit and on a pinned range, and `null` for a
+whole file and for path-less blocks. A search hit is the lines of the index
+chunk it matched, and hits in one file merge into one range, each merged part
+leaving a `deduplicated_into_range` record. Files you name in the prompt and
+instruction files are still collected whole.
 
 `provenance` is the weakest source behind an included item: `language_server`
 when a language server supplied the symbols the block shows, `heuristic` when
@@ -1095,11 +1096,11 @@ carries one today; a file item, an instruction file and hook context are `null`.
 | Reason | What it means | Produced today? |
 |---|---|---|
 | `restricted_path` | The path matched `restricted_patterns`, at collection or at read time. It was never opened. | Yes |
-| `category_budget_exhausted` | The item did not fit its category's share. Once one item in a category does not fit, every lower-priority item in that category is dropped too, so the dropped set is the tail of the category's priority order, not a scatter. | Yes |
+| `category_budget_exhausted` | The item did not fit what was left of its category's share, and no unspent budget remained at the end of the pass to take it in. Only that item is dropped: smaller, lower-priority items after it are still tried, so the dropped set can be a scatter. | Yes |
 | `truncated` | The item **is** included, but shorter: the repository map or the symbols block was re-rendered at a smaller ceiling to fit the category's share. `detail` names the ceiling. | Yes |
 | `too_large` | A whole-file read was refused because the file exceeds `max_file_bytes`. | Yes |
 | `binary` | A whole-file read was refused because the file looks binary. | Yes |
-| `deduplicated_into_range` | A line range was merged into another range for the same path, or absorbed by a whole-file item. | Not yet: nothing produces a line range. |
+| `deduplicated_into_range` | A line range was merged into another range for the same path, or absorbed by a whole-file item. | Yes: search hits in one file, and pinned ranges |
 | `user_removed` | You removed an optional item in a paused pre-send review, or removed the conversation summary. It applies to that turn only. | Yes, spec 27 |
 | `path_not_selected` | The session's path restriction admits only selected paths, and this one is not among them. `AGENTS.md` is exempt by design. | Yes, spec 27 |
 | `missing` | A pinned file no longer reads: it was deleted or became unreadable. The pin stays in the session. | Yes, spec 27 |
@@ -1148,10 +1149,12 @@ fraction of the window.
 #### When content is `category_budget_exhausted`
 
 That reason means the category ran out of its share, not that the file was
-refused. Check `categories` first: if that category's `used` equals its
-`allocated`, the share is what bound it; if `allocated` is already above the
-category's nominal percentage, earlier categories released their remainder and
-it still was not enough.
+refused, and that the whole context had no unspent budget left over to take
+the item in afterwards. Check `categories` first: if that category's `used`
+equals its `allocated`, the share is what bound it; if `allocated` is already
+above the category's nominal percentage, earlier categories released their
+remainder, or the end-of-pass backfill added to it, and it still was not
+enough.
 
 Any of these changes it, in the order that is usually cheapest:
 
