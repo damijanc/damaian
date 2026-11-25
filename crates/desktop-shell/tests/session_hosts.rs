@@ -89,7 +89,15 @@ fn answer(stream: TcpStream, arrived: &AtomicUsize, open: &AtomicBool) {
     while !open.load(Ordering::SeqCst) {
         std::thread::sleep(Duration::from_millis(20));
     }
-    let (chunk, last) = if wants_tracker_call(&body) {
+    let (chunk, last) = if wants_command(&body) {
+        let id = arrived.load(Ordering::SeqCst);
+        (
+            format!(
+                r#"{{"id":"c1","object":"chat.completion.chunk","created":1,"model":"fake","choices":[{{"index":0,"delta":{{"role":"assistant","tool_calls":[{{"index":0,"id":"call_{id}","type":"function","function":{{"name":"run_command","arguments":"{{\"command\":\"touch marked-{id}.txt\",\"reason\":\"Mark the tree\"}}"}}}}]}},"finish_reason":null}}]}}"#
+            ),
+            r#"{"id":"c1","object":"chat.completion.chunk","created":1,"model":"fake","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+        )
+    } else if wants_tool_call(&body, TRACKER_PROMPT) {
         let id = arrived.load(Ordering::SeqCst);
         (
             format!(
@@ -116,27 +124,52 @@ fn answer(stream: TcpStream, arrived: &AtomicUsize, open: &AtomicBool) {
 /// The prompt that makes the model call `mcp__tracker__ping` once per turn
 /// (spec 33 Task 7's host-level health test); every other prompt gets "Done.".
 const TRACKER_PROMPT: &str = "PING-THE-TRACKER once.";
+/// The prompt that makes the model propose a `touch` command, which pauses the
+/// turn on the user's approval.
+const COMMAND_PROMPT: &str = "TOUCH-A-FILE once.";
+/// As [`COMMAND_PROMPT`], but the turn proposes a second command once the first
+/// is answered, so a resumed turn pauses again.
+const TWO_COMMANDS_PROMPT: &str = "TOUCH-TWO-FILES in turn.";
 
-/// Whether this request is a tracker turn whose call has not been answered
-/// yet: more user prompts asking for the call than tool results so far.
-fn wants_tracker_call(body: &[u8]) -> bool {
+/// Whether this request is a turn for `prompt` whose call has not been
+/// answered yet: more user prompts asking for the call than tool results so far.
+fn wants_tool_call(body: &[u8], prompt: &str) -> bool {
+    tool_calls_owed(body, &[(prompt, 1)])
+}
+
+/// Whether the command-proposing prompts so far ask for more calls than tool
+/// results have answered.
+fn wants_command(body: &[u8]) -> bool {
+    tool_calls_owed(body, &[(COMMAND_PROMPT, 1), (TWO_COMMANDS_PROMPT, 2)])
+}
+
+/// Whether the user prompts carrying each marker, `calls` calls apiece, ask for
+/// more calls than there are tool results so far.
+fn tool_calls_owed(body: &[u8], prompts: &[(&str, usize)]) -> bool {
     let Ok(request) = serde_json::from_slice::<serde_json::Value>(body) else {
         return false;
     };
     let messages = request["messages"].as_array().cloned().unwrap_or_default();
-    let count = |role: &str, marked: bool| {
-        messages
-            .iter()
-            .filter(|message| message["role"] == role)
-            .filter(|message| {
-                !marked
-                    || message["content"]
-                        .as_str()
-                        .is_some_and(|text| text.contains(TRACKER_PROMPT))
-            })
-            .count()
-    };
-    count("user", true) > count("tool", false)
+    let asked: usize = prompts
+        .iter()
+        .map(|(prompt, calls)| {
+            calls
+                * messages
+                    .iter()
+                    .filter(|message| message["role"] == "user")
+                    .filter(|message| {
+                        message["content"]
+                            .as_str()
+                            .is_some_and(|text| text.contains(prompt))
+                    })
+                    .count()
+        })
+        .sum();
+    let answered = messages
+        .iter()
+        .filter(|message| message["role"] == "tool")
+        .count();
+    asked > answered
 }
 
 struct Shell {
@@ -154,7 +187,11 @@ impl Shell {
             .join("&");
         let method = if matches!(
             path,
-            "/api/recovery" | "/api/sessions" | "/api/working-sessions" | "/api/mcp-health"
+            "/api/recovery"
+                | "/api/sessions"
+                | "/api/working-sessions"
+                | "/api/mcp-health"
+                | "/api/pending-card"
         ) {
             "GET"
         } else {
@@ -208,14 +245,18 @@ impl Shell {
     }
 
     fn start_turn(&self, repo: &Path, session_id: &str) -> std::thread::JoinHandle<String> {
-        let stream = self.request(
+        self.stream(
             "/api/ask-stream",
             &[
                 ("repo", repo.to_str().unwrap()),
                 ("session_id", session_id),
                 ("prompt", "Say done."),
             ],
-        );
+        )
+    }
+
+    fn stream(&self, path: &str, fields: &[(&str, &str)]) -> std::thread::JoinHandle<String> {
+        let stream = self.request(path, fields);
         std::thread::spawn(move || {
             let mut text = String::new();
             let _ = BufReader::new(stream).read_to_string(&mut text);
@@ -424,6 +465,147 @@ fn two_sessions_work_at_once_in_two_hosts_and_a_killed_host_recovers_as_a_crash(
     );
     assert_ne!(status, 0);
     assert_ne!(live_pid(&first), first_pid);
+}
+
+/// The `data` of the stream's `done` event.
+fn done_payload(streamed: &str) -> serde_json::Value {
+    let data = streamed
+        .split("event: done\ndata: ")
+        .nth(1)
+        .and_then(|rest| rest.lines().next())
+        .unwrap_or_else(|| panic!("no done event: {streamed}"));
+    serde_json::from_str(data).unwrap()
+}
+
+/// Owner report 2026-11-25: two sessions of one project paused on command
+/// approvals at once, each in its own host. Approving the first left the
+/// second, reloaded, with no card to answer: `/api/pending-card` took the
+/// session's live host for a worker that owns its approvals. The approved
+/// session's resumed turn then paused again (a plan review, in the owner's
+/// case) and that card was missing too, for the same reason. Each session's
+/// card is read while its host runs, a resumed turn's new pause included, and
+/// answering one leaves the other answerable.
+#[test]
+#[ignore = "starts real host processes and binds loopback ports; see the module docs"]
+fn two_sessions_paused_on_approvals_each_keep_their_card() {
+    let _turn = exclusive();
+    let (shell, model) = shell_and_model();
+    model.release();
+    let repo = temp_repo("approvals");
+    let repo_arg = repo.to_str().unwrap();
+    let first = shell.create_session(&repo, "First");
+    let second = shell.create_session(&repo, "Second");
+
+    let paused = |session: &str, prompt: &str| {
+        shell.stream(
+            "/api/ask-stream",
+            &[
+                ("repo", repo_arg),
+                ("session_id", session),
+                ("prompt", prompt),
+            ],
+        )
+    };
+    let (one, two) = (
+        paused(&first, TWO_COMMANDS_PROMPT),
+        paused(&second, COMMAND_PROMPT),
+    );
+    let (one, two) = (
+        done_payload(&one.join().unwrap()),
+        done_payload(&two.join().unwrap()),
+    );
+    assert_ne!(live_pid(&first), live_pid(&second), "one host per session");
+    let pause = |done: &serde_json::Value| {
+        let proposal = done["commandProposal"]["proposalId"]
+            .as_str()
+            .unwrap_or_else(|| panic!("the turn pauses on the command: {done}"))
+            .to_string();
+        (done["taskId"].as_str().unwrap().to_string(), proposal)
+    };
+    let ((first_task, first_proposal), (second_task, second_proposal)) = (pause(&one), pause(&two));
+    let card = |session: &str, task: &str| {
+        let (status, body, _) = shell.call(
+            "/api/pending-card",
+            &[("session_id", session), ("task_id", task)],
+        );
+        assert_eq!(status, 200, "{body}");
+        body["card"].clone()
+    };
+    assert_eq!(
+        card(&first, &first_task)["payload"]["proposalId"],
+        first_proposal.as_str()
+    );
+    assert_eq!(
+        card(&second, &second_task)["payload"]["proposalId"],
+        second_proposal.as_str()
+    );
+
+    let approved = shell
+        .stream(
+            "/api/resume-command-stream",
+            &[
+                ("repo", repo_arg),
+                ("proposal_id", &first_proposal),
+                ("approved", "true"),
+            ],
+        )
+        .join()
+        .unwrap();
+    // The resumed turn ran the command and paused on its next one, in the
+    // same host; that pause has its card as well.
+    let (resumed_task, resumed_proposal) = pause(&done_payload(&approved));
+    assert_ne!(resumed_proposal, first_proposal);
+    assert_eq!(
+        done_payload(&approved)["turnPresentation"]["pendingDecision"]["cardId"],
+        resumed_proposal.as_str(),
+        "{approved}"
+    );
+    let resumed = card(&first, &resumed_task);
+    assert_eq!(resumed["kind"], "command", "{resumed}");
+    assert_eq!(
+        resumed["payload"]["proposalId"],
+        resumed_proposal.as_str(),
+        "{resumed}"
+    );
+
+    // The second still waits, with its card.
+    let waiting = card(&second, &second_task);
+    assert_eq!(waiting["kind"], "command", "{waiting}");
+    assert_eq!(
+        waiting["payload"]["proposalId"],
+        second_proposal.as_str(),
+        "{waiting}"
+    );
+
+    // And it answers through its own host.
+    let rejected = shell
+        .stream(
+            "/api/resume-command-stream",
+            &[
+                ("repo", repo_arg),
+                ("proposal_id", &second_proposal),
+                ("approved", "false"),
+            ],
+        )
+        .join()
+        .unwrap();
+    assert!(rejected.contains("event: done"), "{rejected}");
+    assert_eq!(card(&second, &second_task), serde_json::Value::Null);
+
+    // The first session's resumed pause answers through its host too.
+    let finished = shell
+        .stream(
+            "/api/resume-command-stream",
+            &[
+                ("repo", repo_arg),
+                ("proposal_id", &resumed_proposal),
+                ("approved", "true"),
+            ],
+        )
+        .join()
+        .unwrap();
+    assert!(finished.contains("Done."), "{finished}");
+    assert_eq!(card(&first, &resumed_task), serde_json::Value::Null);
 }
 
 /// Quitting ends every host, and a turn running at the time ends as stopped,

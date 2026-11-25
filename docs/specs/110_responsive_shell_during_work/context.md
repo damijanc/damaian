@@ -86,7 +86,13 @@ when the turn ended. Local OBSERVATIONS 94.
     The shell writes each key it resolves to the host's stdin as a further
     line, never on the control socket.
   - **Recovery.** A live host is not crash debris: the engine's live-worker
-    check (spec 57 C12) is widened to a live session-host registry entry.
+    check (spec 57 C12) is widened to a live session-host registry entry —
+    for crash classification and the launch sweep's reattach only. The
+    reload read of a pending card (`read_pending_approval`) keeps the
+    worker-only check: a session host owns no approvals (the card's answer is
+    forwarded to it), and with hosts kept until archive or quit the widened
+    check hid every paused session's card after the user left and came back
+    (owner report 2026-11-25, two sessions paused on command approvals).
   - **Split (recorded in tasks.md).** Task 1 lands the shell side with the work
     still in the shell process, each session's work behind an in-process
     per-session lane; Task 1b moves the lane's work into the host. The lane's
@@ -123,7 +129,9 @@ when the turn ended. Local OBSERVATIONS 94.
     swept like a crashed instance (`sweep_orphaned_processes`), its session is
     classified into the running sweep snapshot (`recovery::recover_session`),
     and the window gets an `error` event; recovery's live-worker check is now
-    `SessionStore::has_live_host` (`ProcessKind::SessionHost`). Quit
+    `SessionStore::has_live_host` (`ProcessKind::SessionHost`) in
+    `classify_session` and `reattach_pending_approvals`, not in
+    `read_pending_approval` (fixed 2026-11-25, see Recovery above). Quit
     (`shutdown_all_hosts`) asks each host to shut down; the host cancels its
     work and waits up to 3 s for it to end as stopped before `sweep_own`.
 - **D2 — classification.** `RouteClass { SessionWork(session_id), Ui }` by an
