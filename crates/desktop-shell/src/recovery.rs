@@ -2361,12 +2361,54 @@ mod tests {
             .session_store
             .update_task_status(&first_task, TaskStatus::Complete, None)
             .unwrap();
+        // Its resumed turn then paused on a plan review (the owner's session A).
+        let resumed = engine
+            .session_store
+            .create_task(&first_session, "carry on", "mock", "m")
+            .unwrap();
+        let mut plan = TaskPlan::new(&resumed.id, 1);
+        plan.steps.push(PlanStep {
+            id: "step_1".to_string(),
+            title: "Add a retry helper".to_string(),
+            detail: None,
+            status: StepStatus::Pending,
+            depends_on: Vec::new(),
+            started_at_ms: None,
+            completed_at_ms: None,
+            evidence: Vec::new(),
+            check: None,
+            build: None,
+        });
+        engine.session_store.create_plan(&resumed, &plan).unwrap();
+        let folder = dir.join("chat").join("pending");
+        fs::create_dir_all(&folder).unwrap();
+        fs::write(
+            folder.join("planprop_resumed.json"),
+            r#"{"proposal_id":"planprop_resumed","plan_review":{"deferred_action":"apply a patch"}}"#,
+        )
+        .unwrap();
+        engine
+            .session_store
+            .await_approval(
+                &resumed,
+                &PendingApprovalRef {
+                    kind: "plan".to_string(),
+                    proposal_id: "planprop_resumed".to_string(),
+                },
+            )
+            .unwrap();
         let first_card = pending_card(&engine, &first_session, &first_task.id)["card"].clone();
+        let plan_card = pending_card(&engine, &first_session, &resumed.id)["card"].clone();
         let second_card = pending_card(&engine, &second_session, &second_task.id)["card"].clone();
         let _ = stand_in.kill();
         let _ = stand_in.wait();
 
         assert_eq!(first_card, serde_json::Value::Null);
+        assert_eq!(plan_card["kind"], "plan", "{plan_card}");
+        assert_eq!(
+            plan_card["payload"]["proposalId"], "planprop_resumed",
+            "{plan_card}"
+        );
         assert_eq!(second_card["kind"], "command", "{second_card}");
         assert_eq!(
             second_card["payload"]["proposalId"],

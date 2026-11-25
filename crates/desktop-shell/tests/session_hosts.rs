@@ -89,7 +89,7 @@ fn answer(stream: TcpStream, arrived: &AtomicUsize, open: &AtomicBool) {
     while !open.load(Ordering::SeqCst) {
         std::thread::sleep(Duration::from_millis(20));
     }
-    let (chunk, last) = if wants_tool_call(&body, COMMAND_PROMPT) {
+    let (chunk, last) = if wants_command(&body) {
         let id = arrived.load(Ordering::SeqCst);
         (
             format!(
@@ -127,27 +127,49 @@ const TRACKER_PROMPT: &str = "PING-THE-TRACKER once.";
 /// The prompt that makes the model propose a `touch` command, which pauses the
 /// turn on the user's approval.
 const COMMAND_PROMPT: &str = "TOUCH-A-FILE once.";
+/// As [`COMMAND_PROMPT`], but the turn proposes a second command once the first
+/// is answered, so a resumed turn pauses again.
+const TWO_COMMANDS_PROMPT: &str = "TOUCH-TWO-FILES in turn.";
 
 /// Whether this request is a turn for `prompt` whose call has not been
 /// answered yet: more user prompts asking for the call than tool results so far.
 fn wants_tool_call(body: &[u8], prompt: &str) -> bool {
+    tool_calls_owed(body, &[(prompt, 1)])
+}
+
+/// Whether the command-proposing prompts so far ask for more calls than tool
+/// results have answered.
+fn wants_command(body: &[u8]) -> bool {
+    tool_calls_owed(body, &[(COMMAND_PROMPT, 1), (TWO_COMMANDS_PROMPT, 2)])
+}
+
+/// Whether the user prompts carrying each marker, `calls` calls apiece, ask for
+/// more calls than there are tool results so far.
+fn tool_calls_owed(body: &[u8], prompts: &[(&str, usize)]) -> bool {
     let Ok(request) = serde_json::from_slice::<serde_json::Value>(body) else {
         return false;
     };
     let messages = request["messages"].as_array().cloned().unwrap_or_default();
-    let count = |role: &str, marked: bool| {
-        messages
-            .iter()
-            .filter(|message| message["role"] == role)
-            .filter(|message| {
-                !marked
-                    || message["content"]
-                        .as_str()
-                        .is_some_and(|text| text.contains(prompt))
-            })
-            .count()
-    };
-    count("user", true) > count("tool", false)
+    let asked: usize = prompts
+        .iter()
+        .map(|(prompt, calls)| {
+            calls
+                * messages
+                    .iter()
+                    .filter(|message| message["role"] == "user")
+                    .filter(|message| {
+                        message["content"]
+                            .as_str()
+                            .is_some_and(|text| text.contains(prompt))
+                    })
+                    .count()
+        })
+        .sum();
+    let answered = messages
+        .iter()
+        .filter(|message| message["role"] == "tool")
+        .count();
+    asked > answered
 }
 
 struct Shell {
@@ -458,9 +480,11 @@ fn done_payload(streamed: &str) -> serde_json::Value {
 /// Owner report 2026-11-25: two sessions of one project paused on command
 /// approvals at once, each in its own host. Approving the first left the
 /// second, reloaded, with no card to answer: `/api/pending-card` took the
-/// session's live host for a worker that owns its approvals. Each session's
-/// card is read while its host runs, and answering one leaves the other
-/// answerable.
+/// session's live host for a worker that owns its approvals. The approved
+/// session's resumed turn then paused again (a plan review, in the owner's
+/// case) and that card was missing too, for the same reason. Each session's
+/// card is read while its host runs, a resumed turn's new pause included, and
+/// answering one leaves the other answerable.
 #[test]
 #[ignore = "starts real host processes and binds loopback ports; see the module docs"]
 fn two_sessions_paused_on_approvals_each_keep_their_card() {
@@ -472,17 +496,20 @@ fn two_sessions_paused_on_approvals_each_keep_their_card() {
     let first = shell.create_session(&repo, "First");
     let second = shell.create_session(&repo, "Second");
 
-    let paused = |session: &str| {
+    let paused = |session: &str, prompt: &str| {
         shell.stream(
             "/api/ask-stream",
             &[
                 ("repo", repo_arg),
                 ("session_id", session),
-                ("prompt", COMMAND_PROMPT),
+                ("prompt", prompt),
             ],
         )
     };
-    let (one, two) = (paused(&first), paused(&second));
+    let (one, two) = (
+        paused(&first, TWO_COMMANDS_PROMPT),
+        paused(&second, COMMAND_PROMPT),
+    );
     let (one, two) = (
         done_payload(&one.join().unwrap()),
         done_payload(&two.join().unwrap()),
@@ -524,11 +551,24 @@ fn two_sessions_paused_on_approvals_each_keep_their_card() {
         )
         .join()
         .unwrap();
-    assert!(approved.contains("event: done"), "{approved}");
-    assert!(approved.contains("Done."), "{approved}");
+    // The resumed turn ran the command and paused on its next one, in the
+    // same host; that pause has its card as well.
+    let (resumed_task, resumed_proposal) = pause(&done_payload(&approved));
+    assert_ne!(resumed_proposal, first_proposal);
+    assert_eq!(
+        done_payload(&approved)["turnPresentation"]["pendingDecision"]["cardId"],
+        resumed_proposal.as_str(),
+        "{approved}"
+    );
+    let resumed = card(&first, &resumed_task);
+    assert_eq!(resumed["kind"], "command", "{resumed}");
+    assert_eq!(
+        resumed["payload"]["proposalId"],
+        resumed_proposal.as_str(),
+        "{resumed}"
+    );
 
-    // The first is settled; the second still waits, with its card.
-    assert_eq!(card(&first, &first_task), serde_json::Value::Null);
+    // The second still waits, with its card.
     let waiting = card(&second, &second_task);
     assert_eq!(waiting["kind"], "command", "{waiting}");
     assert_eq!(
@@ -551,6 +591,21 @@ fn two_sessions_paused_on_approvals_each_keep_their_card() {
         .unwrap();
     assert!(rejected.contains("event: done"), "{rejected}");
     assert_eq!(card(&second, &second_task), serde_json::Value::Null);
+
+    // The first session's resumed pause answers through its host too.
+    let finished = shell
+        .stream(
+            "/api/resume-command-stream",
+            &[
+                ("repo", repo_arg),
+                ("proposal_id", &resumed_proposal),
+                ("approved", "true"),
+            ],
+        )
+        .join()
+        .unwrap();
+    assert!(finished.contains("Done."), "{finished}");
+    assert_eq!(card(&first, &resumed_task), serde_json::Value::Null);
 }
 
 /// Quitting ends every host, and a turn running at the time ends as stopped,
