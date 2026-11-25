@@ -125,6 +125,7 @@ pub(crate) enum Route {
     ProviderKey,
     ModelKeyDelete,
     McpTest,
+    McpHealth,
     WorkersEnabled,
     WorkerSourceStatus,
     StartWorker,
@@ -342,6 +343,7 @@ pub(crate) const ROUTES: &[(&str, &str, Route)] = &[
     ("POST", "/api/provider-key", Route::ProviderKey),
     ("POST", "/api/model-key-delete", Route::ModelKeyDelete),
     ("POST", "/api/mcp-test", Route::McpTest),
+    ("GET", "/api/mcp-health", Route::McpHealth),
     ("GET", "/api/workers-enabled", Route::WorkersEnabled),
     (
         "GET",
@@ -520,6 +522,7 @@ impl Route {
             | Route::ProviderKey
             | Route::ModelKeyDelete
             | Route::McpTest
+            | Route::McpHealth
             | Route::WorkersEnabled
             | Route::WorkerSourceStatus
             | Route::ListWorkers

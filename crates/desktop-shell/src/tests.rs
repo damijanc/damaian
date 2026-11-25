@@ -9749,3 +9749,190 @@ fn app_js_offers_approve_for_this_session_and_its_revoke() {
         "both session ⋮ menus"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Spec 33 Task 7 · `/api/mcp-health` and the manual retry on `/api/mcp-test`
+// ---------------------------------------------------------------------------
+
+fn mcp_test_server(
+    id: &str,
+    transport: workspace_engine::McpTransport,
+) -> workspace_engine::McpServerConfig {
+    workspace_engine::McpServerConfig {
+        id: id.to_string(),
+        label: id.to_uppercase(),
+        transport,
+        command: String::new(),
+        args: Vec::new(),
+        env: Vec::new(),
+        url: String::new(),
+        auth_token_env: String::new(),
+        enabled: true,
+        require_approval: true,
+    }
+}
+
+/// `Unknown` and `Ready` are distinct values in the API, an observation of
+/// another repository does not leak into this one, a `Failed` server carries
+/// its reason, and the auth reference is shown — but a raw token put where a
+/// reference belongs is redacted.
+#[test]
+fn mcp_health_json_tells_unknown_from_ready_and_never_shows_a_token() {
+    use workspace_engine::{McpHealthObservation, McpServerHealth, McpTransport, SecretScanner};
+    let mut alpha = mcp_test_server("alpha", McpTransport::Http);
+    alpha.auth_token_env = "keychain:alpha-token".to_string();
+    let mut beta = mcp_test_server("beta", McpTransport::Stdio);
+    let raw = format!("ghp_{}", "a1B2c3D4e5".repeat(4));
+    beta.auth_token_env = raw.clone();
+    let gamma = mcp_test_server("gamma", McpTransport::Stdio);
+    let observed = |repo: &str, server: &str, health, failures, last| McpHealthObservation {
+        repository_id: repo.to_string(),
+        server_id: server.to_string(),
+        health,
+        observed_at_ms: 7,
+        session_id: "session_1".to_string(),
+        consecutive_failures: failures,
+        last_failure: last,
+    };
+    let observations = vec![
+        observed("repo_a", "alpha", McpServerHealth::Ready, 0, None),
+        observed("repo_other", "beta", McpServerHealth::Ready, 0, None),
+        observed(
+            "repo_a",
+            "gamma",
+            McpServerHealth::Failed,
+            3,
+            Some(McpServerHealth::Unauthenticated),
+        ),
+    ];
+    let scanner = SecretScanner::new(Config::default().secret_patterns);
+    let payload = super::mcp_health_json(&[alpha, beta, gamma], "repo_a", &observations, &scanner);
+    let text = payload.to_string();
+    let servers = payload["servers"].as_array().unwrap();
+    assert_eq!(servers[0]["health"], "ready");
+    assert_eq!(servers[0]["authReference"], "keychain:alpha-token");
+    assert_eq!(servers[0]["sessionId"], "session_1");
+    assert_eq!(servers[1]["health"], "unknown", "{text}");
+    assert_ne!(servers[0]["health"], servers[1]["health"]);
+    assert_eq!(servers[1]["observedAtMs"], serde_json::Value::Null);
+    assert!(!text.contains(&raw), "a raw token is redacted: {text}");
+    assert_eq!(servers[2]["health"], "failed");
+    assert_eq!(servers[2]["lastFailure"], "unauthenticated");
+    assert!(
+        servers[2]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("refused the credentials")),
+        "{text}"
+    );
+}
+
+/// A stdio MCP server that answers `initialize` and `tools/list` with one
+/// tool, `ping`.
+fn write_mcp_test_server(dir: &Path) -> PathBuf {
+    let script = dir.join("alpha.sh");
+    fs::write(
+        &script,
+        r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed 's/.*"id":\([0-9]*\).*/\1/')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-06-18","capabilities":{},"serverInfo":{"name":"fake","version":"0"}}}\n' "$id" ;;
+    *'"method":"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"ping","description":"Ping.","inputSchema":{"type":"object"}}]}}\n' "$id" ;;
+  esac
+done
+"#,
+    )
+    .unwrap();
+    script
+}
+
+/// Through the real routes: every configured server reads `unknown` until
+/// something contacts it; the manual retry contacts the saved server and the
+/// health route then serves `ready` for it while its sibling stays
+/// `unknown`; a retry that fails reports the auth reference and the outcome,
+/// never the token value.
+#[test]
+fn the_health_route_serves_unknown_until_a_retry_contacts_the_server() {
+    let repo = temp_shell_repo("mcp-health-route");
+    let script = write_mcp_test_server(&repo);
+    let token_env = format!("DAMAIAN_TEST_MCP_TOKEN_{}", std::process::id());
+    let token_value = format!("ghp_{}", "Z9y8X7w6V5".repeat(4));
+    // SAFETY: a variable no other test reads, set before any server in this
+    // test resolves it.
+    unsafe { std::env::set_var(&token_env, &token_value) };
+    let user_config = isolated_data_dir().join("config").join("user.conf");
+    fs::create_dir_all(user_config.parent().unwrap()).unwrap();
+    fs::write(
+        &user_config,
+        format!(
+            "mcp_enabled=true\n\
+             mcp_server.alpha.enabled=true\n\
+             mcp_server.alpha.transport=stdio\n\
+             mcp_server.alpha.command=/bin/sh\n\
+             mcp_server.alpha.args={}\n\
+             mcp_server.beta.enabled=true\n\
+             mcp_server.beta.transport=http\n\
+             mcp_server.beta.url=http://127.0.0.1:1/mcp\n\
+             mcp_server.beta.auth_token_env={token_env}\n",
+            script.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    let repo_arg = repo.to_string_lossy().to_string();
+    let health_url = format!(
+        "/api/mcp-health?repo={}",
+        percent_encode_for_test(&repo_arg)
+    );
+    let (port, token) = serve_for_test();
+    let health_of = |payload: &serde_json::Value, id: &str| {
+        payload["servers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|server| server["id"] == id)
+            .unwrap_or_else(|| panic!("{id} is listed: {payload}"))["health"]
+            .clone()
+    };
+
+    let before = get_for_test(port, &token, &health_url);
+    assert!(before.starts_with("HTTP/1.1 200"), "{before}");
+    let before = json_of(&before);
+    assert_eq!(health_of(&before, "alpha"), "unknown");
+    assert_eq!(health_of(&before, "beta"), "unknown");
+
+    let retried = post_fields_for_test(
+        port,
+        &token,
+        "/api/mcp-test",
+        &[("retry", "true"), ("repo", &repo_arg), ("id", "alpha")],
+    );
+    let retried_json = json_of(&retried);
+    assert_eq!(retried_json["ok"], true, "{retried}");
+    assert_eq!(retried_json["health"], "ready");
+    assert_eq!(retried_json["tools"], serde_json::json!(["ping"]));
+
+    let after = json_of(&get_for_test(port, &token, &health_url));
+    assert_eq!(health_of(&after, "alpha"), "ready");
+    assert_eq!(health_of(&after, "beta"), "unknown", "never contacted");
+
+    let refused = post_fields_for_test(
+        port,
+        &token,
+        "/api/mcp-test",
+        &[("retry", "true"), ("repo", &repo_arg), ("id", "beta")],
+    );
+    let refused_json = json_of(&refused);
+    assert_eq!(refused_json["ok"], false, "{refused}");
+    assert_eq!(refused_json["health"], "unreachable");
+    assert_eq!(refused_json["authReference"], token_env.as_str());
+    let after = get_for_test(port, &token, &health_url);
+    for response in [&refused, &after] {
+        assert!(!response.contains(&token_value), "{response}");
+    }
+
+    let _ = fs::remove_file(&user_config);
+    unsafe { std::env::remove_var(&token_env) };
+    fs::remove_dir_all(repo).unwrap();
+}

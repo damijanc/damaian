@@ -180,7 +180,7 @@ manages. `crates/workspace-engine/src/chat.rs` (23,166 lines) is the orchestrato
   `ClientError::InvalidInput`) leaves the server `Ready`, since it answered;
   anything else — spawn, network, handshake, a server that cannot list, a
   server that exited (no longer misreported as a timeout) → `Unreachable`; a
-  stopped turn records nothing. `Failed` is not set yet (Task 7).
+  stopped turn records nothing. `Failed` is set by Task 7 (below).
   **For Task 7's `GET /api/mcp-health`:** the shell cannot read hosts' memory,
   so the route must gather it. Add an `mcp_health` command to
   `serve_host_connection` in `crates/desktop-shell/src/session_host.rs`
@@ -196,6 +196,27 @@ manages. `crates/workspace-engine/src/chat.rs` (23,166 lines) is the orchestrato
   must act in the session's host (the offer path already reads
   `mcp_server_health` in the process that builds the offer); `/api/mcp-test`
   runs in the shell through `McpClient` directly and records nothing today.
+  **Health route and `Failed` as built (Task 7, 2026-11-25):** the plan
+  above was followed. `GET /api/mcp-health?repo=` gathers the shell's own
+  snapshot, every live session host's and — decided here — every live
+  worker's (a worker's turns run MCP in its own process, so leaving it out
+  would show its servers as `unknown` while it uses them); a process that does
+  not answer within the exchange timeout contributes nothing. `Failed` is a
+  latch in the health store: three failed contacts in a row in one process
+  (`MCP_FAILED_AFTER_CONSECUTIVE_FAILURES`; a success resets the count) make
+  the server `Failed` there, and that process then neither contacts it, offers
+  its tools, nor searches it, and answers a call to it with the reason before
+  any approval card. Three, because a failing call usually costs two contacts
+  (the listing before the permission check, then the call), so the second
+  turn that tries latches it. **Retry routing:** the UI's retry is not tied to
+  a session, and the shell cannot tell which host's latch the user means, so
+  `/api/mcp-test` with `retry=true` sends `mcp_retry` to *every* live host and
+  worker — each forgets that server's health, latch included, so its next
+  turn that wants the server contacts it again — and then contacts the saved
+  server once from the shell (`McpRuntime::retry_server`), whose recorded
+  outcome is the latest observation the route reports. Clearing a latch in a
+  session the user did not have in mind is harmless: a manual retry is the
+  user saying the server is worth trying again.
   **Lazy startup as built:** Task 6 also stopped the *direct* and *pinned*
   offers from starting a server. A server not yet listed this turn has its
   tools offered from the inventory's recorded schemas (Task 4 stored them)

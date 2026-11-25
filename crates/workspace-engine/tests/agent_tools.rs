@@ -2446,3 +2446,81 @@ fn a_server_that_never_answers_reads_timeout() {
     );
     fs::remove_dir_all(repo).unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// Spec 33 Task 7 · Failed and its manual retry (requirements 1, 3; context D5)
+// ---------------------------------------------------------------------------
+
+/// Acceptance criterion: a server that fails repeatedly is `Failed` — not
+/// retried automatically, its tools not offered, the reason visible to the
+/// model — until the manual retry clears it, after which it is offered and
+/// called again.
+#[test]
+fn a_failed_server_withholds_its_tools_until_a_manual_retry() {
+    let repo = temp_dir("mcp-failed-retry");
+    let (engine, servers) = mcp_engine(&repo, true, "");
+    let working = fs::read_to_string(servers.join("tracker.sh")).unwrap();
+    rewrite_tracker(&servers, "exit 1");
+
+    // Each call is a contact: the first lists then calls (two failures), the
+    // second calls (the third, which latches `Failed`), the third is refused
+    // without contacting anything.
+    let (result, _adapter) = ask_scripted(
+        &engine,
+        &repo,
+        vec![
+            vec![tracker_call("call_1", "list_pulls")],
+            vec![tracker_call("call_2", "list_pulls")],
+            vec![tracker_call("call_3", "list_pulls")],
+            Vec::new(),
+        ],
+    );
+    assert_eq!(
+        tracker_health(&repo),
+        workspace_engine::McpServerHealth::Failed
+    );
+    let results = tool_results(&engine, &result);
+    assert!(
+        results[2].contains("not retried automatically"),
+        "the refusal says why: {results:?}"
+    );
+
+    // Restored, the server still is not contacted: the latch holds for the
+    // session, so the next turn neither offers its tools nor starts it.
+    fs::write(servers.join("tracker.sh"), &working).unwrap();
+    let _ = fs::remove_file(servers.join("tracker.started"));
+    let (result, adapter) = ask_scripted(
+        &engine,
+        &repo,
+        vec![vec![search_call("call_1", "pull requests")], Vec::new()],
+    );
+    let names = offered_names(&adapter.requests[0]);
+    assert!(
+        !names.iter().any(|name| name.starts_with("mcp__tracker__")),
+        "a Failed server's tools are not offered: {names:?}"
+    );
+    let found: serde_json::Value =
+        serde_json::from_str(&tool_results(&engine, &result)[0]).unwrap();
+    assert_eq!(found["failed_servers"][0], "tracker", "{found}");
+    assert_eq!(found["matches"].as_array().unwrap().len(), 0, "{found}");
+    assert!(!mcp_server_started(&servers, "tracker"));
+
+    // The manual retry (the host's half: forget the latch) brings it back.
+    let repository_id = workspace_engine::repository_id_for_root(&repo);
+    assert_eq!(
+        workspace_engine::clear_mcp_health(&repository_id, "tracker"),
+        workspace_engine::McpServerHealth::Failed
+    );
+    let (result, adapter) = ask_scripted(
+        &engine,
+        &repo,
+        vec![vec![tracker_call("call_1", "list_pulls")], Vec::new()],
+    );
+    assert!(offered_names(&adapter.requests[0]).contains(&"mcp__tracker__list_pulls".to_string()));
+    assert_eq!(tool_results(&engine, &result)[0], "tool ran");
+    assert_eq!(
+        tracker_health(&repo),
+        workspace_engine::McpServerHealth::Ready
+    );
+    fs::remove_dir_all(repo).unwrap();
+}

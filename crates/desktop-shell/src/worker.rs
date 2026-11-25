@@ -46,6 +46,8 @@ const MAX_REQUEST_BYTES: u64 = 256 * 1024;
 pub const MAX_NOTE_BYTES: usize = 16 * 1024;
 const MAX_PROPOSAL_ID_BYTES: usize = 256;
 const MAX_TASK_ID_BYTES: usize = 256;
+/// A repository id or MCP server id in `mcp_retry`.
+const MAX_MCP_ID_BYTES: usize = 256;
 /// How long one control connection may sit idle. The shell's exchanges are
 /// short, and the socket serves one connection at a time, so a client that
 /// stops talking must not hold it.
@@ -262,6 +264,15 @@ pub(crate) enum ControlCommand {
     Stop,
     Shutdown,
     Status,
+    /// Spec 33 Task 7: this worker's MCP health snapshot, for
+    /// `/api/mcp-health`.
+    McpHealth,
+    /// Spec 33 Task 7: the manual retry's first half — forget this process's
+    /// health for one server, a `Failed` latch included.
+    McpRetry {
+        repository_id: String,
+        server_id: String,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -370,6 +381,11 @@ fn parse_command(
         "stop" => ControlCommand::Stop,
         "shutdown" => ControlCommand::Shutdown,
         "status" => ControlCommand::Status,
+        "mcp_health" => ControlCommand::McpHealth,
+        "mcp_retry" => ControlCommand::McpRetry {
+            repository_id: required(take("repositoryId", MAX_MCP_ID_BYTES)?)?,
+            server_id: required(take("serverId", MAX_MCP_ID_BYTES)?)?,
+        },
         _ => return Err("unknown command"),
     };
     if !fields.is_empty() {
@@ -539,6 +555,14 @@ impl WorkerHost {
     pub(crate) fn dispatch(&self, command: ControlCommand) -> (Value, bool) {
         match command {
             ControlCommand::Status => (self.snapshot(), false),
+            ControlCommand::McpHealth => (crate::mcp_health_api::snapshot_answer(), false),
+            ControlCommand::McpRetry {
+                repository_id,
+                server_id,
+            } => (
+                crate::mcp_health_api::retry_answer(&repository_id, &server_id),
+                false,
+            ),
             ControlCommand::Shutdown => {
                 self.set_state(WorkerState::ShuttingDown);
                 self.cancel_turn();
@@ -2273,6 +2297,22 @@ mod tests {
         assert_eq!(
             with_token(r#""command":"status""#),
             ParsedRequest::Command(ControlCommand::Status)
+        );
+        // Spec 33 Task 7: the MCP health exchange the shell's route uses.
+        assert_eq!(
+            with_token(r#""command":"mcp_health""#),
+            ParsedRequest::Command(ControlCommand::McpHealth)
+        );
+        assert_eq!(
+            with_token(r#""command":"mcp_retry","repositoryId":"repo_1","serverId":"tracker""#),
+            ParsedRequest::Command(ControlCommand::McpRetry {
+                repository_id: "repo_1".to_string(),
+                server_id: "tracker".to_string(),
+            })
+        );
+        assert_eq!(
+            with_token(r#""command":"mcp_retry","serverId":"tracker""#),
+            ParsedRequest::Invalid("a required argument is missing")
         );
         assert_eq!(
             with_token(r#""command":"resume""#),

@@ -686,6 +686,28 @@ pub(crate) fn global() -> &'static Supervisor {
     })
 }
 
+/// Asks every live worker `command` and returns the answers that came; none
+/// when no worker was ever started. For the spec 33 Task 7 MCP health
+/// exchange: a worker's turns contact MCP servers in its own process.
+pub(crate) fn ask_every_worker(command: &str, arguments: Map<String, Value>) -> Vec<Value> {
+    let Some(supervisor) = SUPERVISOR.get() else {
+        return Vec::new();
+    };
+    supervisor
+        .endpoints()
+        .iter()
+        .filter_map(|endpoint| {
+            exchange(
+                &endpoint.socket,
+                &endpoint.token,
+                command,
+                arguments.clone(),
+                supervisor.timeouts.exchange,
+            )
+        })
+        .collect()
+}
+
 /// For the desktop app's `RunEvent::Exit`: ends every worker this process
 /// started. A no-op when none was.
 pub fn shutdown_all_workers() {

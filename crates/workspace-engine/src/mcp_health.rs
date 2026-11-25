@@ -32,9 +32,49 @@ pub struct McpHealthObservation {
     /// When the contact that set `health` ended, in Unix milliseconds. Lets a
     /// reader merging several processes' snapshots keep the latest.
     pub observed_at_ms: u64,
-    /// The session whose turn made the contact.
+    /// The session whose turn made the contact; empty for a manual retry
+    /// from the settings screen, which belongs to no session.
     pub session_id: String,
+    /// Failed contacts in a row in this process since the last success or
+    /// manual retry. [`MCP_FAILED_AFTER_CONSECUTIVE_FAILURES`] of them latch
+    /// the server `Failed`.
+    #[serde(default)]
+    pub consecutive_failures: u32,
+    /// What the latest failed contact showed (`unreachable`, `timeout`,
+    /// `unauthenticated`), so a `Failed` server says why. `None` after a
+    /// success.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_failure: Option<McpServerHealth>,
 }
+
+impl McpHealthObservation {
+    /// Why this server is `Failed`, in words for the model and the user, or
+    /// `None` when it is not (spec 33 §5.3: "with the reason visible").
+    pub fn failed_reason(&self) -> Option<String> {
+        (self.health == McpServerHealth::Failed).then(|| {
+            let last = match self.last_failure {
+                Some(McpServerHealth::Timeout) => "it timed out",
+                Some(McpServerHealth::Unauthenticated) => "it refused the credentials",
+                _ => "it could not be reached",
+            };
+            format!(
+                "The MCP server `{}` failed {} times in a row (last time {last}), so it is \
+                 not retried automatically in this session and its tools are not offered. \
+                 The user can retry it from the MCP settings.",
+                self.server_id, self.consecutive_failures
+            )
+        })
+    }
+}
+
+/// How many failed contacts in a row make a server `Failed` (spec 33 §5.3):
+/// not retried automatically for the rest of the session and its tools not
+/// offered, until the user retries it. Every contact counts — a connect and
+/// list, or a call that had to connect — so a turn whose call fails usually
+/// spends two (the listing before the permission check, then the call), and
+/// the second turn that tries latches it. A server that only refuses one call
+/// with a JSON-RPC error is `Ready` and counts nothing.
+pub const MCP_FAILED_AFTER_CONSECUTIVE_FAILURES: u32 = 3;
 
 type Store = HashMap<(String, String), McpHealthObservation>;
 
@@ -58,22 +98,71 @@ pub(crate) fn record_mcp_health(
     if repository_id.is_empty() {
         return;
     }
+    // A poisoned lock still holds a usable map: health is advisory, and a
+    // panic elsewhere must not stop the next contact being recorded.
+    let mut map = store()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let key = (repository_id.to_string(), server_id.to_string());
+    let previous = map.get(&key);
+    let (health, consecutive_failures, last_failure) = match health {
+        McpServerHealth::Ready => (McpServerHealth::Ready, 0, None),
+        // Never recorded by a contact; kept for completeness.
+        McpServerHealth::Unknown | McpServerHealth::Failed => {
+            let failures = previous.map_or(0, |kept| kept.consecutive_failures);
+            (
+                health,
+                failures,
+                previous.and_then(|kept| kept.last_failure),
+            )
+        }
+        failure => {
+            let failures = previous.map_or(0, |kept| kept.consecutive_failures) + 1;
+            let latched = failures >= MCP_FAILED_AFTER_CONSECUTIVE_FAILURES
+                || previous.is_some_and(|kept| kept.health == McpServerHealth::Failed);
+            let shown = if latched {
+                McpServerHealth::Failed
+            } else {
+                failure
+            };
+            (shown, failures, Some(failure))
+        }
+    };
     let observation = McpHealthObservation {
         repository_id: repository_id.to_string(),
         server_id: server_id.to_string(),
         health,
         observed_at_ms: now_ms(),
         session_id: session_id.to_string(),
+        consecutive_failures,
+        last_failure,
     };
-    // A poisoned lock still holds a usable map: health is advisory, and a
-    // panic elsewhere must not stop the next contact being recorded.
+    map.insert(key, observation);
+}
+
+/// The manual retry's first half (spec 33 §5.3): forgets what this process
+/// knew about `server_id` — a `Failed` latch and the failure count included —
+/// so the server reads `Unknown` and the next use contacts it again. Returns
+/// the health it had. The second half, contacting the server now, is
+/// [`crate::McpRuntime::retry_server`].
+pub fn clear_mcp_health(repository_id: &str, server_id: &str) -> McpServerHealth {
     let mut map = store()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    map.insert(
-        (repository_id.to_string(), server_id.to_string()),
-        observation,
-    );
+    map.remove(&(repository_id.to_string(), server_id.to_string()))
+        .map_or(McpServerHealth::Unknown, |observation| observation.health)
+}
+
+/// This process's latest observation of one server, if it contacted it.
+pub fn mcp_health_observation(
+    repository_id: &str,
+    server_id: &str,
+) -> Option<McpHealthObservation> {
+    let map = store()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    map.get(&(repository_id.to_string(), server_id.to_string()))
+        .cloned()
 }
 
 /// This process's view of one server: `Unknown` until something here has
@@ -164,6 +253,8 @@ mod tests {
             health,
             observed_at_ms: at,
             session_id: format!("session_{at}"),
+            consecutive_failures: 0,
+            last_failure: None,
         }
     }
 
@@ -189,6 +280,39 @@ mod tests {
             .collect();
         assert_eq!(mine.len(), 1);
         assert_eq!(mine[0].session_id, "session_1");
+    }
+
+    #[test]
+    fn repeated_failures_latch_failed_until_cleared() {
+        let repo = format!("health-test-repo-{}", crate::hash::create_id("r"));
+        for attempt in 1..MCP_FAILED_AFTER_CONSECUTIVE_FAILURES {
+            record_mcp_health(&repo, "tracker", "s", McpServerHealth::Unreachable);
+            assert_eq!(
+                mcp_server_health(&repo, "tracker"),
+                McpServerHealth::Unreachable,
+                "attempt {attempt} is not yet repeated failure"
+            );
+        }
+        record_mcp_health(&repo, "tracker", "s", McpServerHealth::Timeout);
+        let observation = mcp_health_observation(&repo, "tracker").unwrap();
+        assert_eq!(observation.health, McpServerHealth::Failed);
+        assert_eq!(observation.last_failure, Some(McpServerHealth::Timeout));
+        assert_eq!(
+            observation.consecutive_failures,
+            MCP_FAILED_AFTER_CONSECUTIVE_FAILURES
+        );
+        assert_eq!(clear_mcp_health(&repo, "tracker"), McpServerHealth::Failed);
+        assert_eq!(
+            mcp_server_health(&repo, "tracker"),
+            McpServerHealth::Unknown
+        );
+        // A success in between resets the count.
+        record_mcp_health(&repo, "tracker", "s", McpServerHealth::Unreachable);
+        record_mcp_health(&repo, "tracker", "s", McpServerHealth::Ready);
+        record_mcp_health(&repo, "tracker", "s", McpServerHealth::Unreachable);
+        let observation = mcp_health_observation(&repo, "tracker").unwrap();
+        assert_eq!(observation.health, McpServerHealth::Unreachable);
+        assert_eq!(observation.consecutive_failures, 1);
     }
 
     #[test]

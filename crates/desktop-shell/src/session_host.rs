@@ -8,8 +8,9 @@
 //! resumes are the shell's own code, not a translation, and writes the HTTP
 //! response, JSON or SSE, back over the connection for the shell to copy to
 //! the window. Besides `request`, a connection may ask `status`, `cancel`,
-//! `note` or `shutdown`, one line each: that is how the shell's lane reaches
-//! the work running here (D3, D7).
+//! `note`, `mcp_health`, `mcp_retry` or `shutdown`, one line each: that is
+//! how the shell's lane reaches the work running here (D3, D7), and how the
+//! shell gathers this session's MCP health (spec 33 Task 7).
 //!
 //! The host never reads the Keychain. The shell resolves each key a request
 //! needs and writes it on the host's stdin, after the handover line, as
@@ -289,6 +290,15 @@ fn serve_host_connection(stream: UnixStream, token: &str, shutdown: &ShutdownSig
             };
             json!({"ok": crate::lanes::queue_note(&session, text)})
         }
+        // Spec 33 Task 7: this session's MCP health, and the manual retry's
+        // first half, for the shell's `/api/mcp-health` and `/api/mcp-test`.
+        "mcp_health" => crate::mcp_health_api::snapshot_answer(),
+        "mcp_retry" => match (fields.remove("repositoryId"), fields.remove("serverId")) {
+            (Some(Value::String(repository_id)), Some(Value::String(server_id))) => {
+                crate::mcp_health_api::retry_answer(&repository_id, &server_id)
+            }
+            _ => json!({"ok": false, "error": "a required argument is missing"}),
+        },
         "shutdown" => {
             shutdown.trigger();
             json!({"ok": true})

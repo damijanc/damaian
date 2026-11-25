@@ -89,8 +89,20 @@ fn answer(stream: TcpStream, arrived: &AtomicUsize, open: &AtomicBool) {
     while !open.load(Ordering::SeqCst) {
         std::thread::sleep(Duration::from_millis(20));
     }
-    let chunk = r#"{"id":"c1","object":"chat.completion.chunk","created":1,"model":"fake","choices":[{"index":0,"delta":{"role":"assistant","content":"Done."},"finish_reason":null}]}"#;
-    let last = r#"{"id":"c1","object":"chat.completion.chunk","created":1,"model":"fake","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#;
+    let (chunk, last) = if wants_tracker_call(&body) {
+        let id = arrived.load(Ordering::SeqCst);
+        (
+            format!(
+                r#"{{"id":"c1","object":"chat.completion.chunk","created":1,"model":"fake","choices":[{{"index":0,"delta":{{"role":"assistant","tool_calls":[{{"index":0,"id":"call_{id}","type":"function","function":{{"name":"mcp__tracker__ping","arguments":"{{}}"}}}}]}},"finish_reason":null}}]}}"#
+            ),
+            r#"{"id":"c1","object":"chat.completion.chunk","created":1,"model":"fake","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+        )
+    } else {
+        (
+            r#"{"id":"c1","object":"chat.completion.chunk","created":1,"model":"fake","choices":[{"index":0,"delta":{"role":"assistant","content":"Done."},"finish_reason":null}]}"#.to_string(),
+            r#"{"id":"c1","object":"chat.completion.chunk","created":1,"model":"fake","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+        )
+    };
     let body = format!("data: {chunk}\n\ndata: {last}\n\ndata: [DONE]\n\n");
     let _ = writer.write_all(
         format!(
@@ -99,6 +111,32 @@ fn answer(stream: TcpStream, arrived: &AtomicUsize, open: &AtomicBool) {
         )
         .as_bytes(),
     );
+}
+
+/// The prompt that makes the model call `mcp__tracker__ping` once per turn
+/// (spec 33 Task 7's host-level health test); every other prompt gets "Done.".
+const TRACKER_PROMPT: &str = "PING-THE-TRACKER once.";
+
+/// Whether this request is a tracker turn whose call has not been answered
+/// yet: more user prompts asking for the call than tool results so far.
+fn wants_tracker_call(body: &[u8]) -> bool {
+    let Ok(request) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return false;
+    };
+    let messages = request["messages"].as_array().cloned().unwrap_or_default();
+    let count = |role: &str, marked: bool| {
+        messages
+            .iter()
+            .filter(|message| message["role"] == role)
+            .filter(|message| {
+                !marked
+                    || message["content"]
+                        .as_str()
+                        .is_some_and(|text| text.contains(TRACKER_PROMPT))
+            })
+            .count()
+    };
+    count("user", true) > count("tool", false)
 }
 
 struct Shell {
@@ -116,7 +154,7 @@ impl Shell {
             .join("&");
         let method = if matches!(
             path,
-            "/api/recovery" | "/api/sessions" | "/api/working-sessions"
+            "/api/recovery" | "/api/sessions" | "/api/working-sessions" | "/api/mcp-health"
         ) {
             "GET"
         } else {
@@ -491,6 +529,117 @@ fn a_new_sessions_first_turn_binds_its_host_and_the_lane_reaches_it() {
         Some(pid),
         "the host stays bound to its session"
     );
+}
+
+/// Spec 33 Task 7: MCP health lives in the process whose turn contacted the
+/// server — here, the session's host — so `/api/mcp-health` must gather it
+/// from there; a server that fails repeatedly in that host is `Failed`, and
+/// the manual retry on `/api/mcp-test` reaches the host, clears the latch
+/// there, and lets the session's next turn contact the server again.
+#[test]
+#[ignore = "starts real host processes and binds loopback ports; see the module docs"]
+fn mcp_health_is_gathered_from_the_session_host_and_a_retry_clears_its_latch() {
+    let _turn = exclusive();
+    let (shell, model) = shell_and_model();
+    model.release();
+    let repo = temp_repo("mcp");
+    let script = repo.join("tracker.sh");
+    std::fs::write(&script, "#!/bin/sh\nexit 1\n").unwrap();
+    let user_conf = shell.data_dir.join("config").join("user.conf");
+    let shared = std::fs::read_to_string(&user_conf).unwrap();
+    std::fs::write(
+        &user_conf,
+        format!(
+            "{shared}mcp_enabled=true\n\
+             mcp_server.tracker.enabled=true\n\
+             mcp_server.tracker.transport=stdio\n\
+             mcp_server.tracker.command=/bin/sh\n\
+             mcp_server.tracker.args={}\n\
+             mcp_server.tracker.require_approval=false\n",
+            script.display()
+        ),
+    )
+    .unwrap();
+    let repo_arg = repo.to_str().unwrap();
+    let session = shell.create_session(&repo, "MCP health");
+    let turn = |prompt: &str| {
+        let mut text = String::new();
+        shell
+            .request(
+                "/api/ask-stream",
+                &[
+                    ("repo", repo_arg),
+                    ("session_id", &session),
+                    ("prompt", prompt),
+                ],
+            )
+            .read_to_string(&mut text)
+            .unwrap();
+        assert!(text.contains("event: done"), "{text}");
+        text
+    };
+    let tracker = |shell: &Shell| {
+        let (status, body, _) = shell.call("/api/mcp-health", &[("repo", repo_arg)]);
+        assert_eq!(status, 200, "{body}");
+        body["servers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|server| server["id"] == "tracker")
+            .cloned()
+            .unwrap_or_else(|| panic!("tracker is listed: {body}"))
+    };
+
+    assert_eq!(tracker(shell)["health"], "unknown");
+    // Two contacts fail in the first turn (the listing, then the call), the
+    // third in the second turn, which latches `Failed` — all in the host.
+    turn(TRACKER_PROMPT);
+    live_pid(&session);
+    let seen = tracker(shell);
+    assert_eq!(seen["health"], "unreachable", "{seen}");
+    assert_eq!(seen["sessionId"], session.as_str(), "observed by the host");
+    turn(TRACKER_PROMPT);
+    let seen = tracker(shell);
+    assert_eq!(seen["health"], "failed", "{seen}");
+    assert!(seen["reason"].as_str().is_some(), "{seen}");
+
+    // The server is fixed; the retry clears the host's latch and contacts it.
+    std::fs::write(
+        &script,
+        r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed 's/.*"id":\([0-9]*\).*/\1/')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-06-18","capabilities":{},"serverInfo":{"name":"fake","version":"0"}}}\n' "$id" ;;
+    *'"method":"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"ping","description":"Ping.","inputSchema":{"type":"object"}}]}}\n' "$id" ;;
+    *'"method":"tools/call"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"pong"}]}}\n' "$id" ;;
+  esac
+done
+"#,
+    )
+    .unwrap();
+    let (status, retried, _) = shell.call(
+        "/api/mcp-test",
+        &[("retry", "true"), ("repo", repo_arg), ("id", "tracker")],
+    );
+    assert_eq!(status, 200, "{retried}");
+    assert_eq!(retried["ok"], true, "{retried}");
+    assert_eq!(retried["health"], "ready", "{retried}");
+    assert_eq!(
+        retried["wasFailedIn"], 1,
+        "the host had it latched: {retried}"
+    );
+
+    // The session's next turn contacts the server again, from its host.
+    turn(TRACKER_PROMPT);
+    let seen = tracker(shell);
+    assert_eq!(seen["health"], "ready", "{seen}");
+    assert_eq!(seen["sessionId"], session.as_str(), "{seen}");
+
+    std::fs::write(&user_conf, shared).unwrap();
 }
 
 unsafe extern "C" {
