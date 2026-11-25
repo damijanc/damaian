@@ -203,6 +203,7 @@ impl ChatOrchestrator {
                         &mcp_call.server_id,
                         &mcp_call.tool_name,
                         &mcp_call.arguments_json,
+                        crate::mcp::McpApprovalDecision::Approved,
                     ) {
                         Ok(result) => {
                             let text = self.scanner.redact(&result.text).text;
@@ -234,6 +235,27 @@ impl ChatOrchestrator {
                     content
                 }
             } else {
+                // Invocation history (spec 33 §5.7): what was asked of the
+                // server and refused. Nothing is contacted, so no runtime is
+                // built (building one would resolve the server's token).
+                self.audit_log.record(
+                    "mcp_tool_call_declined",
+                    &[
+                        ("actor", approved_by.to_string()),
+                        ("server", mcp_call.server_id.clone()),
+                        ("tool", mcp_call.tool_name.clone()),
+                        ("sessionId", pending.session.id.clone()),
+                        ("outcome", "declined".to_string()),
+                        ("approvalDecision", "declined".to_string()),
+                        (
+                            "arguments",
+                            crate::mcp::mcp_history_excerpt(
+                                &self.scanner,
+                                &mcp_call.arguments_json,
+                            ),
+                        ),
+                    ],
+                )?;
                 format!(
                     "The user declined to run the MCP tool `{}` on server `{}`. Do not request it again; answer using what you already know, noting the limitation if it matters.",
                     mcp_call.tool_name, mcp_call.server_id

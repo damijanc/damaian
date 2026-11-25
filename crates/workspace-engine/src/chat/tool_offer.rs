@@ -219,7 +219,7 @@ impl ChatOrchestrator {
                     || pinned.contains(&tool.name)
                     || named_here.contains(tool.name.as_str());
                 if wanted && offered(server_id, &tool) {
-                    definitions.push(tool.to_tool_definition(server_id));
+                    definitions.push(tool.to_tool_definition(server_id, &self.scanner));
                 }
             }
         }

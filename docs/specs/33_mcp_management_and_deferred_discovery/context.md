@@ -243,6 +243,29 @@ manages. `crates/workspace-engine/src/chat.rs` (23,166 lines) is the orchestrato
   `SecretScanner` before they become `ToolDefinition`s, closing the
   description-embeds-a-secret hole (proposal §5.6). Results are already
   redacted; extend the same path to the bounded invocation-history copy.
+- **D8/D9 as built (Task 8).** The audit events keep their camelCase field
+  style: `mcp_tool_called` and `mcp_tool_call_failed` carry `server`, `tool`,
+  `sessionId`, `outcome`, `durationMs`, `approvalDecision`,
+  `serverReadOnlyClaim`, `arguments`, and `result` (called) or `error`
+  (failed); the timestamp is the audit log's own `timestampMs`. `outcome` is
+  `ok`, `tool_error` (the server answered with an error result), `failed` (the
+  server refused the request), `not_sent` (nothing reached the server: it
+  could not be started, or is latched `Failed`), or `unknown` (sent, no answer:
+  a timeout, a stop, or a server that exited mid-call). `approvalDecision` is
+  `not_required` (waived in config) or `approved` (the card); a call the user
+  declines is recorded as a third event, `mcp_tool_call_declined`
+  (`approvalDecision`/`outcome` `declined`, redacted arguments), written
+  straight to the audit log because building a runtime would resolve the
+  server's token. Arguments, results and errors are redacted *then* bounded to
+  `MCP_HISTORY_EXCERPT_CHARS` (2,000) characters, so a cut never splits a
+  secret into an unrecognisable fragment; `AuditLog::record` redacts again.
+  Descriptions and schemas are redacted at two points: once when a listing
+  arrives (`McpRuntime::list_now`, so the cached listing, the inventory on
+  disk and search results never hold the secret), and again in
+  `McpTool::to_tool_definition`, which now requires the scanner, so a schema
+  served from an inventory recorded before this change is scanned too. A
+  schema is redacted string by string inside its parsed JSON (keys included)
+  so it stays valid JSON; text that is not JSON is redacted as text.
 
 ## Open items not yet decided
 
