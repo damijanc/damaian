@@ -147,14 +147,14 @@ fn without_a_stop_the_same_call_runs_to_its_deadline() {
 // The stopped turn's report names only the action the stop ended.
 // ---------------------------------------------------------------------------
 
-/// `command` runs without a card: it is on the allowlist, and a one-second
-/// timeout lets a test make it time out by itself.
-fn turn_engine(repo: &std::path::Path, command: &str) -> WorkspaceEngine {
+/// `command` runs without a card: it is on the allowlist, and a short
+/// `timeout_secs` lets a test make it time out by itself.
+fn turn_engine(repo: &std::path::Path, command: &str, timeout_secs: usize) -> WorkspaceEngine {
     WorkspaceEngine::new(Config {
         data_dir: repo.join(".damaian"),
         enable_index_watcher: false,
         shell: "/bin/sh".to_string(),
-        command_timeout_secs: 1,
+        command_timeout_secs: timeout_secs,
         command_allowlist: vec![command.to_string()],
         ..Config::default()
     })
@@ -221,17 +221,33 @@ fn ask(
 #[test]
 fn a_command_the_stop_ended_is_named_in_the_stopped_turns_report() {
     let repo = temp_dir("turn-stopped-command");
-    // Under the one-second timeout, so only the stop at 300 ms ends it.
-    let command = "sleep 0.9";
-    let engine = turn_engine(&repo, command);
+    // Far under its timeout, so only the stop ends it.
+    let command = "sleep 30";
+    let engine = turn_engine(&repo, command, 60);
     let cancel = CancelToken::new();
+    // Stop once the command is running, not after a fixed delay: a stop that
+    // lands during context assembly ends the turn before the model is ever
+    // asked (OBSERVATIONS 107). The runner registers the child right after
+    // spawning it, so its registry entry means the command is running.
+    let registry = ProcessRegistry::open(repo.join(".damaian")).expect("registry");
     let stopper = {
         let cancel = cancel.clone();
         std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(300));
+            let deadline = Instant::now() + Duration::from_secs(20);
+            let running = || {
+                registry.entries().is_ok_and(|entries| {
+                    entries
+                        .iter()
+                        .any(|(_, entry)| entry.as_ref().is_some_and(|e| e.kind == "command"))
+                })
+            };
+            while !running() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
             cancel.cancel();
         })
     };
+    let started = Instant::now();
     let mut adapter = CommandThenStop {
         command: run_command_call(command),
         calls: 0,
@@ -244,6 +260,10 @@ fn a_command_the_stop_ended_is_named_in_the_stopped_turns_report() {
         "the command ran without a card"
     );
     assert!(result.cancelled);
+    assert!(
+        started.elapsed() < Duration::from_secs(25),
+        "the stop did not end the command before its 60 s timeout"
+    );
     assert_eq!(adapter.calls, 1, "a stopped command is not retried");
     assert!(
         result.response.contains(&format!(
@@ -265,7 +285,7 @@ fn a_command_that_timed_out_earlier_is_not_blamed_for_a_later_stop() {
     let repo = temp_dir("turn-timed-out-command");
     // Past the one-second timeout: it ends `unknown` by itself.
     let command = "sleep 3";
-    let engine = turn_engine(&repo, command);
+    let engine = turn_engine(&repo, command, 1);
     let cancel = CancelToken::new();
     let mut adapter = CommandThenStop {
         command: run_command_call(command),
