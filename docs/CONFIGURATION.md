@@ -253,7 +253,7 @@ See [MCP Servers](USER_GUIDE.md#mcp-servers). `allow_mutating_mcp_tools` is unde
 | `mcp_server.<id>.url` | Empty | A URL; a trailing `/` is removed | http: the server's address | Only for a new server |
 | `mcp_server.<id>.auth_token_env` | Empty (no token) | `keychain:<account>` or an environment variable name | http: where the bearer token is read from | Only for a new server |
 | `mcp_server.<id>.enabled` | `false` | `true`, `false` | Offer this server's tools to the assistant. The Settings form ticks it for a new server | Turn off only |
-| `mcp_server.<id>.require_approval` | `true` | `true`, `false` | Ask before each tool call on this server | Turn on only |
+| `mcp_server.<id>.require_approval` | `true` | `true`, `false` | Ask before each tool call on this server, except for a tool with its own `require_approval` below | Turn on only (turning it on also makes every tool on the server ask) |
 
 ### Per-tool overrides: `mcp_server.<server>.tool.<tool>.<field>`
 
@@ -262,7 +262,7 @@ See [MCP Servers](USER_GUIDE.md#mcp-servers). `allow_mutating_mcp_tools` is unde
 | Key | Default | Values | What it does | Repository may change it? |
 |---|---|---|---|---|
 | `mcp_server.<server>.tool.<tool>.enabled` | `true` | `true`, `false` | Offer this tool when its server is enabled | Turn off only |
-| `mcp_server.<server>.tool.<tool>.require_approval` | `true` | `true`, `false` | Ask before each call to this tool | Turn on only |
+| `mcp_server.<server>.tool.<tool>.require_approval` | The server's `require_approval` | `true`, `false` | Ask before each call to this tool. Set for this tool alone: `false` lets this one tool run without a card and never changes another tool on the server. A tool that its server describes as read-only still asks unless you set this | Turn on only |
 | `mcp_server.<server>.tool.<tool>.pinned` | `false` | `true`, `false` | Always send this tool's schema, even when discovery is deferred | Clear only (a repository may set `false`, never `true`) |
 
 ## Hooks

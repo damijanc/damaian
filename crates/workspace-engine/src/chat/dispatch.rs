@@ -978,17 +978,24 @@ impl ChatOrchestrator {
                 )));
             }
             // MCP tools reach an external service and can have side
-            // effects, so unless the server is marked no-approval we
-            // pause the turn exactly like a command needing approval:
-            // persist state keyed by a fresh proposal id and hand the
-            // user a proposal to accept or decline.
-            if cx.force_approval || cx.mcp.requires_approval(&server_id) {
+            // effects, so unless the user waived approval for this exact
+            // tool (or its server, when the tool has no setting of its
+            // own) we pause the turn exactly like a command needing
+            // approval: persist state keyed by a fresh proposal id and
+            // hand the user a proposal to accept or decline. The server's
+            // read-only claim is shown, never obeyed (spec 33 D1).
+            if cx.force_approval
+                || self
+                    .config
+                    .mcp_tool_requires_approval(&server_id, &tool_name)
+            {
                 let proposal_id = create_id("mcp");
                 let proposal = mcp_approval_proposal(
                     &proposal_id,
                     &server_id,
                     &tool_name,
                     &arguments_json,
+                    cx.mcp.tool_read_only_hint(&server_id, &tool_name),
                     cx.force_approval_cause.as_ref(),
                 );
                 let response = proposal.prompt.clone();

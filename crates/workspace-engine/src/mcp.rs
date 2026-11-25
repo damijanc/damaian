@@ -701,6 +701,17 @@ fn parse_rpc_body(body: &str) -> Option<Value> {
 // Runtime
 // ---------------------------------------------------------------------------
 
+/// How the audit log records a tool's `readOnlyHint`: what the server said,
+/// including that it said nothing. `claimed_read_only` is the server's word,
+/// not a verified property of the tool.
+fn read_only_claim_label(hint: Option<bool>) -> &'static str {
+    match hint {
+        Some(true) => "claimed_read_only",
+        Some(false) => "claimed_not_read_only",
+        None => "no_claim",
+    }
+}
+
 /// The three independently configured MCP budgets (spec 33 §5.4, D6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct McpTimeouts {
@@ -787,13 +798,6 @@ impl McpRuntime {
         self.servers
             .iter()
             .find(|server| server.config.id == server_id)
-    }
-
-    pub fn requires_approval(&self, server_id: &str) -> bool {
-        // Default to requiring approval for anything we can't identify.
-        self.server(server_id)
-            .map(|server| server.config.require_approval)
-            .unwrap_or(true)
     }
 
     /// The server's own read-only claim for one of its tools, from the
@@ -957,6 +961,8 @@ impl McpRuntime {
         let result = self
             .connection(server_id)
             .and_then(|client| client.call_tool(tool_name, arguments_json, call_timeout));
+        // Spec 33 §5.5: recorded as the server's claim, never as a fact.
+        let claim = read_only_claim_label(self.tool_read_only_hint(server_id, tool_name));
         match &result {
             Ok(value) => self.record(
                 "mcp_tool_called",
@@ -964,6 +970,7 @@ impl McpRuntime {
                     ("server", server_id.to_string()),
                     ("tool", tool_name.to_string()),
                     ("isError", value.is_error.to_string()),
+                    ("serverReadOnlyClaim", claim.to_string()),
                 ],
             ),
             Err(error) => self.record(
@@ -972,6 +979,7 @@ impl McpRuntime {
                     ("server", server_id.to_string()),
                     ("tool", tool_name.to_string()),
                     ("error", error.to_string()),
+                    ("serverReadOnlyClaim", claim.to_string()),
                 ],
             ),
         }

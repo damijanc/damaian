@@ -865,6 +865,40 @@ fn every_capability_key_resists_weakening_from_repository_scope() {
     }
 }
 
+/// Spec 33 D1: a tool's own `require_approval` outranks its server's, so a
+/// repository that gates the whole server must also reach the tools the user
+/// waived one by one — and may never waive one itself.
+#[test]
+fn a_repository_server_gate_reaches_tools_the_user_waived() {
+    let user = "mcp_server.github.command=github-mcp\n\
+                mcp_server.github.enabled=true\n\
+                mcp_server.github.tool.search_code.require_approval=false\n";
+    let (gated, report) = load(
+        "mcp-tool-server-gate",
+        user,
+        "mcp_server.github.require_approval=true\n",
+    );
+    assert!(
+        gated.mcp_tool_requires_approval("github", "search_code"),
+        "the repository's server gate must reach the user's per-tool waiver"
+    );
+    assert!(report.rejected_keys.is_empty(), "{report:?}");
+
+    let (waived, report) = load(
+        "mcp-tool-waive",
+        "mcp_server.github.command=github-mcp\nmcp_server.github.enabled=true\n",
+        "mcp_server.github.tool.create_issue.require_approval=false\n",
+    );
+    assert!(waived.mcp_tool_requires_approval("github", "create_issue"));
+    assert!(
+        report.rejected_keys.iter().any(|rejected| {
+            rejected.key == "mcp_server.github.tool.create_issue.require_approval"
+                && rejected.class == RepositoryKeyClass::RestrictOnly
+        }),
+        "{report:?}"
+    );
+}
+
 /// Spec 33 §5.2: pinning always sends a tool's schema and spends context
 /// budget, so a repository may clear a pin the user set but never pin a tool
 /// itself.

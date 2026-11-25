@@ -908,8 +908,11 @@ pub struct McpToolConfig {
     /// Default true: a tool the user has not overridden is offered when its
     /// server is enabled.
     pub enabled: bool,
-    /// Default true: MCP tools can have arbitrary external side effects.
-    pub require_approval: bool,
+    /// `None` until set for this exact tool, when the server's
+    /// `require_approval` decides (spec 33 D1). An explicit value decides for
+    /// this tool alone, never a sibling — see
+    /// [`Config::mcp_tool_requires_approval`].
+    pub require_approval: Option<bool>,
     /// Default false: pinning always sends a tool's schema, so only user or
     /// admin config may opt into it.
     pub pinned: bool,
@@ -919,7 +922,7 @@ impl Default for McpToolConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            require_approval: true,
+            require_approval: None,
             pinned: false,
         }
     }
@@ -3139,11 +3142,25 @@ impl Config {
     }
 
     /// The effective per-tool settings: the override when present, otherwise
-    /// the defaults — enabled and approval-gated, never pinned.
+    /// the defaults — enabled, never pinned, and approval left to the server.
     pub fn mcp_tool_settings(&self, server_id: &str, tool_name: &str) -> McpToolConfig {
         self.mcp_tool_config(server_id, tool_name)
             .cloned()
             .unwrap_or_default()
+    }
+
+    /// Whether a call to one MCP tool must be approved (spec 33 §5.5, D1):
+    /// the tool's own `require_approval` when set for exactly this tool,
+    /// otherwise its server's (default true). A server this config does not
+    /// know asks. The tool's read-only claim plays no part: it is the
+    /// server's assertion, not a local decision.
+    pub fn mcp_tool_requires_approval(&self, server_id: &str, tool_name: &str) -> bool {
+        let Some(server) = self.mcp_server_config(server_id) else {
+            return true;
+        };
+        self.mcp_tool_settings(server_id, tool_name)
+            .require_approval
+            .unwrap_or(server.require_approval)
     }
 
     /// The MCP servers whose tools should actually be offered to the model:
@@ -3233,7 +3250,7 @@ impl Config {
             entry.enabled = value;
         }
         if let Some(value) = require_approval {
-            entry.require_approval = value;
+            entry.require_approval = Some(value);
         }
         if let Some(value) = pinned {
             entry.pinned = value;
@@ -3388,7 +3405,20 @@ impl Config {
             narrowed.require_approval = Some(true);
         }
         let fields = narrowed.present_fields();
+        let gates_every_tool = narrowed.require_approval == Some(true);
         self.upsert_mcp_server(narrowed);
+        if gates_every_tool {
+            // A tool's own `require_approval=false` outranks its server's
+            // value, so the server gate alone would leave the user's per-tool
+            // waivers in place; this scope asked for every tool to ask.
+            for (namespaced, tool) in &mut self.mcp_tools {
+                let on_server = parse_namespaced_tool_name(namespaced)
+                    .is_some_and(|(server_id, _)| server_id == id);
+                if on_server && tool.require_approval == Some(false) {
+                    tool.require_approval = Some(true);
+                }
+            }
+        }
         fields
     }
 
@@ -6478,11 +6508,14 @@ fn push_mcp_tool_config(
         &format!("mcp_server.{server_id}.tool.{tool_name}.enabled"),
         &tool.enabled.to_string(),
     );
-    push_line(
-        output,
-        &format!("mcp_server.{server_id}.tool.{tool_name}.require_approval"),
-        &tool.require_approval.to_string(),
-    );
+    // Unset stays unset, so the tool keeps following its server.
+    if let Some(require_approval) = tool.require_approval {
+        push_line(
+            output,
+            &format!("mcp_server.{server_id}.tool.{tool_name}.require_approval"),
+            &require_approval.to_string(),
+        );
+    }
     push_line(
         output,
         &format!("mcp_server.{server_id}.tool.{tool_name}.pinned"),

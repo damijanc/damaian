@@ -82,6 +82,22 @@ manages. `crates/workspace-engine/src/chat.rs` (23,166 lines) is the orchestrato
   widening (`mode.rs` ≈199) stays, so Ask/Review still *offer* read-only-claimed
   tools; offering is not approval. This changes `profile.rs` and its tests, plus
   `chat.rs:21946`'s narrowed-profile expectation.
+  **As built (Task 5, 2026-11-25):** `profile_permits` (in `mode.rs`, not
+  `profile.rs`) no longer takes the claim at all. Per-tool approval is
+  `Config::mcp_tool_requires_approval(server, tool)`: the tool's own
+  `require_approval` when set for exactly that tool, otherwise the server's
+  (default true); an unknown server asks. So the per-tool field is now
+  `Option<bool>` (unset is not serialised, so a reload does not freeze it to
+  the server's value), server-level `require_approval=false` keeps waiving the
+  server's tools that have no setting of their own (unchanged for existing
+  configs), and a tool may ask on a server that does not. Because the tool's
+  value outranks the server's, a repository or profile that sets
+  `mcp_server.<id>.require_approval=true` also turns that server's per-tool
+  `false` waivers back to `true`, so the tightening reaches every tool. The
+  approval card attributes a `readOnlyHint: true` to the server ("describes
+  this tool as read-only … the server's own claim"), and `mcp_tool_called` /
+  `mcp_tool_call_failed` carry `serverReadOnlyClaim`
+  (`claimed_read_only` / `claimed_not_read_only` / `no_claim`).
 - **D2 — deferral ceiling (decided 2026-11-10).** New config key
   `mcp_deferral_ceiling_tokens` (estimated tokens, `usize`), default **8,000**
   so one or two servers with a handful of tools stay direct. Repository and

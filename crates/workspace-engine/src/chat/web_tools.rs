@@ -215,11 +215,23 @@ pub(super) fn mcp_approval_proposal(
     server_id: &str,
     tool_name: &str,
     arguments_json: &str,
+    read_only_claim: Option<bool>,
     hook_cause: Option<&(String, String)>,
 ) -> AgentCommandProposal {
     let arguments = truncate_for_prompt(arguments_json.trim(), 500);
+    // Spec 33 §5.5: the claim is attributed to the server, and it does not
+    // change what the card asks.
+    let claim = if read_only_claim == Some(true) {
+        format!(
+            "\n\nThe server `{server_id}` describes this tool as read-only. That is the \
+             server's own claim, which Damaian cannot check, so the call still needs your \
+             approval."
+        )
+    } else {
+        String::new()
+    };
     let prompt = format!(
-        "The assistant wants to call the MCP tool `{tool_name}` on server `{server_id}` with arguments:\n{arguments}\n\nThis runs outside the local sandbox and may have side effects. Approve to run it, or decline."
+        "The assistant wants to call the MCP tool `{tool_name}` on server `{server_id}` with arguments:\n{arguments}\n\nThis runs outside the local sandbox and may have side effects. Approve to run it, or decline.{claim}"
     );
     AgentCommandProposal {
         id: proposal_id.to_string(),
@@ -242,8 +254,9 @@ pub(super) fn mcp_approval_proposal(
             .unwrap_or_default(),
         reason: String::new(),
         // An MCP tool call is not a shell command, so `command_allowlist` has
-        // nothing to say about it. Per-server `require_approval` in the MCP
-        // config is the knob for making these stop prompting.
+        // nothing to say about it. `require_approval` for the exact tool (or
+        // its server) in the MCP config is the knob for making these stop
+        // prompting (spec 33 D1).
         allow_always: false,
         allow_browser_diagnostics_for_session: false,
         session_approvable: false,

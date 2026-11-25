@@ -320,3 +320,29 @@ fn an_mcp_tool_with_a_true_read_only_hint_is_offered_in_ask() {
 
     fs::remove_dir_all(repo).unwrap();
 }
+
+/// Spec 33 D1: the read-only claim widens the mode layer only. Under a profile
+/// without `allow_mutating_mcp_tools` the claimed tool is withheld in every
+/// mode, Code included, where it was offered before; the mode still offers it
+/// in Ask when the profile allows MCP tools that change things.
+#[test]
+fn a_read_only_claim_does_not_carry_a_tool_past_the_profile() {
+    let repo = temp_repo("mcp-read-only-profile");
+    let mut engine = engine_with_mcp(
+        &repo,
+        r#"[{"name":"echo","description":"Echoes text","inputSchema":{"type":"object"},"annotations":{"readOnlyHint":true}}]"#,
+    );
+    let mut config = engine.config.clone();
+    config.allow_mutating_mcp_tools = false;
+    engine = WorkspaceEngine::new(config);
+
+    for mode in [SessionMode::Code, SessionMode::Ask] {
+        let offered = offered_tool_names(&engine, &repo, mode);
+        assert!(
+            !offered.iter().any(|name| name == "mcp__fake__echo"),
+            "{mode:?} withholds a read-only-claimed tool the profile refuses: {offered:?}"
+        );
+    }
+
+    fs::remove_dir_all(repo).unwrap();
+}
