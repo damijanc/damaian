@@ -2296,3 +2296,153 @@ fn a_tool_can_ask_on_a_server_that_does_not() {
     assert!(called.contains("claimed_read_only"), "{called}");
     fs::remove_dir_all(repo).unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// Spec 33 Task 6 · Lazy startup and in-memory health
+// (requirements 1, 3; context D5)
+// ---------------------------------------------------------------------------
+
+fn registry_is_empty(repo: &Path) -> bool {
+    workspace_engine::ProcessRegistry::open(repo.join(".damaian"))
+        .unwrap()
+        .entries()
+        .unwrap()
+        .is_empty()
+}
+
+fn tracker_health(repo: &Path) -> workspace_engine::McpServerHealth {
+    workspace_engine::mcp_server_health(&workspace_engine::repository_id_for_root(repo), "tracker")
+}
+
+/// Replaces the `tracker` server's script with `body`.
+fn rewrite_tracker(servers: &Path, body: &str) {
+    fs::write(servers.join("tracker.sh"), format!("#!/bin/sh\n{body}\n")).unwrap();
+}
+
+/// Acceptance criterion with a server whose cost is known and under the
+/// ceiling: its schemas are offered from the inventory, so a session that
+/// never searches or calls still starts no server process, and its health
+/// stays `Unknown` — never contacted is not the same as healthy.
+#[test]
+fn offering_a_known_server_directly_starts_nothing() {
+    let repo = temp_dir("mcp-lazy-direct");
+    let (engine, servers) = mcp_engine(
+        &repo,
+        true,
+        "mcp_server.tracker.tool.list_pulls.pinned=true\n",
+    );
+    let (_result, adapter) = ask_scripted(&engine, &repo, vec![Vec::new()]);
+
+    let names = offered_names(&adapter.requests[0]);
+    for tool in ["create_issue", "list_pulls", "trigger_deploy"] {
+        assert!(
+            names.contains(&format!("mcp__tracker__{tool}")),
+            "{tool} is offered from the inventory: {names:?}"
+        );
+    }
+    assert!(!mcp_server_started(&servers, "tracker"));
+    assert!(registry_is_empty(&repo), "no server process is registered");
+    assert_eq!(
+        tracker_health(&repo),
+        workspace_engine::McpServerHealth::Unknown
+    );
+    fs::remove_dir_all(repo).unwrap();
+}
+
+/// A pinned tool over the ceiling is offered from the inventory too.
+#[test]
+fn a_pinned_tool_is_offered_without_starting_its_server() {
+    let repo = temp_dir("mcp-lazy-pinned");
+    let (engine, servers) = mcp_engine(
+        &repo,
+        true,
+        "mcp_deferral_ceiling_tokens=10\n\
+         mcp_server.tracker.tool.list_pulls.pinned=true\n",
+    );
+    let (_result, adapter) = ask_scripted(&engine, &repo, vec![Vec::new()]);
+
+    assert!(offered_names(&adapter.requests[0]).contains(&"mcp__tracker__list_pulls".to_string()));
+    assert!(!mcp_server_started(&servers, "tracker"));
+    assert!(registry_is_empty(&repo));
+    fs::remove_dir_all(repo).unwrap();
+}
+
+/// A call is a contact: the server starts then, and its health reads `Ready`.
+#[test]
+fn calling_a_tool_starts_its_server_and_marks_it_ready() {
+    let repo = temp_dir("mcp-lazy-call");
+    let (engine, servers) = mcp_engine(&repo, true, "");
+    let (result, _adapter) = ask_scripted(
+        &engine,
+        &repo,
+        vec![
+            vec![ToolCall {
+                id: "call_1".to_string(),
+                name: "mcp__tracker__list_pulls".to_string(),
+                arguments_json: "{}".to_string(),
+            }],
+            Vec::new(),
+        ],
+    );
+
+    assert_eq!(tool_results(&engine, &result)[0], "tool ran");
+    assert!(mcp_server_started(&servers, "tracker"));
+    assert_eq!(
+        tracker_health(&repo),
+        workspace_engine::McpServerHealth::Ready
+    );
+    let observation = workspace_engine::mcp_health_snapshot()
+        .into_iter()
+        .find(|observation| {
+            observation.repository_id == workspace_engine::repository_id_for_root(&repo)
+        })
+        .expect("the contact is in this process's snapshot");
+    assert_eq!(observation.session_id, result.session.id);
+    fs::remove_dir_all(repo).unwrap();
+}
+
+/// A server that dies before its handshake reads `Unreachable` once searched.
+#[test]
+fn a_server_that_cannot_start_reads_unreachable() {
+    let repo = temp_dir("mcp-lazy-unreachable");
+    let (engine, servers) = mcp_engine(&repo, false, "");
+    rewrite_tracker(&servers, "exit 1");
+    let (result, _adapter) = ask_scripted(
+        &engine,
+        &repo,
+        vec![vec![search_call("call_1", "pull requests")], Vec::new()],
+    );
+
+    let found: serde_json::Value =
+        serde_json::from_str(&tool_results(&engine, &result)[0]).unwrap();
+    assert_eq!(found["unreachable_servers"][0], "tracker", "{found}");
+    assert_eq!(
+        tracker_health(&repo),
+        workspace_engine::McpServerHealth::Unreachable
+    );
+    fs::remove_dir_all(repo).unwrap();
+}
+
+/// A server that never answers its handshake reads `Timeout` (Task 2 sets
+/// the budget; the store records what it caused).
+#[test]
+fn a_server_that_never_answers_reads_timeout() {
+    let repo = temp_dir("mcp-lazy-timeout");
+    let (engine, servers) = mcp_engine(&repo, false, "mcp_connect_timeout_ms=300\n");
+    rewrite_tracker(&servers, "sleep 10");
+    let (_result, _adapter) = ask_scripted(
+        &engine,
+        &repo,
+        vec![vec![search_call("call_1", "pull requests")], Vec::new()],
+    );
+
+    assert_eq!(
+        tracker_health(&repo),
+        workspace_engine::McpServerHealth::Timeout
+    );
+    assert!(
+        registry_is_empty(&repo),
+        "the timed-out server is ended and unregistered"
+    );
+    fs::remove_dir_all(repo).unwrap();
+}

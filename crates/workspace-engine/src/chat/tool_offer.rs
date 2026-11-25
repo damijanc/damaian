@@ -129,11 +129,12 @@ impl ChatOrchestrator {
     /// Spec 33 §5.1: the MCP schemas a round sends. Per server, from the
     /// deferral decision: every tool when the configuration is under the
     /// ceiling; otherwise only pinned tools and those `named` this turn. A
-    /// server with nothing to send is not contacted, so a turn that uses no
-    /// MCP tool starts no server (§6). Named tools of a server not yet listed
-    /// are offered from the inventory's recorded schema, so a search match is
-    /// callable with its parameters while only the server actually called
-    /// starts (D3); a record without schemas lists the server instead. Every
+    /// server with nothing to send is not contacted, and a server not yet
+    /// listed has its tools offered from the inventory's recorded schemas, so
+    /// a turn that uses no MCP tool starts no server (§6) and only the server
+    /// actually called (or searched while of unknown cost) starts (D3, Task
+    /// 6); a record without a wanted tool or schema lists the server instead.
+    /// Every
     /// tool sent passes its per-tool `enabled` setting — a disabled tool is
     /// absent, not refused — and the mode and profile layers with the claim
     /// on record; a call re-asks with the claim the server lists then.
@@ -178,23 +179,31 @@ impl ChatOrchestrator {
             if !direct && pinned.is_empty() && named_here.is_empty() {
                 continue;
             }
-            // Only named tools are wanted from this server, and it has not
-            // been listed: offer them from the record when it holds their
-            // schemas, rather than start the server to fetch them.
-            let recorded: Option<Vec<crate::mcp::McpTool>> =
-                (!direct && pinned.is_empty() && !mcp.is_listed(server_id))
-                    .then(|| inventory.servers.get(server_id))
-                    .flatten()
-                    .and_then(|record| {
-                        let tools: Vec<_> = record
-                            .tools
-                            .iter()
-                            .filter(|tool| named_here.contains(tool.name.as_str()))
-                            .collect();
-                        let complete = tools.len() == named_here.len()
-                            && tools.iter().all(|tool| !tool.input_schema_json.is_empty());
-                        complete.then(|| tools.iter().map(|tool| tool.to_mcp_tool()).collect())
-                    });
+            // Lazy startup (spec 33 Task 6, §5.3): a server not yet listed
+            // this turn is offered from its record whenever the record holds
+            // every wanted tool with its schema — direct, pinned and named
+            // alike — so offering starts nothing; only a search of an
+            // unknown-cost server or a call does. A record missing a wanted
+            // tool or a schema (an older record) lists the server instead.
+            let recorded: Option<Vec<crate::mcp::McpTool>> = (!mcp.is_listed(server_id))
+                .then(|| inventory.servers.get(server_id))
+                .flatten()
+                .and_then(|record| {
+                    let has = |name: &str| record.tools.iter().any(|tool| tool.name == name);
+                    let tools: Vec<_> = record
+                        .tools
+                        .iter()
+                        .filter(|tool| {
+                            direct
+                                || pinned.contains(&tool.name)
+                                || named_here.contains(tool.name.as_str())
+                        })
+                        .collect();
+                    let complete = pinned.iter().all(|name| has(name))
+                        && named_here.iter().all(|name| has(name))
+                        && tools.iter().all(|tool| !tool.input_schema_json.is_empty());
+                    complete.then(|| tools.iter().map(|tool| tool.to_mcp_tool()).collect())
+                });
             let tools = match recorded {
                 Some(tools) => tools,
                 None => mcp.list_server(server_id).to_vec(),

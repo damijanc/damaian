@@ -203,6 +203,11 @@ Added in planning (2026-11-10, [`context.md`](context.md) D5): health is held
 **in memory** per shell process, keyed by repository and server, and is not
 persisted — only the tool inventory (D4) is written to disk. Persisting a
 per-session `Unknown`/`Failed` state would contradict its own semantics.
+Refined in Task 6 (2026-11-25): since each session's work runs in a session
+host process of its own ([spec 110](../110_responsive_shell_during_work/tasks.md)
+Task 1b), health is held per process wherever MCP runs — in a host, that is the
+session — and a reader of every session's view gathers the hosts' snapshots
+(`context.md` D5 "As built").
 
 ```rust
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

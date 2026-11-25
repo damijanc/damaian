@@ -35,6 +35,7 @@ mod keyword_rank;
 pub mod language;
 pub mod lsp;
 pub mod mcp;
+pub mod mcp_health;
 pub mod mcp_inventory;
 pub mod memory;
 pub mod mode;
@@ -192,8 +193,11 @@ pub use lsp::{
     symbol_kind_from_lsp, symbol_refs_from_locations, symbols_from_document_symbols, write_message,
 };
 pub use mcp::{
-    McpClient, McpRuntime, McpServerRuntime, McpTool, McpToolResult, namespaced_tool_name,
-    parse_namespaced_tool_name,
+    McpClient, McpRuntime, McpServerHealth, McpServerRuntime, McpTool, McpToolResult,
+    namespaced_tool_name, parse_namespaced_tool_name,
+};
+pub use mcp_health::{
+    McpHealthObservation, mcp_health_snapshot, mcp_server_health, merge_mcp_health,
 };
 pub use mcp_inventory::{
     McpDeferralDecision, McpInventoryTool, McpServerInventory, McpToolInventory, McpToolSurface,
