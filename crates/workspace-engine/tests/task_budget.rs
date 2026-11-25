@@ -785,8 +785,14 @@ mod budget_usage_chain {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
+        // The process id is what makes this unique. nextest runs each test in
+        // its own process, so the counter starts at 1 in every one, and macOS
+        // reports time in whole microseconds: two tests started together got
+        // the same root, and the first to finish deleted the other's session
+        // log mid-test (OBSERVATIONS 101).
         let root = std::env::temp_dir().join(format!(
-            "damaian-budget-chain-{now}-{}",
+            "damaian-budget-chain-{}-{now}-{}",
+            std::process::id(),
             COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&root).unwrap();
@@ -846,28 +852,10 @@ mod budget_usage_chain {
             .unwrap();
         store.resume_plan(&continued, &first.id).unwrap();
 
-        // Failed once on CI (2026-11-13, OBSERVATIONS 101) and never in 1,100
-        // local runs, 800 of them 24 at a time. A failure prints what the
-        // store saw, so the next one names its cause.
         let total = store
             .read_budget_usage(&session.id, &continued.id)
             .unwrap()
-            .unwrap_or_else(|| {
-                let log = root
-                    .join(".damaian")
-                    .join("sessions")
-                    .join(format!("{}.jsonl", session.id));
-                panic!(
-                    "the chain's usage is known before the continuation's first call\n\
-                     first = {}\ncontinued = {}\nchain = {:?}\nlog {} =\n{}",
-                    first.id,
-                    continued.id,
-                    store.task_continuation_chain(&session.id, &continued.id),
-                    log.display(),
-                    std::fs::read_to_string(&log)
-                        .unwrap_or_else(|error| format!("<unreadable: {error}>")),
-                )
-            });
+            .expect("the chain's usage is known before the continuation's first call");
         assert_eq!((total.input_tokens, total.output_tokens), (100, 10));
 
         store
