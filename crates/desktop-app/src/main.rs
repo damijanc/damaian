@@ -40,6 +40,13 @@ fn main() {
     if args.get(1).map(String::as_str) == Some(desktop_shell::WORKER_FLAG) {
         std::process::exit(desktop_shell::run_worker_from_args(args));
     }
+    // A session host likewise (spec 110 D1a): one session's work, no window.
+    if args.get(1).map(String::as_str) == Some(desktop_shell::SESSION_HOST_FLAG) {
+        std::process::exit(desktop_shell::run_session_host_from_args(args));
+    }
+    if let Ok(exe) = env::current_exe() {
+        desktop_shell::enable_session_hosts(exe);
+    }
     let shell_port = shell_port().unwrap_or_else(|error| {
         eprintln!("{error}");
         std::process::exit(1);
@@ -135,10 +142,10 @@ fn main() {
         .build(tauri::generate_context!())
         .expect("error while building Damaian desktop app")
         .run(|_app, event| {
-            // A normal quit (spec 57 §5.3 step 4). A crash or `SIGKILL` never
-            // gets here; each worker's lifeline covers that.
+            // A normal quit (spec 57 §5.3 step 4, spec 110 D6). A crash or
+            // `SIGKILL` never gets here; each host's lifeline covers that.
             if let tauri::RunEvent::Exit = event {
-                desktop_shell::shutdown_all_workers();
+                desktop_shell::shutdown_all_hosts();
             }
         });
 }

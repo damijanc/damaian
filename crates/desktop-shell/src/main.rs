@@ -7,6 +7,13 @@ fn main() {
     if args.get(1).map(String::as_str) == Some(desktop_shell::WORKER_FLAG) {
         std::process::exit(desktop_shell::run_worker_from_args(args));
     }
+    if args.get(1).map(String::as_str) == Some(desktop_shell::SESSION_HOST_FLAG) {
+        std::process::exit(desktop_shell::run_session_host_from_args(args));
+    }
+    // Spec 110 D1: each session's work runs in a host process of its own.
+    if let Ok(exe) = std::env::current_exe() {
+        desktop_shell::enable_session_hosts(exe);
+    }
     if let Err(error) = install_shutdown_handler() {
         eprintln!("{error}");
         std::process::exit(1);

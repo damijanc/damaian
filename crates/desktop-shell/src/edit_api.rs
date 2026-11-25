@@ -2,7 +2,7 @@
 
 use super::*;
 
-pub(crate) fn handle_propose_edit(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+pub(crate) fn handle_propose_edit(stream: &mut dyn Write, request: &Request) -> Result<(), String> {
     let form = parse_form(&request.body);
     let repo = required_form(&form, "repo")?;
     let prompt = required_form(&form, "prompt")?;
@@ -57,7 +57,7 @@ pub(crate) fn handle_propose_edit(stream: &mut TcpStream, request: &Request) -> 
     )
 }
 
-pub(crate) fn handle_apply_patch(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+pub(crate) fn handle_apply_patch(stream: &mut dyn Write, request: &Request) -> Result<(), String> {
     let form = parse_form(&request.body);
     let repo = required_form(&form, "repo")?;
     let patch_id = required_form(&form, "patch_id")?;
@@ -130,7 +130,7 @@ pub(crate) fn handle_apply_patch(stream: &mut TcpStream, request: &Request) -> R
 }
 
 pub(crate) fn handle_rollback_patch(
-    stream: &mut TcpStream,
+    stream: &mut dyn Write,
     request: &Request,
 ) -> Result<(), String> {
     let form = parse_form(&request.body);
@@ -161,7 +161,7 @@ pub(crate) fn handle_rollback_patch(
 }
 
 pub(crate) fn handle_reject_patch_files(
-    stream: &mut TcpStream,
+    stream: &mut dyn Write,
     request: &Request,
 ) -> Result<(), String> {
     let form = parse_form(&request.body);
@@ -187,7 +187,7 @@ pub(crate) fn handle_reject_patch_files(
     )
 }
 
-pub(crate) fn handle_reject_patch(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+pub(crate) fn handle_reject_patch(stream: &mut dyn Write, request: &Request) -> Result<(), String> {
     let form = parse_form(&request.body);
     let patch_id = required_form(&form, "patch_id")?;
     let engine = engine_for_repo(form.get("repo").map(String::as_str).unwrap_or_default())?;
@@ -209,7 +209,7 @@ pub(crate) fn handle_reject_patch(stream: &mut TcpStream, request: &Request) -> 
 }
 
 pub(crate) fn handle_propose_command(
-    stream: &mut TcpStream,
+    stream: &mut dyn Write,
     request: &Request,
 ) -> Result<(), String> {
     let form = parse_form(&request.body);
@@ -239,7 +239,7 @@ pub(crate) fn handle_propose_command(
     )
 }
 
-pub(crate) fn handle_run_command(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+pub(crate) fn handle_run_command(stream: &mut dyn Write, request: &Request) -> Result<(), String> {
     let form = parse_form(&request.body);
     let proposal_id = required_form(&form, "proposal_id")?;
     let repo = form.get("repo").map(String::as_str).unwrap_or_default();
@@ -324,7 +324,7 @@ pub(crate) fn handle_run_command(stream: &mut TcpStream, request: &Request) -> R
 }
 
 pub(crate) fn handle_reject_command(
-    stream: &mut TcpStream,
+    stream: &mut dyn Write,
     request: &Request,
 ) -> Result<(), String> {
     let form = parse_form(&request.body);

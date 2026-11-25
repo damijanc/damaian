@@ -13,24 +13,25 @@
 //! it in the environment, argv, a file, a log line, an audit field or an error.
 
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use serde_json::{Map, Value, json};
+
+use crate::host::{
+    HostKind, HostLaunch, StartedHost, exchange, host_audit_log as audit_log, start_host,
+};
 use workspace_engine::worker_progress::read_progress_after;
 use workspace_engine::worktree::{
     RemoveOutcome, create_worker_worktree, remove_worker_worktree, source_changes,
 };
 use workspace_engine::{
-    AuditLog, Config, HandedPlan, ProcessIdentity, ProcessKind, ProcessRegistry,
-    RegistrationHandle, SecretScanner, Session, SessionMode, SessionStore, TaskControl,
-    TaskControlService, TaskStatus, WorkerBoardGroup, WorkerProcessState, WorkerRecord,
-    WorkerTaskFacts,
+    AuditLog, Config, HandedPlan, ProcessIdentity, RegistrationHandle, Session, SessionMode,
+    SessionStore, TaskControl, TaskControlService, TaskStatus, WorkerBoardGroup,
+    WorkerProcessState, WorkerRecord, WorkerTaskFacts,
 };
 
 /// How long the supervisor waits at each step. Only tests change these.
@@ -85,9 +86,6 @@ pub struct SpawnedWorker {
     pub worktree: PathBuf,
 }
 
-/// The longest answer read from a worker. `status` is a few hundred bytes; the
-/// bound only stops a misbehaving worker from making the shell buffer forever.
-const MAX_ANSWER_BYTES: u64 = 1024 * 1024;
 /// A worker session's title: the prompt's first non-blank line, this long.
 const MAX_TITLE_CHARS: usize = 80;
 
@@ -428,7 +426,11 @@ impl Supervisor {
         let watchdog = std::thread::Builder::new()
             .name("damaian-worker-shutdown".to_string())
             .spawn(move || {
-                if !wait_for_exit(&endpoint.identity, &timeouts, timeouts.shutdown_to_sigterm) {
+                if !crate::host::wait_for_exit(
+                    &endpoint.identity,
+                    timeouts.poll,
+                    timeouts.shutdown_to_sigterm,
+                ) {
                     terminate(&endpoint);
                 }
             });
@@ -483,7 +485,8 @@ impl Supervisor {
         }
     }
 
-    /// Starts `exe --worker`, registers it, hands over and keeps the lifeline.
+    /// Starts `exe --worker` through the shared host plumbing (spec 110
+    /// D1a): registers it, hands over and keeps the lifeline.
     fn start(
         &self,
         config: &Config,
@@ -495,50 +498,21 @@ impl Supervisor {
         // The worker refuses a relative data directory; the shell's may be
         // relative when `DAMAIAN_DATA_DIR` was set that way.
         let data_dir = std::path::absolute(&config.data_dir).map_err(|error| error.to_string())?;
-        let socket = crate::worker_socket_path(&data_dir, session_id)?;
-        let token = control_token()?;
-        let registry = ProcessRegistry::open(&data_dir).map_err(|error| error.to_string())?;
-        let mut child = Command::new(&self.exe)
-            .arg(crate::WORKER_FLAG)
-            .arg("--session")
-            .arg(session_id)
-            .arg("--data-dir")
-            .arg(&data_dir)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
-            .process_group(0)
-            .spawn()
-            .map_err(|error| format!("could not start the worker: {error}"))?;
-        let Some(mut stdin) = child.stdin.take() else {
-            abandon(child);
-            return Err("could not open the worker's stdin".to_string());
-        };
-        let registration = match registry.register(ProcessKind::Worker, session_id, child.id()) {
-            Ok(registration) => registration,
-            Err(error) => {
-                drop(stdin);
-                abandon(child);
-                return Err(format!("could not register the worker: {error}"));
-            }
-        };
-        let Some(identity) = ProcessIdentity::of(child.id()) else {
-            drop(stdin);
-            abandon(child);
-            return Err("the worker exited as it started".to_string());
-        };
-        let handover = json!({"apiKey": api_key, "token": token}).to_string();
-        if stdin
-            .write_all(handover.as_bytes())
-            .and_then(|()| stdin.write_all(b"\n"))
-            .and_then(|()| stdin.flush())
-            .is_err()
-        {
-            drop(stdin);
-            abandon(child);
-            return Err("could not hand over to the worker: it exited".to_string());
-        }
-        drop(handover);
+        let StartedHost {
+            child,
+            stdin,
+            registration,
+            identity,
+            token,
+            socket,
+        } = start_host(HostLaunch {
+            exe: &self.exe,
+            kind: HostKind::Worker,
+            id: session_id,
+            data_dir: &data_dir,
+            current_dir: None,
+            api_key,
+        })?;
 
         let audit = audit_log(config);
         if let Some(text) = first_message {
@@ -559,7 +533,7 @@ impl Supervisor {
             session_id.to_string(),
             Supervised {
                 child,
-                stdin: Some(stdin),
+                stdin,
                 _registration: registration,
                 identity,
                 token,
@@ -627,36 +601,6 @@ fn reap(workers: &mut HashMap<String, Supervised>) {
     workers.retain(|_, worker| matches!(worker.child.try_wait(), Ok(None)));
 }
 
-/// A child that failed part way through starting: its stdin is already
-/// closed, so it ends by its lifeline; this only reaps it.
-fn abandon(mut child: Child) {
-    let _ = std::thread::Builder::new()
-        .name("damaian-worker-reap".to_string())
-        .spawn(move || {
-            let _ = child.wait();
-        });
-}
-
-/// The audit log `ProcessRegistry::open_with_audit` builds, so the worker
-/// events land beside every other event.
-fn audit_log(config: &Config) -> AuditLog {
-    AuditLog::with_retention(
-        &config.data_dir,
-        config.audit_enabled,
-        config.audit_retention_days,
-        SecretScanner::new(config.secret_patterns.clone()),
-    )
-}
-
-/// 32 bytes from `/dev/urandom`, as hex.
-fn control_token() -> Result<String, String> {
-    let mut bytes = [0_u8; 32];
-    std::fs::File::open("/dev/urandom")
-        .and_then(|mut random| random.read_exact(&mut bytes))
-        .map_err(|_| "could not read /dev/urandom for the worker's token".to_string())?;
-    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
-}
-
 /// The prompt's first non-blank line, which is also where its slug comes from.
 fn worker_title(prompt: &str) -> String {
     prompt
@@ -667,32 +611,6 @@ fn worker_title(prompt: &str) -> String {
         .chars()
         .take(MAX_TITLE_CHARS)
         .collect()
-}
-
-/// One request and its one-line answer. `None` covers every failure: no
-/// socket, a closed connection, a timeout, an answer that is not JSON.
-fn exchange(
-    socket: &Path,
-    token: &str,
-    command: &str,
-    mut arguments: Map<String, Value>,
-    timeout: Duration,
-) -> Option<Value> {
-    let stream = UnixStream::connect(socket).ok()?;
-    stream.set_read_timeout(Some(timeout)).ok()?;
-    stream.set_write_timeout(Some(timeout)).ok()?;
-    arguments.insert("token".to_string(), Value::from(token));
-    arguments.insert("command".to_string(), Value::from(command));
-    let mut writer = stream.try_clone().ok()?;
-    writer
-        .write_all(format!("{}\n", Value::Object(arguments)).as_bytes())
-        .ok()?;
-    let mut line = String::new();
-    BufReader::new(stream)
-        .take(MAX_ANSWER_BYTES)
-        .read_line(&mut line)
-        .ok()?;
-    serde_json::from_str(&line).ok()
 }
 
 /// §5.1 step 9's prompt, sent once the new worker serves its socket. Off the
@@ -737,20 +655,6 @@ fn deliver_first_message(endpoint: &Endpoint, text: String, timeouts: &WorkerTim
                 endpoint.session_id
             );
             return;
-        }
-        std::thread::sleep(timeouts.poll);
-    }
-}
-
-/// Whether the process `identity` names is gone within `within`.
-fn wait_for_exit(identity: &ProcessIdentity, timeouts: &WorkerTimeouts, within: Duration) -> bool {
-    let deadline = Instant::now() + within;
-    loop {
-        if ProcessIdentity::of(identity.pid) != Some(*identity) {
-            return true;
-        }
-        if Instant::now() >= deadline {
-            return false;
         }
         std::thread::sleep(timeouts.poll);
     }

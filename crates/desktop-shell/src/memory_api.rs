@@ -6,7 +6,7 @@ use super::*;
 /// session, with the origin line the card shows. Read from the session log, so
 /// a reload or a restart shows the same list.
 pub(crate) fn handle_memory_proposals(
-    stream: &mut TcpStream,
+    stream: &mut dyn Write,
     request: &Request,
 ) -> Result<(), String> {
     let session_id = required_param(request, "session_id")?;
@@ -86,7 +86,7 @@ pub(crate) fn require_memory_session_in_repository(
 /// a client cannot choose either. The confirmation is recorded here because
 /// this route is the user action.
 pub(crate) fn handle_memory_confirm(
-    stream: &mut TcpStream,
+    stream: &mut dyn Write,
     request: &Request,
 ) -> Result<(), String> {
     let form = parse_form(&request.body);
@@ -128,7 +128,7 @@ pub(crate) fn handle_memory_confirm(
 /// a deletion: the proposal and the dismissal stay in the session log, and no
 /// entry is written.
 pub(crate) fn handle_memory_dismiss(
-    stream: &mut TcpStream,
+    stream: &mut dyn Write,
     request: &Request,
 ) -> Result<(), String> {
     let form = parse_form(&request.body);

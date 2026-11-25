@@ -173,6 +173,9 @@ pub enum ProcessKind {
     /// so the launch sweep kills the workers of a crashed shell; each worker
     /// registers its own children, so its `sweep_own` kills exactly those.
     Worker,
+    /// A spec 110 session host: an ordinary session's work in its own
+    /// process. Registered by the shell (owner = shell), like a worker.
+    SessionHost,
     /// A spec 25 language server, owned by the process-wide hub. Often the
     /// same program as the user's own editor's server, which is why it is
     /// only ever stopped by PID.
@@ -189,6 +192,7 @@ impl ProcessKind {
             Self::Fetch => "fetch",
             Self::Hook => "hook",
             Self::Worker => "worker",
+            Self::SessionHost => "session_host",
             Self::LanguageServer => "language_server",
         }
     }
@@ -403,6 +407,17 @@ static TEMP_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU6
 /// registry, because a reader has no business creating the directory, and a
 /// missing directory means nothing was ever registered.
 pub fn live_worker_registered(data_dir: &Path, session_id: &str) -> Result<bool> {
+    live_kind_registered(data_dir, ProcessKind::Worker, session_id)
+}
+
+/// Whether a spec 110 session host for `session_id` is running, by the same
+/// rule as [`live_worker_registered`]: its tasks are in flight in that
+/// process, not left by a crash.
+pub fn live_session_host_registered(data_dir: &Path, session_id: &str) -> Result<bool> {
+    live_kind_registered(data_dir, ProcessKind::SessionHost, session_id)
+}
+
+fn live_kind_registered(data_dir: &Path, kind: ProcessKind, session_id: &str) -> Result<bool> {
     let dir = data_dir.join("processes");
     if !dir.is_dir() {
         return Ok(false);
@@ -411,7 +426,7 @@ pub fn live_worker_registered(data_dir: &Path, session_id: &str) -> Result<bool>
         .into_iter()
         .filter_map(|(_, entry)| entry)
         .any(|entry| {
-            entry.kind == ProcessKind::Worker.as_str()
+            entry.kind == kind.as_str()
                 && entry.session_id == session_id
                 && ProcessIdentity::of(entry.pid) == Some(entry.identity())
         }))
