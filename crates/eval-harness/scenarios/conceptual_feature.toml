@@ -22,6 +22,8 @@ content = "That is handled in src/checkout.rs."
 # AGENTS.md instruction files are *always* injected and occupy ranks 0 and 1 —
 # they are not retrieval results at all. So a limit of 4 leaves exactly two
 # retrieval slots, and `src/checkout.rs` has to be one of the top two files
-# retrieval actually chose out of the ten it ranked. Eight of twelve positions
-# still fail.
+# retrieval actually chose. Keyword ranking returns only files that hold a query
+# term, so the distractors inventory.rs, telemetry.rs and logging.rs each hold
+# one ("reduce", "total", "promotion") to compete with checkout.rs, which holds
+# all four; `a_ranking_assertion_has_more_candidates_than_its_limit` guards it.
 context_ranks_within = ["src/checkout.rs", 4]
