@@ -6741,7 +6741,12 @@ done
         .expect("tools/list");
     assert_eq!(tools.len(), 1);
     assert_eq!(tools[0].name, "echo");
-    assert_eq!(tools[0].to_tool_definition("fake").name, "mcp__fake__echo");
+    assert_eq!(
+        tools[0]
+            .to_tool_definition("fake", &workspace_engine::SecretScanner::default())
+            .name,
+        "mcp__fake__echo"
+    );
 
     let result = client
         .call_tool(

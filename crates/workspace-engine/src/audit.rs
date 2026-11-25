@@ -39,6 +39,13 @@ impl AuditLog {
         Self::new(".", false, scanner)
     }
 
+    /// The scanner `record` redacts every field with. A caller that bounds a
+    /// value before recording it redacts with this first, so a cut cannot
+    /// split a secret into a fragment the scanner no longer recognises.
+    pub fn scanner(&self) -> &SecretScanner {
+        &self.scanner
+    }
+
     pub fn record(&self, event_type: &str, fields: &[(&str, String)]) -> Result<String> {
         let mut event = vec![
             ("eventId".to_string(), create_id("evt")),

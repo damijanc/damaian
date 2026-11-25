@@ -20,6 +20,7 @@ use crate::mcp_health::{
 use crate::mcp_inventory::McpToolInventory;
 use crate::model::{ToolDefinition, escape_curl_config_value};
 use crate::process_registry::{ProcessKind, ProcessRegistry, RegistrationHandle};
+use crate::secret_scanner::SecretScanner;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -145,11 +146,107 @@ pub struct McpTool {
 }
 
 impl McpTool {
-    pub fn to_tool_definition(&self, server_id: &str) -> ToolDefinition {
+    /// The tool with its description and schema passed through the secret
+    /// scanner (spec 33 §5.6, D9). Both are server-authored text that becomes
+    /// model context, so a credential a server embeds in them is redacted
+    /// like any other context. The name is left alone: it is how calls are
+    /// routed, and a name a scanner would match is not a callable tool.
+    pub fn redacted(&self, scanner: &SecretScanner) -> McpTool {
+        McpTool {
+            name: self.name.clone(),
+            description: scanner.redact(&self.description).text,
+            input_schema_json: redact_json_text(scanner, &self.input_schema_json),
+            read_only_hint: self.read_only_hint,
+        }
+    }
+
+    /// The definition offered to the model. It takes the scanner so that no
+    /// MCP schema can reach a request unscanned — including one served from
+    /// an inventory recorded before listings were redacted.
+    pub fn to_tool_definition(&self, server_id: &str, scanner: &SecretScanner) -> ToolDefinition {
+        let tool = self.redacted(scanner);
         ToolDefinition {
-            name: namespaced_tool_name(server_id, &self.name),
-            description: self.description.clone(),
-            parameters_json: self.input_schema_json.clone(),
+            name: namespaced_tool_name(server_id, &tool.name),
+            description: tool.description,
+            parameters_json: tool.input_schema_json,
+        }
+    }
+}
+
+/// Redacts secrets inside a JSON document string by string, so the result
+/// stays the same valid JSON: scanning the raw text could match across a
+/// quote and replace it, breaking the schema. Text that is not JSON is
+/// redacted as plain text.
+pub fn redact_json_text(scanner: &SecretScanner, text: &str) -> String {
+    if !scanner.contains_secrets(text) {
+        return text.to_string();
+    }
+    match serde_json::from_str::<Value>(text) {
+        Ok(mut value) => {
+            redact_json_value(scanner, &mut value);
+            value.to_string()
+        }
+        Err(_) => scanner.redact(text).text,
+    }
+}
+
+fn redact_json_value(scanner: &SecretScanner, value: &mut Value) {
+    match value {
+        Value::String(text) => *text = scanner.redact(text).text,
+        Value::Array(items) => {
+            for item in items {
+                redact_json_value(scanner, item);
+            }
+        }
+        Value::Object(map) => {
+            let entries = std::mem::take(map);
+            for (key, mut item) in entries {
+                redact_json_value(scanner, &mut item);
+                map.insert(scanner.redact(&key).text, item);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
+}
+
+/// How many characters of a call's arguments or result the invocation
+/// history keeps (spec 33 §5.7): enough to see what was asked and answered,
+/// bounded so one large result cannot swell the audit log.
+pub const MCP_HISTORY_EXCERPT_CHARS: usize = 2_000;
+
+/// The invocation-history copy of a call's arguments or result: redacted
+/// first, then bounded — in that order, so the cut never leaves part of a
+/// secret the scanner would no longer recognise. `AuditLog::record`
+/// redacts again on the way in.
+pub fn mcp_history_excerpt(scanner: &SecretScanner, text: &str) -> String {
+    let redacted = scanner.redact(text).text;
+    let total = redacted.chars().count();
+    if total <= MCP_HISTORY_EXCERPT_CHARS {
+        return redacted;
+    }
+    let kept: String = redacted.chars().take(MCP_HISTORY_EXCERPT_CHARS).collect();
+    format!(
+        "{kept}… [{} more characters not kept]",
+        total - MCP_HISTORY_EXCERPT_CHARS
+    )
+}
+
+/// How a call got past the approval step, for the invocation history
+/// (spec 33 §5.7, D8). A declined call never reaches `call_tool`; the resume
+/// path records it as `mcp_tool_call_declined`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McpApprovalDecision {
+    /// The user waived approval for this tool (or its server) in config.
+    NotRequired,
+    /// The user approved this call on its card.
+    Approved,
+}
+
+impl McpApprovalDecision {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotRequired => "not_required",
+            Self::Approved => "approved",
         }
     }
 }
@@ -771,6 +868,9 @@ pub struct McpRuntime {
     connections: HashMap<String, McpClient>,
     tools: HashMap<String, Vec<McpTool>>,
     audit_log: Option<AuditLog>,
+    /// Redacts server-authored descriptions and schemas, and the bounded
+    /// invocation-history copies (spec 33 §5.6) — the audit log's own scanner.
+    scanner: SecretScanner,
     /// Where to open the process registry when a stdio server is spawned. The
     /// registry is opened per connection rather than held, because opening it
     /// can fail and `build_mcp_runtime` cannot.
@@ -798,6 +898,7 @@ impl McpRuntime {
             servers,
             connections: HashMap::new(),
             tools: HashMap::new(),
+            scanner: audit_log.scanner().clone(),
             audit_log: Some(audit_log),
             data_dir: Some(data_dir),
             session_id: session_id.to_string(),
@@ -815,6 +916,7 @@ impl McpRuntime {
             servers: Vec::new(),
             connections: HashMap::new(),
             tools: HashMap::new(),
+            scanner: SecretScanner::default(),
             audit_log: None,
             data_dir: None,
             session_id: String::new(),
@@ -985,6 +1087,13 @@ impl McpRuntime {
         self.record_health(server_id, McpContactPhase::Connect, listing.as_ref().err());
         match listing {
             Ok(tools) => {
+                // Redacted once here, so the cached listing, the inventory on
+                // disk, search results and offered definitions never carry a
+                // secret the server embedded (§5.6, D9).
+                let tools: Vec<McpTool> = tools
+                    .iter()
+                    .map(|tool| tool.redacted(&self.scanner))
+                    .collect();
                 self.record(
                     "mcp_tools_listed",
                     &[
@@ -1020,8 +1129,9 @@ impl McpRuntime {
     pub fn tool_definitions(&mut self) -> Vec<ToolDefinition> {
         let mut definitions = Vec::new();
         for server_id in self.server_ids() {
+            let scanner = self.scanner.clone();
             for tool in self.list_server(&server_id) {
-                definitions.push(tool.to_tool_definition(&server_id));
+                definitions.push(tool.to_tool_definition(&server_id, &scanner));
             }
         }
         definitions
@@ -1053,13 +1163,17 @@ impl McpRuntime {
     }
 
     /// Executes a tool call, returning the flattened result. Errors are the
-    /// caller's to convert into a tool-result message.
+    /// caller's to convert into a tool-result message. Every call is written
+    /// to the invocation history (spec 33 §5.7, D8) — `approval` is how it
+    /// got past the approval step.
     pub fn call_tool(
         &mut self,
         server_id: &str,
         tool_name: &str,
         arguments_json: &str,
+        approval: McpApprovalDecision,
     ) -> Result<McpToolResult> {
+        let started = Instant::now();
         let call_timeout = self.call_timeout;
         let (phase, result) = if let Some(reason) = self.failed_reason(server_id) {
             // Not retried automatically (§5.3): nothing is contacted, and the
@@ -1079,29 +1193,57 @@ impl McpRuntime {
         {
             self.record_health(server_id, phase, result.as_ref().err());
         }
+        let duration_ms = started.elapsed().as_millis();
         // Spec 33 §5.5: recorded as the server's claim, never as a fact.
         let claim = read_only_claim_label(self.tool_read_only_hint(server_id, tool_name));
+        let mut fields = vec![
+            ("server", server_id.to_string()),
+            ("tool", tool_name.to_string()),
+            ("sessionId", self.session_id.clone()),
+            ("outcome", mcp_call_outcome(phase, &result).to_string()),
+            ("durationMs", duration_ms.to_string()),
+            ("approvalDecision", approval.as_str().to_string()),
+            ("serverReadOnlyClaim", claim.to_string()),
+            (
+                "arguments",
+                mcp_history_excerpt(&self.scanner, arguments_json),
+            ),
+        ];
         match &result {
-            Ok(value) => self.record(
-                "mcp_tool_called",
-                &[
-                    ("server", server_id.to_string()),
-                    ("tool", tool_name.to_string()),
-                    ("isError", value.is_error.to_string()),
-                    ("serverReadOnlyClaim", claim.to_string()),
-                ],
-            ),
-            Err(error) => self.record(
-                "mcp_tool_call_failed",
-                &[
-                    ("server", server_id.to_string()),
-                    ("tool", tool_name.to_string()),
-                    ("error", error.to_string()),
-                    ("serverReadOnlyClaim", claim.to_string()),
-                ],
-            ),
+            Ok(value) => {
+                fields.push(("isError", value.is_error.to_string()));
+                fields.push(("result", mcp_history_excerpt(&self.scanner, &value.text)));
+                self.record("mcp_tool_called", &fields);
+            }
+            Err(error) => {
+                fields.push((
+                    "error",
+                    mcp_history_excerpt(&self.scanner, &error.to_string()),
+                ));
+                self.record("mcp_tool_call_failed", &fields);
+            }
         }
         result
+    }
+}
+
+/// The invocation history's `outcome` for one call (spec 33 §5.7, D8):
+/// `ok`, `tool_error` (the server answered with an error result), `failed`
+/// (the server refused the request), `not_sent` (nothing reached the server:
+/// it could not be started or is latched `Failed`), or `unknown` — the
+/// request was sent and no answer came (a timeout, a stop, a server that
+/// exited), so the server may have acted on it. `unknown` is never retried
+/// automatically.
+fn mcp_call_outcome(
+    phase: Option<McpContactPhase>,
+    result: &Result<McpToolResult>,
+) -> &'static str {
+    match (phase, result) {
+        (_, Ok(value)) if value.is_error => "tool_error",
+        (_, Ok(_)) => "ok",
+        (None | Some(McpContactPhase::Connect), Err(_)) => "not_sent",
+        (_, Err(ClientError::InvalidInput(_) | ClientError::AccessDenied(_))) => "failed",
+        (_, Err(_)) => "unknown",
     }
 }
 
@@ -1199,6 +1341,64 @@ mod tests {
             Some("abc123")
         );
         assert_eq!(body, "{\"result\":1}");
+    }
+
+    #[test]
+    fn a_schema_is_redacted_string_by_string_and_stays_json() {
+        let scanner = SecretScanner::default();
+        let schema = r#"{"type":"object","properties":{"key":{"type":"string","default":"password = hunter2-very-secret","description":"Use AKIAIOSFODNN7EXAMPLE"}}}"#;
+        let redacted = redact_json_text(&scanner, schema);
+        assert!(!redacted.contains("AKIAIOSFODNN7EXAMPLE"), "{redacted}");
+        assert!(!redacted.contains("hunter2"), "{redacted}");
+        let value: Value = serde_json::from_str(&redacted).expect("still JSON");
+        assert_eq!(value["properties"]["key"]["type"], "string");
+        // Nothing to redact: returned byte for byte.
+        let clean = r#"{"type":"object","properties":{}}"#;
+        assert_eq!(redact_json_text(&scanner, clean), clean);
+        // Not JSON: redacted as text.
+        assert!(!redact_json_text(&scanner, "{ AKIAIOSFODNN7EXAMPLE").contains("AKIA"));
+    }
+
+    #[test]
+    fn a_history_excerpt_is_redacted_before_it_is_bounded() {
+        let scanner = SecretScanner::default();
+        // The secret straddles the cut: bounding first would leave a prefix
+        // the scanner no longer recognises.
+        let text = format!(
+            "{}AKIAIOSFODNN7EXAMPLE{}",
+            "a ".repeat(MCP_HISTORY_EXCERPT_CHARS / 2 - 5),
+            "z".repeat(3_000)
+        );
+        let excerpt = mcp_history_excerpt(&scanner, &text);
+        assert!(!excerpt.contains("AKIA"), "{excerpt}");
+        assert!(excerpt.contains("more characters not kept"));
+        assert_eq!(mcp_history_excerpt(&scanner, "short"), "short");
+    }
+
+    #[test]
+    fn a_call_outcome_tells_unsent_refused_and_unknown_apart() {
+        let ok = |is_error| {
+            Ok(McpToolResult {
+                text: String::new(),
+                is_error,
+            })
+        };
+        let call = Some(McpContactPhase::Call);
+        assert_eq!(mcp_call_outcome(call, &ok(false)), "ok");
+        assert_eq!(mcp_call_outcome(call, &ok(true)), "tool_error");
+        let timeout = Err(ClientError::McpTimeout("timed out".into()));
+        assert_eq!(mcp_call_outcome(call, &timeout), "unknown");
+        assert_eq!(
+            mcp_call_outcome(call, &Err(ClientError::Cancelled)),
+            "unknown"
+        );
+        let exited = Err(ClientError::Io("exited".into()));
+        assert_eq!(mcp_call_outcome(call, &exited), "unknown");
+        let refused = Err(ClientError::InvalidInput("bad".into()));
+        assert_eq!(mcp_call_outcome(call, &refused), "failed");
+        let connect = Some(McpContactPhase::Connect);
+        assert_eq!(mcp_call_outcome(connect, &exited), "not_sent");
+        assert_eq!(mcp_call_outcome(None, &refused), "not_sent");
     }
 
     #[test]

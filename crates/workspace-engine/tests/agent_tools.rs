@@ -1712,6 +1712,22 @@ fn fetch_url_is_offered_in_code_mode_only() {
 /// tell whether the turn ever started it. `tools_array` must contain no `%`
 /// or `'`: it is spliced into a single-quoted `printf` format.
 fn write_marked_mcp_server(dir: &Path, name: &str, tools_array: &str) -> PathBuf {
+    write_marked_mcp_server_calling(
+        dir,
+        name,
+        tools_array,
+        r#"printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"tool ran"}]}}\n' "$id""#,
+    )
+}
+
+/// [`write_marked_mcp_server`] running the shell fragment `on_call` for
+/// `tools/call` (the request id is in `$id`).
+fn write_marked_mcp_server_calling(
+    dir: &Path,
+    name: &str,
+    tools_array: &str,
+    on_call: &str,
+) -> PathBuf {
     assert!(!tools_array.contains('%') && !tools_array.contains('\''));
     let script = dir.join(format!("{name}.sh"));
     let marker = dir.join(format!("{name}.started"));
@@ -1728,7 +1744,7 @@ while IFS= read -r line; do
     *'"method":"tools/list"'*)
       printf '{{"jsonrpc":"2.0","id":%s,"result":{{"tools":{tools_array}}}}}\n' "$id" ;;
     *'"method":"tools/call"'*)
-      printf '{{"jsonrpc":"2.0","id":%s,"result":{{"content":[{{"type":"text","text":"tool ran"}}]}}}}\n' "$id" ;;
+      {on_call} ;;
   esac
 done
 "#,
@@ -1784,6 +1800,17 @@ fn mcp_engine_with_tools(
     known: bool,
     overlay: &str,
 ) -> (WorkspaceEngine, PathBuf) {
+    let (config, servers) = mcp_config_with_tools(repo, tools, known, overlay);
+    (WorkspaceEngine::new(config), servers)
+}
+
+/// The config [`mcp_engine_with_tools`] builds its engine from.
+fn mcp_config_with_tools(
+    repo: &Path,
+    tools: Vec<serde_json::Value>,
+    known: bool,
+    overlay: &str,
+) -> (Config, PathBuf) {
     write_fixture(repo, "README.md", "# MCP surface\n");
     let servers = repo.join("servers");
     fs::create_dir_all(&servers).unwrap();
@@ -1816,7 +1843,7 @@ fn mcp_engine_with_tools(
         )
         .unwrap();
     }
-    (WorkspaceEngine::new(config), servers)
+    (config, servers)
 }
 
 fn offered_names(request: &workspace_engine::ModelRequest) -> Vec<String> {
@@ -2522,5 +2549,346 @@ fn a_failed_server_withholds_its_tools_until_a_manual_retry() {
         tracker_health(&repo),
         workspace_engine::McpServerHealth::Ready
     );
+    fs::remove_dir_all(repo).unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Spec 33 Task 8 · Sanitized invocation history and schema redaction
+// (requirements 1, 5.6, 5.7; context D8, D9)
+// ---------------------------------------------------------------------------
+
+/// A credential the secret scanner recognises (an AWS example key).
+const SEEDED_SECRET: &str = "AKIAIOSFODNN7EXAMPLE";
+
+/// The tracker's tools, with `create_issue`'s description and schema
+/// embedding [`SEEDED_SECRET`] — a server putting a credential into what
+/// becomes model context.
+fn tracker_tools_embedding_a_secret() -> Vec<serde_json::Value> {
+    let mut tools = tracker_tools();
+    tools[0] = serde_json::json!({
+        "name": "create_issue",
+        "description": format!("Creates an issue. Authenticate with {SEEDED_SECRET}."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "title": {
+                    "type": "string",
+                    "description": format!("Title. Key: {SEEDED_SECRET}"),
+                    "default": SEEDED_SECRET
+                }
+            }
+        }
+    });
+    tools
+}
+
+/// Every audit event of `event_type`, parsed.
+fn audit_events(repo: &Path, event_type: &str) -> Vec<serde_json::Value> {
+    fs::read_to_string(repo.join(".damaian/audit/events.jsonl"))
+        .unwrap_or_default()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .filter(|event| event["eventType"] == event_type)
+        .collect()
+}
+
+fn audit_text(repo: &Path) -> String {
+    fs::read_to_string(repo.join(".damaian/audit/events.jsonl")).unwrap_or_default()
+}
+
+/// Every file under `dir`, concatenated — the inventory on disk.
+fn files_text(dir: &Path) -> String {
+    let mut text = String::new();
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                text.push_str(&files_text(&path));
+            } else {
+                text.push_str(&fs::read_to_string(&path).unwrap_or_default());
+            }
+        }
+    }
+    text
+}
+
+fn resume_mcp(
+    engine: &WorkspaceEngine,
+    proposal_id: &str,
+    approved: bool,
+) -> workspace_engine::ChatTurnResult {
+    let mut adapter =
+        MockModelAdapter::new_sequence_with_tool_calls(vec!["Done.".to_string()], vec![Vec::new()]);
+    let cancel = CancelToken::new();
+    let mut on_token = |_token: &str| {};
+    let mut on_progress = |_event: TurnProgress| {};
+    let mut sink = TurnSink {
+        on_token: &mut on_token,
+        on_progress: &mut on_progress,
+        cancel: &cancel,
+        steering: None,
+    };
+    engine
+        .chat_orchestrator
+        .resume_after_command_decision(proposal_id, approved, "tester", &mut adapter, &mut sink)
+        .unwrap()
+}
+
+/// Acceptance criterion (§5.6, D9): a tool description arriving from a
+/// server that embeds a secret is redacted before entering context — when the
+/// schema is offered from an inventory recorded before listings were
+/// redacted, and the schema stays valid JSON.
+#[test]
+fn a_secret_in_a_recorded_tool_description_is_redacted_before_it_is_offered() {
+    let repo = temp_dir("mcp-redact-recorded");
+    let (engine, _servers) =
+        mcp_engine_with_tools(&repo, tracker_tools_embedding_a_secret(), true, "");
+    let (_result, adapter) = ask_scripted(&engine, &repo, vec![Vec::new()]);
+
+    let tools = adapter.requests[0]
+        .tools
+        .as_ref()
+        .expect("tools are offered");
+    let create = tools
+        .iter()
+        .find(|tool| tool.name == "mcp__tracker__create_issue")
+        .expect("create_issue is offered directly");
+    assert!(
+        create.description.contains("[REDACTED_"),
+        "{}",
+        create.description
+    );
+    assert!(!create.description.contains(SEEDED_SECRET));
+    assert!(
+        !create.parameters_json.contains(SEEDED_SECRET),
+        "{}",
+        create.parameters_json
+    );
+    let schema: serde_json::Value =
+        serde_json::from_str(&create.parameters_json).expect("the redacted schema is still JSON");
+    assert_eq!(schema["properties"]["title"]["type"], "string");
+    assert!(
+        !format!("{:?}", adapter.requests).contains(SEEDED_SECRET),
+        "no request carries the secret"
+    );
+    fs::remove_dir_all(repo).unwrap();
+}
+
+/// The same through a live listing: a search lists the unknown-cost server,
+/// and neither the search result, the inventory written from the listing,
+/// nor the schema offered from the next round carries the secret.
+#[test]
+fn a_secret_in_a_listed_tool_description_is_redacted_everywhere_it_goes() {
+    let repo = temp_dir("mcp-redact-listed");
+    let (engine, _servers) =
+        mcp_engine_with_tools(&repo, tracker_tools_embedding_a_secret(), false, "");
+    let (result, adapter) = ask_scripted(
+        &engine,
+        &repo,
+        vec![vec![search_call("call_1", "create issue")], Vec::new()],
+    );
+
+    let second = offered_names(&adapter.requests[1]);
+    assert!(
+        second.contains(&"mcp__tracker__create_issue".to_string()),
+        "the searched tool's schema is offered: {second:?}"
+    );
+    assert!(!format!("{:?}", adapter.requests).contains(SEEDED_SECRET));
+    assert!(
+        !tool_results(&engine, &result)
+            .iter()
+            .any(|text| text.contains(SEEDED_SECRET))
+    );
+    let inventory = files_text(&repo.join(".damaian/mcp/inventory"));
+    assert!(
+        inventory.contains("create_issue"),
+        "the listing was recorded"
+    );
+    assert!(!inventory.contains(SEEDED_SECRET), "{inventory}");
+    fs::remove_dir_all(repo).unwrap();
+}
+
+/// Acceptance criterion (§5.7, D8): invocation history records server, tool,
+/// session, duration, outcome, approval decision and the server's claim, with
+/// arguments and result redacted and bounded — and the seeded secret appears
+/// in no audit field and nowhere in model context.
+#[test]
+fn invocation_history_records_a_call_redacted_and_bounded() {
+    let repo = temp_dir("mcp-history");
+    let (engine, servers) = mcp_engine(&repo, true, "");
+    let tools = serde_json::to_string(&tracker_tools()).unwrap();
+    write_marked_mcp_server_calling(
+        &servers,
+        "tracker",
+        &tools,
+        &format!(
+            r#"printf '{{"jsonrpc":"2.0","id":%s,"result":{{"content":[{{"type":"text","text":"created with {SEEDED_SECRET}"}}]}}}}\n' "$id""#
+        ),
+    );
+    let long_title = format!("{SEEDED_SECRET} {}", "x".repeat(5_000));
+    let call = ToolCall {
+        id: "call_1".to_string(),
+        name: "mcp__tracker__create_issue".to_string(),
+        arguments_json: serde_json::json!({ "title": long_title }).to_string(),
+    };
+    let (result, _adapter) = ask_scripted(&engine, &repo, vec![vec![call], Vec::new()]);
+
+    let called = audit_events(&repo, "mcp_tool_called");
+    assert_eq!(called.len(), 1, "{}", audit_text(&repo));
+    let event = &called[0];
+    assert_eq!(event["server"], "tracker");
+    assert_eq!(event["tool"], "create_issue");
+    assert_eq!(event["sessionId"], result.session.id.as_str());
+    assert_eq!(event["outcome"], "ok");
+    assert_eq!(event["approvalDecision"], "not_required");
+    assert_eq!(event["serverReadOnlyClaim"], "no_claim");
+    assert!(event["durationMs"].as_str().unwrap().parse::<u64>().is_ok());
+    assert!(event["timestampMs"].is_string());
+    let arguments = event["arguments"].as_str().unwrap();
+    assert!(arguments.contains("[REDACTED_"), "{arguments}");
+    assert!(arguments.contains("more characters not kept"), "bounded");
+    assert!(
+        arguments.chars().count() < workspace_engine::MCP_HISTORY_EXCERPT_CHARS + 100,
+        "bounded"
+    );
+    let recorded_result = event["result"].as_str().unwrap();
+    assert!(
+        recorded_result.starts_with("created with [REDACTED_"),
+        "{recorded_result}"
+    );
+
+    assert!(!audit_text(&repo).contains(SEEDED_SECRET));
+    // The arguments are the model's own words, so only what the server
+    // returned is checked in context: the tool result is redacted.
+    assert!(
+        !tool_results(&engine, &result)
+            .iter()
+            .any(|text| text.contains(SEEDED_SECRET))
+    );
+    fs::remove_dir_all(repo).unwrap();
+}
+
+/// The approval decision is the one the call actually went through: a call
+/// the user approved reads `approved`; one the user declined is recorded as
+/// `mcp_tool_call_declined` with its redacted arguments, and nothing is
+/// called.
+#[test]
+fn invocation_history_records_the_approval_decision() {
+    let repo = temp_dir("mcp-history-approval");
+    let (engine, _servers) = mcp_engine(&repo, true, "mcp_server.tracker.require_approval=true\n");
+    let call = |id: &str| ToolCall {
+        id: id.to_string(),
+        name: "mcp__tracker__create_issue".to_string(),
+        arguments_json: serde_json::json!({ "title": SEEDED_SECRET }).to_string(),
+    };
+
+    let (gated, _adapter) = ask_scripted(&engine, &repo, vec![vec![call("call_1")], Vec::new()]);
+    let proposal = gated.command_proposal.expect("the call waits for approval");
+    resume_mcp(&engine, &proposal.id, true);
+    let called = audit_events(&repo, "mcp_tool_called");
+    assert_eq!(called.len(), 1, "{}", audit_text(&repo));
+    assert_eq!(called[0]["approvalDecision"], "approved");
+    assert_eq!(called[0]["outcome"], "ok");
+
+    let (gated, _adapter) = ask_scripted(&engine, &repo, vec![vec![call("call_2")], Vec::new()]);
+    let proposal = gated.command_proposal.expect("the call waits for approval");
+    resume_mcp(&engine, &proposal.id, false);
+    let declined = audit_events(&repo, "mcp_tool_call_declined");
+    assert_eq!(declined.len(), 1, "{}", audit_text(&repo));
+    assert_eq!(declined[0]["approvalDecision"], "declined");
+    assert_eq!(declined[0]["outcome"], "declined");
+    assert_eq!(declined[0]["tool"], "create_issue");
+    assert!(
+        declined[0]["arguments"]
+            .as_str()
+            .unwrap()
+            .contains("[REDACTED_")
+    );
+    assert_eq!(
+        audit_events(&repo, "mcp_tool_called").len(),
+        1,
+        "the declined call ran nothing"
+    );
+    assert!(!audit_text(&repo).contains(SEEDED_SECRET));
+    fs::remove_dir_all(repo).unwrap();
+}
+
+/// A call that times out is recorded with outcome `unknown`: it was sent, no
+/// answer came, so the server may have acted on it (§5.4).
+#[test]
+fn a_timed_out_call_is_recorded_as_an_unknown_outcome() {
+    let repo = temp_dir("mcp-history-timeout");
+    let (engine, servers) = mcp_engine(&repo, true, "mcp_call_timeout_ms=300\n");
+    let tools = serde_json::to_string(&tracker_tools()).unwrap();
+    write_marked_mcp_server_calling(&servers, "tracker", &tools, "sleep 5");
+    let (_result, _adapter) = ask_scripted(
+        &engine,
+        &repo,
+        vec![vec![tracker_call("call_1", "create_issue")], Vec::new()],
+    );
+
+    let failed = audit_events(&repo, "mcp_tool_call_failed");
+    assert_eq!(failed.len(), 1, "{}", audit_text(&repo));
+    assert_eq!(failed[0]["outcome"], "unknown");
+    assert_eq!(failed[0]["approvalDecision"], "not_required");
+    assert!(
+        failed[0]["error"]
+            .as_str()
+            .unwrap()
+            .to_lowercase()
+            .contains("timed out"),
+        "{}",
+        failed[0]
+    );
+    fs::remove_dir_all(repo).unwrap();
+}
+
+/// Acceptance criterion (§5.6): a configured token value never appears in an
+/// audit field, the invocation history, the connection diagnostic the model
+/// sees, or a request — asserted with a seeded token the secret scanner would
+/// not recognise, so only keeping it out in the first place can pass. The
+/// server is an HTTP one on a loopback port nothing listens on.
+#[test]
+fn a_seeded_token_never_reaches_the_history_or_a_diagnostic() {
+    let token = "seeded-mcp-token-q7Zr2xWb";
+    assert!(!SecretScanner::default().contains_secrets(token));
+    let repo = temp_dir("mcp-history-token");
+    let (mut config, _servers) = mcp_config_with_tools(
+        &repo,
+        tracker_tools(),
+        true,
+        "mcp_connect_timeout_ms=2000\n",
+    );
+    let server = &mut config.mcp_servers[0];
+    server.transport = workspace_engine::McpTransport::Http;
+    server.command = String::new();
+    server.args = Vec::new();
+    server.url = "http://127.0.0.1:1/mcp".to_string();
+    server.auth_token_env = "keychain:tracker-token".to_string();
+    let mut engine = WorkspaceEngine::new(config);
+    engine
+        .chat_orchestrator
+        .set_mcp_token_resolver(workspace_engine::McpTokenResolver::new(move |reference| {
+            (reference == "keychain:tracker-token").then(|| token.to_string())
+        }));
+    let (result, adapter) = ask_scripted(
+        &engine,
+        &repo,
+        vec![vec![tracker_call("call_1", "create_issue")], Vec::new()],
+    );
+
+    let failed = audit_events(&repo, "mcp_tool_call_failed");
+    assert_eq!(failed.len(), 1, "{}", audit_text(&repo));
+    assert_eq!(failed[0]["outcome"], "not_sent");
+    assert!(!audit_text(&repo).contains(token), "{}", audit_text(&repo));
+    let results = tool_results(&engine, &result);
+    assert!(
+        results
+            .iter()
+            .any(|text| text.contains("MCP tool call failed")),
+        "the model is told the call failed: {results:?}"
+    );
+    assert!(!results.iter().any(|text| text.contains(token)));
+    assert!(!format!("{:?}", adapter.requests).contains(token));
     fs::remove_dir_all(repo).unwrap();
 }

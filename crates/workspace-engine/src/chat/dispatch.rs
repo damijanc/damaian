@@ -1044,8 +1044,12 @@ impl ChatOrchestrator {
 
             // No approval required: run it now and feed the result back.
             let summary = mcp_call_summary(&server_id, &tool_name);
-            let (content, outcome) = match cx.mcp.call_tool(&server_id, &tool_name, &arguments_json)
-            {
+            let (content, outcome) = match cx.mcp.call_tool(
+                &server_id,
+                &tool_name,
+                &arguments_json,
+                crate::mcp::McpApprovalDecision::NotRequired,
+            ) {
                 Ok(result) => {
                     let text = self.scanner.redact(&result.text).text;
                     // `is_error` is the server's own verdict on its
