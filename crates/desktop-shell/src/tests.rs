@@ -3490,7 +3490,7 @@ fn verification_provenance_and_actions_survive_json() {
     );
     assert_eq!(
         value["provenance"][0]["summary"],
-        "These checks passed before the patch and fail now. Automatic repair receives only these findings."
+        "These checks passed before this task's changes and fail now. Automatic repair receives only these findings."
     );
     assert_eq!(
         value["provenance"][0]["checks"][0]["evidenceLines"][0],
@@ -3512,7 +3512,13 @@ fn verification_provenance_and_actions_survive_json() {
             .contains("Review the repair"),
         "{json}"
     );
-    assert!(json.contains("Introduced regressions"), "{json}");
+    assert!(json.contains("Caused by this task"), "{json}");
+    // Spec 114 D1: the verdict is engine data in the JSON the card reads.
+    assert_eq!(value["verdict"]["kind"], "caused_by_task");
+    assert_eq!(
+        value["verdict"]["headline"],
+        "This task's changes break 1 check"
+    );
     assert!(!json.contains("raw output"), "{json}");
 }
 
@@ -7524,6 +7530,7 @@ fn phases_carry_the_notes_size() {
         max_exploration_rounds: 24,
         notes_chars: 2_100,
         reasoning_chars: 0,
+        baseline: false,
     };
 
     let json = phase_json(&phase);
@@ -7543,6 +7550,7 @@ fn a_thinking_phase_carries_the_reasoning_count_and_no_text() {
         max_exploration_rounds: 24,
         notes_chars: 0,
         reasoning_chars: 1_234,
+        baseline: false,
     };
 
     let json = phase_json(&phase);
@@ -7550,6 +7558,31 @@ fn a_thinking_phase_carries_the_reasoning_count_and_no_text() {
     assert!(json.contains("\"phase\":\"thinking\""), "{json}");
     assert!(json.contains("\"reasoningChars\":1234"), "{json}");
     assert!(json.contains("\"label\":\"\""), "{json}");
+    assert!(!json.contains("\"baseline\""), "{json}");
+}
+
+/// Spec 114 D5: a baseline run's phase carries a typed marker, so the UI never
+/// has to recognise a baseline from its label text.
+#[test]
+fn a_baseline_phase_carries_its_marker() {
+    let phase = TurnPhase {
+        kind: PhaseKind::Tool,
+        label: "Checking whether cargo test (repository root) failed before this task's changes"
+            .to_string(),
+        round: 1,
+        max_rounds: 0,
+        exploration_round: 0,
+        max_exploration_rounds: 0,
+        notes_chars: 0,
+        reasoning_chars: 0,
+        baseline: true,
+    };
+
+    let json = phase_json(&phase);
+
+    assert!(json.contains("\"phase\":\"tool\""), "{json}");
+    assert!(json.ends_with(",\"baseline\":true}"), "{json}");
+    serde_json::from_str::<serde_json::Value>(&json).expect("valid JSON");
 }
 
 #[test]

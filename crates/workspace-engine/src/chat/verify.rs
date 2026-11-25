@@ -2706,7 +2706,9 @@ fn baseline_turn_progress(progress: crate::baseline::BaselineProgress) -> TurnPr
         crate::baseline::BaselineProgress::Output { line } => (PhaseKind::Output, line),
         crate::baseline::BaselineProgress::Finished { label, .. } => (PhaseKind::Tool, label),
     };
-    TurnProgress::Phase(TurnPhase::new(kind, label, 0, 0, 0, 0, 0))
+    let mut phase = TurnPhase::new(kind, label, 0, 0, 0, 0, 0);
+    phase.baseline = true;
+    TurnProgress::Phase(phase)
 }
 
 /// A check's root as the report names it.

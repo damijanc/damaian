@@ -5831,7 +5831,7 @@ fn provenance_and_repair_targets_survive_a_fresh_store() {
     assert_eq!(group.checks.len(), 1);
     assert!(!report.repair_targets.is_empty());
     assert!(!report.repair_targets[0].evidence.is_empty());
-    assert!(report.render().contains("Introduced regressions"));
+    assert!(report.render().contains("Caused by this task"));
     // R6 (spec 102): redacted details are durable on the evidence, so the
     // reloaded repair request is not poorer than the live one.
     assert!(

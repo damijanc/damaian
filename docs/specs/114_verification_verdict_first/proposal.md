@@ -1,6 +1,6 @@
 # Feature Spec: A Verification Verdict You Can Read
 
-Status: Not started (specified 2026-11-25; five tasks in [tasks.md](tasks.md))
+Status: In progress (specified 2026-11-25; started 2026-11-25; Task 1 of five done, see [tasks.md](tasks.md))
 Order: 114 of 114
 Plan: none. Written from OBSERVATIONS 105: the owner's run of 2026-11-16, in
 which a finished task's verification read as broken three times in one
