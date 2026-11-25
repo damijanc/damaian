@@ -40,8 +40,14 @@ impl Fixture {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
+        // No test name goes into this path, so the process id is what keeps
+        // it unique: nextest gives each test its own process with the counter
+        // at 1, and macOS time has microsecond resolution, so two tests started
+        // together would share a base and one's `Drop` would delete the other's
+        // (OBSERVATIONS 101).
         let base = std::env::temp_dir().join(format!(
-            "damaian-session-approval-{now}-{}",
+            "damaian-session-approval-{}-{now}-{}",
+            std::process::id(),
             COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
         let root = base.join("project");
