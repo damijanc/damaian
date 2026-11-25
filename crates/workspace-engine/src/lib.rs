@@ -193,11 +193,12 @@ pub use lsp::{
     symbol_kind_from_lsp, symbol_refs_from_locations, symbols_from_document_symbols, write_message,
 };
 pub use mcp::{
-    McpClient, McpRuntime, McpServerHealth, McpServerRuntime, McpTool, McpToolResult,
+    McpClient, McpRuntime, McpServerHealth, McpServerRuntime, McpTimeouts, McpTool, McpToolResult,
     namespaced_tool_name, parse_namespaced_tool_name,
 };
 pub use mcp_health::{
-    McpHealthObservation, mcp_health_snapshot, mcp_server_health, merge_mcp_health,
+    MCP_FAILED_AFTER_CONSECUTIVE_FAILURES, McpHealthObservation, clear_mcp_health,
+    mcp_health_observation, mcp_health_snapshot, mcp_server_health, merge_mcp_health,
 };
 pub use mcp_inventory::{
     McpDeferralDecision, McpInventoryTool, McpServerInventory, McpToolInventory, McpToolSurface,

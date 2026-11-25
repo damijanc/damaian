@@ -381,6 +381,15 @@ pub(crate) fn handle_model_key_delete(
 
 pub(crate) fn handle_mcp_test(stream: &mut dyn Write, request: &Request) -> Result<(), String> {
     let form = parse_form(&request.body);
+    // Spec 33 Task 7: `retry=true` is the manual retry of a saved server,
+    // which also clears a `Failed` latch in every session's process.
+    if form.get("retry").map(String::as_str) == Some("true") {
+        let body = match mcp_retry_json(&form) {
+            Ok(body) => body.to_string(),
+            Err(error) => format!("{{\"ok\":false,\"error\":\"{}\"}}", escape_json(&error)),
+        };
+        return write_response(stream, request, 200, "application/json", &body);
+    }
     let config = Config::load_for_repository(None).map_err(|error| error.to_string())?;
     let body = match mcp_test_connection(&form, &config.data_dir) {
         Ok(tools) => format!(

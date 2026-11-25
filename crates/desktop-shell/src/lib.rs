@@ -73,6 +73,8 @@ mod http;
 use http::*;
 mod json;
 use json::*;
+mod mcp_health_api;
+use mcp_health_api::*;
 mod memory_api;
 use memory_api::*;
 mod repository_api;
@@ -660,6 +662,8 @@ fn dispatch(
         Route::ProviderKey => handle_provider_key(stream, request),
         Route::ModelKeyDelete => handle_model_key_delete(stream, request),
         Route::McpTest => handle_mcp_test(stream, request),
+        // Spec 33 Task 7: every process's MCP health for one repository.
+        Route::McpHealth => handle_mcp_health(stream, request),
         Route::WorkersEnabled
         | Route::WorkerSourceStatus
         | Route::StartWorker

@@ -246,6 +246,29 @@ fn keys_for(route: Route, form: &HashMap<String, String>) -> Vec<String> {
     lines
 }
 
+/// Asks every live host `command` and returns the answers that came; a host
+/// that does not answer in time is left out. For the spec 33 Task 7 MCP
+/// health exchange, which every session's host holds a part of.
+pub(crate) fn ask_every_host(command: &str, arguments: Map<String, Value>) -> Vec<Value> {
+    let endpoints = {
+        let mut hosts = hosts();
+        reap(&mut hosts);
+        hosts.values().map(endpoint_of).collect::<Vec<_>>()
+    };
+    endpoints
+        .iter()
+        .filter_map(|endpoint| {
+            exchange(
+                &endpoint.socket,
+                &endpoint.token,
+                command,
+                arguments.clone(),
+                EXCHANGE_TIMEOUT,
+            )
+        })
+        .collect()
+}
+
 /// A lane's way into its host (D3, D7).
 struct RemoteHost {
     endpoint: Endpoint,

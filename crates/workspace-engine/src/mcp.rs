@@ -13,7 +13,10 @@ use crate::cancel::CancelToken;
 use crate::command_runner::kill_process_group;
 use crate::config::{McpServerConfig, McpTransport};
 use crate::error::{ClientError, Result};
-use crate::mcp_health::{McpContactPhase, health_after_failure, record_mcp_health};
+use crate::mcp_health::{
+    McpContactPhase, clear_mcp_health, health_after_failure, mcp_health_observation,
+    record_mcp_health,
+};
 use crate::mcp_inventory::McpToolInventory;
 use crate::model::{ToolDefinition, escape_curl_config_value};
 use crate::process_registry::{ProcessKind, ProcessRegistry, RegistrationHandle};
@@ -866,6 +869,43 @@ impl McpRuntime {
         }
     }
 
+    /// Why `server_id` is latched `Failed` in this process (spec 33 §5.3),
+    /// or `None` when it may be contacted. A `Failed` server is not retried
+    /// automatically for the rest of the session and its tools are not
+    /// offered; only [`Self::retry_server`] or the settings retry clears it.
+    pub fn failed_reason(&self, server_id: &str) -> Option<String> {
+        if self.repository_id.is_empty() {
+            return None;
+        }
+        mcp_health_observation(&self.repository_id, server_id)?.failed_reason()
+    }
+
+    /// Whether `server_id` is latched `Failed` in this process.
+    pub fn is_failed(&self, server_id: &str) -> bool {
+        self.failed_reason(server_id).is_some()
+    }
+
+    /// The manual retry (spec 33 §5.3): forgets this process's health for
+    /// `server_id`, a `Failed` latch included, then connects and lists it once
+    /// more, recording the outcome and refreshing the inventory as any listing
+    /// does. Returns the tool names, or what went wrong — never a token value.
+    pub fn retry_server(&mut self, server_id: &str) -> std::result::Result<Vec<String>, String> {
+        if !self.has_server(server_id) {
+            return Err(format!("Unknown MCP server: {server_id}"));
+        }
+        if !self.repository_id.is_empty() {
+            clear_mcp_health(&self.repository_id, server_id);
+        }
+        self.tools.remove(server_id);
+        self.connections.remove(server_id);
+        self.list_now(server_id)?;
+        Ok(self
+            .tools
+            .get(server_id)
+            .map(|tools| tools.iter().map(|tool| tool.name.clone()).collect())
+            .unwrap_or_default())
+    }
+
     fn connection(&mut self, server_id: &str) -> Result<&mut McpClient> {
         if !self.connections.contains_key(server_id) {
             let Some(server) = self.server(server_id) else {
@@ -920,41 +960,56 @@ impl McpRuntime {
     /// connection or list failure is audited and reads as no tools, never
     /// fatal; the failed listing is cached for the runtime's life.
     pub fn list_server(&mut self, server_id: &str) -> &[McpTool] {
+        // A `Failed` server is not retried automatically (§5.3): it reads as
+        // no tools, contacts nothing, and records nothing more.
+        if !self.tools.contains_key(server_id) && self.is_failed(server_id) {
+            self.tools.insert(server_id.to_string(), Vec::new());
+        }
         if !self.tools.contains_key(server_id) && self.has_server(server_id) {
-            let list_timeout = self.list_timeout;
-            let listing = self
-                .connection(server_id)
-                .and_then(|client| client.list_tools(list_timeout));
-            // A server that cannot list its tools is as unusable as one that
-            // cannot be reached, so both phases read as one contact.
-            self.record_health(server_id, McpContactPhase::Connect, listing.as_ref().err());
-            match listing {
-                Ok(tools) => {
-                    self.record(
-                        "mcp_tools_listed",
-                        &[
-                            ("server", server_id.to_string()),
-                            ("toolCount", tools.len().to_string()),
-                        ],
-                    );
-                    self.refresh_inventory(server_id, &tools);
-                    self.tools.insert(server_id.to_string(), tools);
-                }
-                Err(error) => {
-                    self.record(
-                        "mcp_discovery_failed",
-                        &[
-                            ("server", server_id.to_string()),
-                            ("error", error.to_string()),
-                        ],
-                    );
-                    // Drop any half-open connection so a later call can retry.
-                    self.connections.remove(server_id);
-                    self.tools.insert(server_id.to_string(), Vec::new());
-                }
-            }
+            let _ = self.list_now(server_id);
         }
         self.tools.get(server_id).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    /// Connects to and lists one server now, records its health, and caches
+    /// the result for the runtime's life — the tools, or no tools after a
+    /// failure, which is audited. Returns the failure's message (never a
+    /// token value).
+    fn list_now(&mut self, server_id: &str) -> std::result::Result<(), String> {
+        let list_timeout = self.list_timeout;
+        let listing = self
+            .connection(server_id)
+            .and_then(|client| client.list_tools(list_timeout));
+        // A server that cannot list its tools is as unusable as one that
+        // cannot be reached, so both phases read as one contact.
+        self.record_health(server_id, McpContactPhase::Connect, listing.as_ref().err());
+        match listing {
+            Ok(tools) => {
+                self.record(
+                    "mcp_tools_listed",
+                    &[
+                        ("server", server_id.to_string()),
+                        ("toolCount", tools.len().to_string()),
+                    ],
+                );
+                self.refresh_inventory(server_id, &tools);
+                self.tools.insert(server_id.to_string(), tools);
+                Ok(())
+            }
+            Err(error) => {
+                self.record(
+                    "mcp_discovery_failed",
+                    &[
+                        ("server", server_id.to_string()),
+                        ("error", error.to_string()),
+                    ],
+                );
+                // Drop any half-open connection so a later call can retry.
+                self.connections.remove(server_id);
+                self.tools.insert(server_id.to_string(), Vec::new());
+                Err(error.to_string())
+            }
+        }
     }
 
     /// Discovers every active server's tools as ready-to-offer definitions,
@@ -1006,14 +1061,22 @@ impl McpRuntime {
         arguments_json: &str,
     ) -> Result<McpToolResult> {
         let call_timeout = self.call_timeout;
-        let (phase, result) = match self.connection(server_id) {
-            Ok(client) => (
-                McpContactPhase::Call,
-                client.call_tool(tool_name, arguments_json, call_timeout),
-            ),
-            Err(error) => (McpContactPhase::Connect, Err(error)),
+        let (phase, result) = if let Some(reason) = self.failed_reason(server_id) {
+            // Not retried automatically (§5.3): nothing is contacted, and the
+            // refusal is not another failure of the server's.
+            (None, Err(ClientError::InvalidInput(reason)))
+        } else {
+            match self.connection(server_id) {
+                Ok(client) => (
+                    Some(McpContactPhase::Call),
+                    client.call_tool(tool_name, arguments_json, call_timeout),
+                ),
+                Err(error) => (Some(McpContactPhase::Connect), Err(error)),
+            }
         };
-        if self.has_server(server_id) {
+        if let Some(phase) = phase
+            && self.has_server(server_id)
+        {
             self.record_health(server_id, phase, result.as_ref().err());
         }
         // Spec 33 §5.5: recorded as the server's claim, never as a fact.

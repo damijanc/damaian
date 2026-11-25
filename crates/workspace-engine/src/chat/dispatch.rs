@@ -977,6 +977,19 @@ impl ChatOrchestrator {
                     ),
                 )));
             }
+            // Spec 33 §5.3: a `Failed` server is not retried automatically,
+            // so its call is answered with the reason before any approval
+            // card — approving it could change nothing.
+            if let Some(reason) = cx.mcp.failed_reason(&server_id) {
+                return Ok(ControlFlow::Continue((
+                    action_marker,
+                    (
+                        mcp_call_summary(&server_id, &tool_name),
+                        reason,
+                        ActionOutcome::Failed,
+                    ),
+                )));
+            }
             // MCP tools reach an external service and can have side
             // effects, so unless the user waived approval for this exact
             // tool (or its server, when the tool has no setting of its

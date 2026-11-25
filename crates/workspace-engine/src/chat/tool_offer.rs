@@ -94,6 +94,10 @@ struct McpToolSearchResult {
     matches: Vec<crate::mcp_inventory::McpToolMatch>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     unreachable_servers: Vec<String>,
+    /// Servers latched `Failed` this session (§5.3): not searched, so the
+    /// model learns why their tools are missing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    failed_servers: Vec<String>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     note: String,
 }
@@ -166,7 +170,9 @@ impl ChatOrchestrator {
         };
         let mut definitions = Vec::new();
         for server_id in &server_ids {
-            if !mcp.has_server(server_id) {
+            // A `Failed` server's tools are not offered for the rest of the
+            // session (§5.3); a call naming one is told why.
+            if !mcp.has_server(server_id) || mcp.is_failed(server_id) {
                 continue;
             }
             let direct = surface.surface_for(server_id) == McpToolSurface::Direct;
@@ -300,6 +306,15 @@ impl ChatOrchestrator {
         let ids: Vec<&str> = server_ids.iter().map(String::as_str).collect();
         let mut inventory = McpToolInventory::load(&self.config.data_dir, repository_id, &ids);
         let mut unreachable_servers = Vec::new();
+        let failed_servers: Vec<String> = ids
+            .iter()
+            .filter(|server_id| mcp.is_failed(server_id))
+            .map(|server_id| (*server_id).to_string())
+            .collect();
+        let ids: Vec<&str> = ids
+            .into_iter()
+            .filter(|server_id| !failed_servers.iter().any(|failed| failed == server_id))
+            .collect();
         for server_id in &ids {
             if inventory.servers.contains_key(*server_id) || !mcp.has_server(server_id) {
                 continue;
@@ -346,14 +361,25 @@ impl ChatOrchestrator {
                     )
             },
         );
-        let note = if matches.is_empty() {
+        let mut note = if matches.is_empty() {
             "No MCP tool matched. Try other words for what the tool should do.".to_string()
         } else {
             String::new()
         };
+        if !failed_servers.is_empty() {
+            if !note.is_empty() {
+                note.push(' ');
+            }
+            note.push_str(
+                "The servers in failed_servers failed repeatedly and are not retried \
+                 automatically in this session; their tools are not available until the user \
+                 retries them from the MCP settings.",
+            );
+        }
         let result = McpToolSearchResult {
             matches,
             unreachable_servers,
+            failed_servers,
             note,
         };
         let text = serde_json::to_string(&result).unwrap_or_default();

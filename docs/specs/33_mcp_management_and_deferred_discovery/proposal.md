@@ -239,6 +239,11 @@ A server in `Failed` is not retried automatically for the rest of the session an
 its tools are not offered — with the reason visible, so the user knows why a
 capability disappeared rather than watching the model fail to use it. Manual
 retry is one action, and `/api/mcp-test` remains the diagnostic.
+Refined in Task 7 (2026-11-25): "failed repeatedly" is three failed contacts in
+a row in one process; the retry (`/api/mcp-test` with `retry=true`) clears the
+latch in every session's process and contacts the saved server once, and
+`GET /api/mcp-health` gathers every process's view (`context.md` D5 "As
+built").
 
 ### 5.4 Bounded timeouts
 
