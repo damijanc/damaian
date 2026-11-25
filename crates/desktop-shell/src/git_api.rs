@@ -3,7 +3,7 @@
 
 use super::*;
 
-pub(crate) fn handle_git_status(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+pub(crate) fn handle_git_status(stream: &mut dyn Write, request: &Request) -> Result<(), String> {
     let repo = required_param(request, "repo")?;
     let engine = engine_for_repo(&repo)?;
     let status = engine
@@ -52,7 +52,7 @@ pub(crate) fn handle_git_status(stream: &mut TcpStream, request: &Request) -> Re
 }
 
 pub(crate) fn handle_commit_status(
-    stream: &mut TcpStream,
+    stream: &mut dyn Write,
     request: &Request,
 ) -> Result<(), String> {
     let repo = required_param(request, "repo")?;
@@ -70,7 +70,7 @@ pub(crate) fn handle_commit_status(
 /// `POST` because it writes a record and an audit entry; a `GET` would invite
 /// caches and retries to repeat those side effects.
 pub(crate) fn handle_commit_preparation(
-    stream: &mut TcpStream,
+    stream: &mut dyn Write,
     request: &Request,
 ) -> Result<(), String> {
     let repo = required_param(request, "repo")?;
@@ -86,7 +86,7 @@ pub(crate) fn handle_commit_preparation(
 
 /// `POST /api/commit`: the typed approval. Its own field, its own audit event
 /// and no "always"; a question or a command approval never satisfies it.
-pub(crate) fn handle_commit(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+pub(crate) fn handle_commit(stream: &mut dyn Write, request: &Request) -> Result<(), String> {
     let form = parse_form(&request.body);
     if form.get("approval").map(String::as_str) != Some("commit") {
         return write_response(
@@ -195,7 +195,7 @@ fn commit_error_response(error: &CommitError) -> (u16, String) {
 /// the change, and the secret check at commit covers the gap between the
 /// redacted preview and the real bytes.
 pub(crate) fn handle_commit_message(
-    stream: &mut TcpStream,
+    stream: &mut dyn Write,
     request: &Request,
 ) -> Result<(), String> {
     let form = parse_form(&request.body);
@@ -478,7 +478,7 @@ fn branch_apply_error_response(error: &BranchError) -> (u16, String) {
 /// `GET /api/branch-info`: the read-only state the dialog opens with, plus the
 /// local branch names it may offer for switching or deletion. The current
 /// branch is filtered out by the dialog, and nothing here changes a ref.
-pub(crate) fn handle_branch_info(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+pub(crate) fn handle_branch_info(stream: &mut dyn Write, request: &Request) -> Result<(), String> {
     let repo = required_param(request, "repo")?;
     let session_id = required_param(request, "session")?;
     let engine = engine_for_repo(&repo)?;
@@ -555,7 +555,7 @@ fn branch_suggestion_source(engine: &WorkspaceEngine, session: &Session) -> Stri
 /// the dialog wins; otherwise the session supplies it. The name is never
 /// derived from repository content.
 pub(crate) fn handle_branch_suggestion(
-    stream: &mut TcpStream,
+    stream: &mut dyn Write,
     request: &Request,
 ) -> Result<(), String> {
     let form = parse_form(&request.body);
@@ -599,7 +599,7 @@ pub(crate) fn handle_branch_suggestion(
 /// A refusal means no record was written, so it is a 409 with the preparation
 /// that explains it rather than a 200 the dialog would have to inspect.
 pub(crate) fn handle_branch_prepare(
-    stream: &mut TcpStream,
+    stream: &mut dyn Write,
     request: &Request,
 ) -> Result<(), String> {
     let form = parse_form(&request.body);
@@ -663,7 +663,7 @@ pub(crate) fn handle_branch_prepare(
 /// the durable record, so this route cannot run a command the record did not
 /// name.
 pub(crate) fn handle_branch_change(
-    stream: &mut TcpStream,
+    stream: &mut dyn Write,
     request: &Request,
 ) -> Result<(), String> {
     let form = parse_form(&request.body);
@@ -750,7 +750,7 @@ pub(crate) fn handle_branch_change(
 /// which commits a rebase would replay. Both are reports; neither runs the
 /// operation, and this handler has no branch that could.
 pub(crate) fn handle_merge_preparation(
-    stream: &mut TcpStream,
+    stream: &mut dyn Write,
     request: &Request,
 ) -> Result<(), String> {
     let repo = required_param(request, "repo")?;

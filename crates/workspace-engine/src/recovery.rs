@@ -70,11 +70,11 @@ pub fn classify_session(
     audit: &AuditLog,
     session_id: &str,
 ) -> Result<Vec<RecoveredTask>> {
-    // Spec 57 correction C12: a live worker's tasks are running in that
-    // process, not left by a crash. Checked before anything is audited or
+    // Spec 57 correction C12, widened by spec 110 to session hosts: a live
+    // host's tasks are running in that process, not left by a crash. Checked before anything is audited or
     // written, so the sweep records nothing about them — not even a lost model
     // call, which is still in flight.
-    if store.has_live_worker(session_id)? {
+    if store.has_live_host(session_id)? {
         return Ok(Vec::new());
     }
     let unreadable = store.unreadable_event_count(session_id)?;
@@ -575,7 +575,7 @@ pub fn reattach_pending_approvals(
 ) -> Result<Vec<ReattachedApproval>> {
     // A live worker is waiting on its own approval (spec 57 correction C12).
     // Reattaching it would let the shell answer it behind the worker's back.
-    if store.has_live_worker(session_id)? {
+    if store.has_live_host(session_id)? {
         return Ok(Vec::new());
     }
     // Spec 113 D4: a session that piled up several pending decisions before
@@ -634,7 +634,7 @@ pub fn read_pending_approval(
     session_id: &str,
     task_id: &str,
 ) -> Result<Option<ReattachedApproval>> {
-    if store.has_live_worker(session_id)? {
+    if store.has_live_host(session_id)? {
         return Ok(None);
     }
     let waiting = store

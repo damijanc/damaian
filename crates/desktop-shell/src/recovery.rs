@@ -470,39 +470,7 @@ fn run_sweep(engine: &WorkspaceEngine) -> Result<Sweep, String> {
         .map(|session| (session.id.clone(), session.repository_id.clone()))
         .collect();
 
-    let mut facts: HashMap<String, SessionFacts> = HashMap::new();
-    let mut recovered = Vec::new();
-    for task in &classified {
-        if !facts.contains_key(&task.session_id) {
-            facts.insert(
-                task.session_id.clone(),
-                SessionFacts::read(engine, &task.session_id)?,
-            );
-        }
-        // Already handed to a later turn, so it is not a question any more —
-        // and must not be auto-resumed a second time.
-        if facts[&task.session_id].superseded.contains(&task.task_id) {
-            continue;
-        }
-        // §5.5: authorized automatically, so the status change is the engine's
-        // and is audited — but the turn does not re-run until the user asks.
-        // Otherwise opening the app would fire a billed model call for every
-        // `waiting_for_model` task before the user had read anything.
-        let auto_resumed = if task.auto_resume_permitted {
-            workspace_engine::resume(&engine.session_store, &engine.audit_log, task)
-                .map_err(|error| error.to_string())?;
-            true
-        } else {
-            false
-        };
-        recovered.push(describe(
-            engine,
-            task,
-            &facts[&task.session_id],
-            &repository_ids,
-            auto_resumed,
-        )?);
-    }
+    let recovered = recovered_tasks(engine, &classified, &repository_ids)?;
 
     let mut approvals = Vec::new();
     for session in &sessions {
@@ -534,6 +502,86 @@ fn run_sweep(engine: &WorkspaceEngine) -> Result<Sweep, String> {
         approvals,
         verifications,
     })
+}
+
+/// The sweep's middle step for classified tasks: each one's facts read once
+/// per session, a task already handed to a later turn left out, and an
+/// automatic resume (§5.5) applied before it is described.
+fn recovered_tasks(
+    engine: &WorkspaceEngine,
+    classified: &[RecoveredTask],
+    repository_ids: &HashMap<String, String>,
+) -> Result<Vec<Recovered>, String> {
+    let mut facts: HashMap<String, SessionFacts> = HashMap::new();
+    let mut recovered = Vec::new();
+    for task in classified {
+        if !facts.contains_key(&task.session_id) {
+            facts.insert(
+                task.session_id.clone(),
+                SessionFacts::read(engine, &task.session_id)?,
+            );
+        }
+        // Already handed to a later turn, so it is not a question any more —
+        // and must not be auto-resumed a second time.
+        if facts[&task.session_id].superseded.contains(&task.task_id) {
+            continue;
+        }
+        // §5.5: authorized automatically, so the status change is the engine's
+        // and is audited — but the turn does not re-run until the user asks.
+        // Otherwise opening the app would fire a billed model call for every
+        // `waiting_for_model` task before the user had read anything.
+        let auto_resumed = if task.auto_resume_permitted {
+            workspace_engine::resume(&engine.session_store, &engine.audit_log, task)
+                .map_err(|error| error.to_string())?;
+            true
+        } else {
+            false
+        };
+        recovered.push(describe(
+            engine,
+            task,
+            &facts[&task.session_id],
+            repository_ids,
+            auto_resumed,
+        )?);
+    }
+    Ok(recovered)
+}
+
+/// Spec 110 D6: a session host that died while the shell runs left its
+/// session as a crash leaves it. The session is classified now, exactly as
+/// the launch sweep classifies it, and its tasks join the sweep's snapshot,
+/// so `/api/recovery` offers them without a relaunch. Before the first sweep
+/// there is nothing to join: that sweep finds them itself.
+pub(crate) fn recover_session(session_id: &str) -> Result<(), String> {
+    let Some(sweep) = SWEEP.get() else {
+        return Ok(());
+    };
+    let engine = crate::default_engine()?;
+    let classified = classify_session(&engine.session_store, &engine.audit_log, session_id)
+        .map_err(|error| error.to_string())?;
+    if classified.is_empty() {
+        return Ok(());
+    }
+    let repository_ids = engine
+        .session_store
+        .list_sessions(None)
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .map(|session| (session.id, session.repository_id))
+        .collect();
+    let recovered = recovered_tasks(&engine, &classified, &repository_ids)?;
+    let mut sweep = sweep.lock().map_err(|error| error.to_string())?;
+    for task in recovered {
+        if !sweep
+            .recovered
+            .iter()
+            .any(|known| known.session_id == task.session_id && known.task_id == task.task_id)
+        {
+            sweep.recovered.push(task);
+        }
+    }
+    Ok(())
 }
 
 fn describe(

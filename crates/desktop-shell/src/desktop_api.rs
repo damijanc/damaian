@@ -3,7 +3,7 @@
 
 use super::*;
 
-pub(crate) fn handle_terminal_cwd(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+pub(crate) fn handle_terminal_cwd(stream: &mut dyn Write, request: &Request) -> Result<(), String> {
     let repo = request.param("repo").unwrap_or_default();
     let cwd = terminal_cwd_for_repo(&repo)?;
     write_response(
@@ -15,7 +15,7 @@ pub(crate) fn handle_terminal_cwd(stream: &mut TcpStream, request: &Request) -> 
     )
 }
 
-pub(crate) fn handle_terminal_run(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+pub(crate) fn handle_terminal_run(stream: &mut dyn Write, request: &Request) -> Result<(), String> {
     let form = parse_form(&request.body);
     let cwd = form.get("cwd").cloned().unwrap_or_default();
     let command = required_form(&form, "command")?;
@@ -35,7 +35,7 @@ pub(crate) fn handle_terminal_run(stream: &mut TcpStream, request: &Request) -> 
     )
 }
 
-pub(crate) fn handle_open_vscode(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+pub(crate) fn handle_open_vscode(stream: &mut dyn Write, request: &Request) -> Result<(), String> {
     let form = parse_form(&request.body);
     let repo = required_form(&form, "repo")?;
     let path = open_in_vscode(&repo)?;
@@ -49,7 +49,7 @@ pub(crate) fn handle_open_vscode(stream: &mut TcpStream, request: &Request) -> R
 }
 
 pub(crate) fn handle_reveal_in_finder(
-    stream: &mut TcpStream,
+    stream: &mut dyn Write,
     request: &Request,
 ) -> Result<(), String> {
     let form = parse_form(&request.body);
@@ -64,7 +64,7 @@ pub(crate) fn handle_reveal_in_finder(
     )
 }
 
-pub(crate) fn handle_open_github(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+pub(crate) fn handle_open_github(stream: &mut dyn Write, request: &Request) -> Result<(), String> {
     let form = parse_form(&request.body);
     let url = open_github_for_form(&form, open_url_in_browser)?;
     write_response(
@@ -77,7 +77,7 @@ pub(crate) fn handle_open_github(stream: &mut TcpStream, request: &Request) -> R
 }
 
 pub(crate) fn handle_open_vscode_file(
-    stream: &mut TcpStream,
+    stream: &mut dyn Write,
     request: &Request,
 ) -> Result<(), String> {
     let form = parse_form(&request.body);
@@ -99,7 +99,7 @@ pub(crate) fn handle_open_vscode_file(
 }
 
 pub(crate) fn handle_render_markdown(
-    stream: &mut TcpStream,
+    stream: &mut dyn Write,
     request: &Request,
 ) -> Result<(), String> {
     let form = parse_form(&request.body);

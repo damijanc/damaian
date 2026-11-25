@@ -91,6 +91,41 @@ when the turn ended. Local OBSERVATIONS 94.
     still in the shell process, each session's work behind an in-process
     per-session lane; Task 1b moves the lane's work into the host. The lane's
     interface (claim, label, cancel, refusal) is what the host keeps.
+  - **As built (Task 1b, 2026-11-25).** `host.rs` holds the shared plumbing
+    (mode flag, handover, lifeline, `0600`/`0700` socket under
+    `<data_dir>/workers/` or `<data_dir>/hosts/`, token check, `start_host`
+    with registration before handover, `exchange`); `worker.rs`/`workers.rs`
+    use it unchanged in behaviour. `session_host.rs` is the `--session-host`
+    process; `session_hosts.rs` is the shell side. The shell still claims the
+    session's lane, then forwards the request as one JSON line on the host's
+    socket and copies the raw HTTP response back; the host runs
+    `serve_forwarded_work` (route class, its own lane, the same `dispatch`).
+    Handlers take `&mut dyn Write`. The shell's lane is marked remote, so
+    label, cancel and notes are `status`/`cancel`/`note` exchanges with the
+    host. Hosting is switched on by both `main`s (`enable_session_hosts`); the
+    library's tests keep running work in-process, where their scripted models
+    live. Deviations: **four session-work routes stay in the shell** under the
+    lane — `POST /api/workers` and `/api/plan-to-worker` (the shell's
+    supervisor holds every worker's lifeline) and the two recovery-decision
+    routes (the sweep snapshot is shell memory) — `Route::runs_in_session_host`;
+    a request with no session (a new session's first message) goes to a host
+    started under a placeholder id and bound when the stream's `session` event
+    names the session, and a request whose session never appears gets a
+    one-request host; **hosts are kept until the session is archived or deleted
+    or the app quits**, not ended when idle; the host verifies its effective
+    data directory equals the shell's `--data-dir` rather than setting it.
+    Keys: before forwarding, the shell resolves the Keychain references of the
+    request's provider config (and the fallback target's on an accepted
+    fallback offer) and of the repository's MCP servers and writes
+    `{"account","key"}` lines on the host's stdin; in a host, key lookups use
+    only those (`keys_from_shell_only`). Environment-variable references are
+    inherited with the shell's environment. A host that dies mid-response is
+    swept like a crashed instance (`sweep_orphaned_processes`), its session is
+    classified into the running sweep snapshot (`recovery::recover_session`),
+    and the window gets an `error` event; recovery's live-worker check is now
+    `SessionStore::has_live_host` (`ProcessKind::SessionHost`). Quit
+    (`shutdown_all_hosts`) asks each host to shut down; the host cancels its
+    work and waits up to 3 s for it to end as stopped before `sweep_own`.
 - **D2 — classification.** `RouteClass { SessionWork(session_id), Ui }` by an
   exhaustive match over the route table. Session work: turn streams and every
   resume route (answer, plan review, patch decision, command/check/baseline

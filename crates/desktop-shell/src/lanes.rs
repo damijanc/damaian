@@ -7,9 +7,10 @@
 //! Archive and delete read the same table to refuse a working session, and a
 //! UI route lists working sessions and cancels one.
 //!
-//! The lane lives in the shell process today; spec 110 Task 1b moves the work
-//! behind it into a host process per session and keeps this interface: claim,
-//! label, cancel, refusal, notes.
+//! The lane lives in the shell process. When the session's work runs in a
+//! session host process (spec 110 Task 1b), the lane is marked remote: its
+//! label, cancel and notes come from and go to that host (D3, D7), and the
+//! host keeps a lane table of its own for the work it runs.
 //!
 //! A running chat turn also puts its [`NoteQueue`] in the lane (D7), so a
 //! message the user sends while the session works reaches the turn at its
@@ -31,6 +32,32 @@ struct Lane {
     started: Instant,
     cancel: Option<CancelToken>,
     notes: Option<Arc<NoteQueue>>,
+    /// The session host running this work, when it runs in one.
+    remote: Option<Arc<dyn RemoteWork>>,
+}
+
+impl std::fmt::Debug for dyn RemoteWork {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RemoteWork")
+    }
+}
+
+/// Work running in another process (a session host, spec 110 Task 1b). Each
+/// call is one short exchange with that process; `None` from `status` means it
+/// did not answer, and the lane then shows what it last knew.
+pub(crate) trait RemoteWork: Send + Sync {
+    /// What the work is doing now and whether it can be cancelled, or `None`.
+    fn status(&self) -> Option<RemoteStatus>;
+    fn cancel(&self) -> Result<(), CancelRefusal>;
+    /// Queues a note into the running turn; `false` when it has none.
+    fn note(&self, text: String) -> bool;
+}
+
+/// One answer from a host about its session's work.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RemoteStatus {
+    pub(crate) label: String,
+    pub(crate) cancellable: bool,
 }
 
 /// One running turn's steering notes (spec 110 D7, built on spec 57 §5.4).
@@ -140,6 +167,15 @@ impl LaneGuard {
         }
     }
 
+    /// The host process this work runs in: label, cancel and notes go to it.
+    pub(crate) fn set_remote(&self, remote: Arc<dyn RemoteWork>) {
+        if let Some(lane) = lanes().by_session.get_mut(&self.session_id)
+            && lane.claim == self.claim
+        {
+            lane.remote = Some(remote);
+        }
+    }
+
     /// The running turn's note queue, so a UI request can add to it (D7).
     pub(crate) fn set_notes(&self, notes: &Arc<NoteQueue>) {
         if let Some(lane) = lanes().by_session.get_mut(&self.session_id)
@@ -167,7 +203,9 @@ impl Drop for LaneGuard {
 pub(crate) fn claim(session_id: &str, label: &str) -> Result<LaneGuard, String> {
     let mut lanes = lanes();
     if let Some(running) = lanes.by_session.get(session_id) {
-        return Err(running.label.clone());
+        let (stored, remote) = (running.label.clone(), running.remote.clone());
+        drop(lanes);
+        return Err(current_label(stored, remote.as_deref()));
     }
     lanes.next_claim += 1;
     let claim = lanes.next_claim;
@@ -179,6 +217,7 @@ pub(crate) fn claim(session_id: &str, label: &str) -> Result<LaneGuard, String> 
             started: Instant::now(),
             cancel: None,
             notes: None,
+            remote: None,
         },
     );
     Ok(LaneGuard {
@@ -189,10 +228,22 @@ pub(crate) fn claim(session_id: &str, label: &str) -> Result<LaneGuard, String> 
 
 /// What `session_id` is doing, or `None` while it is idle.
 pub(crate) fn working_label(session_id: &str) -> Option<String> {
-    lanes()
-        .by_session
-        .get(session_id)
-        .map(|lane| lane.label.clone())
+    let (stored, remote) = {
+        let lanes = lanes();
+        let lane = lanes.by_session.get(session_id)?;
+        (lane.label.clone(), lane.remote.clone())
+    };
+    Some(current_label(stored, remote.as_deref()))
+}
+
+/// The host's own label for remote work, else the one the lane holds. Never
+/// called with the table locked: asking a host is a socket exchange.
+fn current_label(stored: String, remote: Option<&dyn RemoteWork>) -> String {
+    remote
+        .and_then(RemoteWork::status)
+        .map(|status| status.label)
+        .filter(|label| !label.trim().is_empty())
+        .unwrap_or(stored)
 }
 
 /// One working session as the UI lists it.
@@ -206,14 +257,26 @@ pub(crate) struct Working {
 
 /// Every working session, ordered by id so the answer is stable.
 pub(crate) fn working() -> Vec<Working> {
-    let mut working = lanes()
+    let rows = lanes()
         .by_session
         .iter()
-        .map(|(session_id, lane)| Working {
-            session_id: session_id.clone(),
-            label: lane.label.clone(),
-            elapsed_ms: lane.started.elapsed().as_millis(),
-            cancellable: lane.cancel.is_some(),
+        .map(|(session_id, lane)| (session_id.clone(), lane.clone()))
+        .collect::<Vec<_>>();
+    // Hosts are asked with the table unlocked.
+    let mut working = rows
+        .into_iter()
+        .map(|(session_id, lane)| {
+            let status = lane.remote.as_deref().and_then(RemoteWork::status);
+            Working {
+                session_id,
+                label: status
+                    .as_ref()
+                    .map(|status| status.label.clone())
+                    .filter(|label| !label.trim().is_empty())
+                    .unwrap_or(lane.label),
+                elapsed_ms: lane.started.elapsed().as_millis(),
+                cancellable: status.map_or(lane.cancel.is_some(), |status| status.cancellable),
+            }
         })
         .collect::<Vec<_>>();
     working.sort_by(|left, right| left.session_id.cmp(&right.session_id));
@@ -232,14 +295,30 @@ pub(crate) enum CancelRefusal {
 /// Fires the cancel token of `session_id`'s running work. The work stops at
 /// its next safe point, exactly as when the window that started it goes away.
 pub(crate) fn cancel(session_id: &str) -> Result<(), CancelRefusal> {
-    let lanes = lanes();
-    let lane = lanes
+    let lane = lanes()
         .by_session
         .get(session_id)
+        .cloned()
         .ok_or(CancelRefusal::Idle)?;
+    if let Some(remote) = lane.remote {
+        return remote.cancel();
+    }
     let cancel = lane.cancel.as_ref().ok_or(CancelRefusal::NotCancellable)?;
     cancel.cancel();
     Ok(())
+}
+
+/// Fires every cancel token in this process: a session host shutting down
+/// stops its work so the turn ends as stopped, not as a crash (D6).
+pub(crate) fn cancel_all() {
+    let tokens = lanes()
+        .by_session
+        .values()
+        .filter_map(|lane| lane.cancel.clone())
+        .collect::<Vec<_>>();
+    for token in tokens {
+        token.cancel();
+    }
 }
 
 /// Queues a note into `session_id`'s running turn (D7). `false` when the
@@ -248,10 +327,16 @@ pub(crate) fn cancel(session_id: &str) -> Result<(), CancelRefusal> {
 /// turn waiting for an approval or a question holds no lane, so a note can
 /// never stand in for an answer.
 pub(crate) fn queue_note(session_id: &str, text: String) -> bool {
-    let notes = lanes()
+    let Some((notes, remote)) = lanes()
         .by_session
         .get(session_id)
-        .and_then(|lane| lane.notes.clone());
+        .map(|lane| (lane.notes.clone(), lane.remote.clone()))
+    else {
+        return false;
+    };
+    if let Some(remote) = remote {
+        return remote.note(text);
+    }
     notes.is_some_and(|notes| notes.queue(text))
 }
 
@@ -502,6 +587,72 @@ mod tests {
         assert!(
             !queue_note(&session, "late".to_string()),
             "a closed turn refuses, so nothing is accepted and dropped"
+        );
+        drop(guard);
+    }
+
+    /// A host that answers with a fixed label and records what reached it.
+    #[derive(Default)]
+    struct FakeHost {
+        silent: bool,
+        cancelled: Mutex<bool>,
+        notes: Mutex<Vec<String>>,
+    }
+
+    impl RemoteWork for FakeHost {
+        fn status(&self) -> Option<RemoteStatus> {
+            (!self.silent).then(|| RemoteStatus {
+                label: "Running `cargo test`".to_string(),
+                cancellable: true,
+            })
+        }
+
+        fn cancel(&self) -> Result<(), CancelRefusal> {
+            *self.cancelled.lock().unwrap() = true;
+            Ok(())
+        }
+
+        fn note(&self, text: String) -> bool {
+            self.notes.lock().unwrap().push(text);
+            true
+        }
+    }
+
+    #[test]
+    fn a_remote_lanes_label_cancel_and_notes_come_from_its_host() {
+        let session = unique("remote");
+        let guard = claim(&session, "Answering a message").unwrap();
+        let host = Arc::new(FakeHost::default());
+        guard.set_remote(host.clone());
+        assert_eq!(
+            working_label(&session).as_deref(),
+            Some("Running `cargo test`")
+        );
+        assert_eq!(
+            claim(&session, "Running checks").unwrap_err(),
+            "Running `cargo test`",
+            "a refusal names what the host is doing"
+        );
+        let row = working()
+            .into_iter()
+            .find(|row| row.session_id == session)
+            .unwrap();
+        assert!(row.cancellable, "the shell itself holds no token");
+        assert!(queue_note(&session, "a note".to_string()));
+        assert_eq!(*host.notes.lock().unwrap(), vec!["a note"]);
+        assert_eq!(cancel(&session), Ok(()));
+        assert!(*host.cancelled.lock().unwrap());
+        drop(guard);
+
+        // A host that does not answer leaves the lane's own label.
+        let guard = claim(&session, "Answering a message").unwrap();
+        guard.set_remote(Arc::new(FakeHost {
+            silent: true,
+            ..FakeHost::default()
+        }));
+        assert_eq!(
+            working_label(&session).as_deref(),
+            Some("Answering a message")
         );
         drop(guard);
     }

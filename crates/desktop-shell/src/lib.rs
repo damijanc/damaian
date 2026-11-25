@@ -35,16 +35,29 @@ use workspace_engine::{
     review_profile_import, review_profile_rejections, select_profile,
 };
 
+mod host;
 mod keychain;
 mod lanes;
 mod recovery;
 mod routes;
+mod session_host;
+mod session_hosts;
 pub mod terminal;
 mod worker;
 pub mod workers;
 
+pub use session_host::{SESSION_HOST_FLAG, run_session_host_from_args};
+pub use session_hosts::{enable_session_hosts, session_host_pid};
 pub use worker::{WORKER_FLAG, run_worker_from_args, worker_socket_path};
 pub use workers::shutdown_all_workers;
+
+/// For the desktop app's `RunEvent::Exit`: ends every host this process
+/// started, workers and session hosts alike (spec 110 D1a, D6). A no-op when
+/// none was.
+pub fn shutdown_all_hosts() {
+    session_hosts::shutdown_all_session_hosts();
+    shutdown_all_workers();
+}
 
 mod browser_diagnostics;
 use browser_diagnostics::*;
@@ -298,8 +311,9 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
     // Spec 110 D1–D2: a session's work holds that session's lane while it
     // runs; a second piece of work for the same session is refused at once
     // with what the first is doing, never queued. UI routes take no lane.
-    if let routes::RouteClass::SessionWork(Some(session_id)) = route_class(route, &request) {
-        match lanes::claim(&session_id, route.work_label()) {
+    let class = route_class(route, &request);
+    if let routes::RouteClass::SessionWork(Some(session_id)) = &class {
+        match lanes::claim(session_id, route.work_label()) {
             Ok(guard) => lanes::hold_current(guard),
             Err(running) => {
                 return write_response(
@@ -307,14 +321,66 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
                     &request,
                     409,
                     "application/json",
-                    &session_working_json(&session_id, &running),
+                    &session_working_json(session_id, &running),
                 );
             }
         }
     }
-    let outcome = dispatch(stream, &request, route, options);
+    // Spec 110 Task 1b: with hosting on, the work itself runs in the
+    // session's host process and this connection only copies its response.
+    let outcome = match class {
+        routes::RouteClass::SessionWork(session)
+            if route.runs_in_session_host() && session_hosts::enabled() =>
+        {
+            session_hosts::forward(stream, &request, route, session)
+        }
+        _ => dispatch(stream, &request, route, options),
+    };
     lanes::release_current();
     outcome
+}
+
+/// A session host's side of one forwarded request (spec 110 D1a): the shell
+/// already authorised it and holds the session's lane, and this process runs
+/// the same handler the shell would, under a lane of its own so the work's
+/// label, cancel token and notes are reachable from the shell.
+pub(crate) fn serve_forwarded_work(stream: &mut dyn Write, request: &Request) {
+    let options = ShellOptions {
+        port: 0,
+        default_repo: None,
+        api_token: String::new(),
+    };
+    let outcome = match routes::route_for(&request.method, &request.path) {
+        Some(route) if route.runs_in_session_host() => match route_class(route, request) {
+            routes::RouteClass::SessionWork(Some(session_id)) => {
+                match lanes::claim(&session_id, route.work_label()) {
+                    Ok(guard) => {
+                        lanes::hold_current(guard);
+                        dispatch(stream, request, route, &options)
+                    }
+                    Err(running) => write_response(
+                        stream,
+                        request,
+                        409,
+                        "application/json",
+                        &session_working_json(&session_id, &running),
+                    ),
+                }
+            }
+            _ => dispatch(stream, request, route, &options),
+        },
+        _ => write_response(
+            stream,
+            request,
+            404,
+            "application/json",
+            &json_error("not a session's work"),
+        ),
+    };
+    if let Err(error) = outcome {
+        let _ = write_basic_response(stream, 500, "application/json", &json_error(&error));
+    }
+    lanes::release_current();
 }
 
 /// The class of one request, with the session it acts for when it names one
@@ -334,14 +400,45 @@ fn route_class(route: routes::Route, request: &Request) -> routes::RouteClass {
     if named.is_some() {
         return routes::RouteClass::SessionWork(named);
     }
-    let paused = form
+    let resolved = form
         .get("proposal_id")
         .filter(|id| is_plain_id(id))
         .and_then(|id| {
             let data_dir = effective_data_dir().ok()?;
             PausedTurns::new(data_dir).session_id(id)
-        });
-    routes::RouteClass::SessionWork(paused)
+        })
+        .or_else(|| patch_session(&form))
+        .or_else(|| checkpoint_session(&form));
+    routes::RouteClass::SessionWork(resolved)
+}
+
+/// The session a patch belongs to: the chat session it was proposed from when
+/// that differs from the one it was stored in (spec 20 §7.3). `None` for a
+/// patch stored before patches recorded their session.
+fn patch_session(form: &HashMap<String, String>) -> Option<String> {
+    let patch_id = form.get("patch_id").filter(|id| is_plain_id(id))?;
+    let data_dir = effective_data_dir().ok()?;
+    let patch = workspace_engine::PatchStore::new(data_dir)
+        .load(patch_id)
+        .ok()?;
+    [patch.origin_session_id, patch.session_id]
+        .into_iter()
+        .find(|id| !id.is_empty())
+}
+
+/// The session a checkpoint was taken in, from its manifest.
+fn checkpoint_session(form: &HashMap<String, String>) -> Option<String> {
+    let checkpoint_id = form.get("checkpoint_id").filter(|id| is_plain_id(id))?;
+    let repo = form.get("repo").filter(|repo| !repo.is_empty())?;
+    let engine = engine_for_repo(repo).ok()?;
+    let repository_id = engine.indexer.repository_id_for_path(repo).ok()?;
+    engine
+        .checkpoint_store
+        .read_checkpoint(&repository_id, checkpoint_id)
+        .ok()
+        .flatten()
+        .map(|manifest| manifest.session_id)
+        .filter(|id| !id.is_empty())
 }
 
 /// An id that can name a file under the data directory without leaving it.
@@ -366,7 +463,7 @@ fn session_working_json(session_id: &str, running: &str) -> String {
 
 /// The handler for each route. Exhaustive, like [`routes::Route::is_session_work`].
 fn dispatch(
-    stream: &mut TcpStream,
+    stream: &mut dyn Write,
     request: &Request,
     route: routes::Route,
     options: &ShellOptions,

@@ -15,13 +15,17 @@
 use std::cell::RefCell;
 use std::fs;
 use std::io::{BufRead, BufReader, IsTerminal, Read, Write};
-use std::os::unix::fs::{DirBuilderExt, FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+pub(crate) use crate::host::validate_session_id;
+use crate::host::{
+    Handover, HostKind, ShutdownSignal, bind_host_socket, host_socket_path, read_handover,
+    refuse_terminal_stdin, tokens_match, watch_lifeline,
+};
 use serde_json::{Map, Value, json};
 use workspace_engine::worker_progress::{ProgressKind, ProgressWriter};
 use workspace_engine::{
@@ -34,8 +38,6 @@ use workspace_engine::{
 /// The first argument that selects worker mode, in both `main`s.
 pub const WORKER_FLAG: &str = "--worker";
 
-/// Room for `{"apiKey": …, "token": …}` with any real provider key.
-const MAX_HANDOVER_BYTES: u64 = 16 * 1024;
 /// One request line. A `message` carries a whole prompt, so this is generous;
 /// it exists so a client cannot make the worker buffer without limit.
 const MAX_REQUEST_BYTES: u64 = 256 * 1024;
@@ -43,12 +45,7 @@ const MAX_REQUEST_BYTES: u64 = 256 * 1024;
 /// the socket is where notes are bounded.
 pub const MAX_NOTE_BYTES: usize = 16 * 1024;
 const MAX_PROPOSAL_ID_BYTES: usize = 256;
-const MAX_SESSION_ID_BYTES: usize = 128;
 const MAX_TASK_ID_BYTES: usize = 256;
-/// macOS's `sockaddr_un.sun_path`, including the terminating NUL.
-const SUN_PATH_CAPACITY: usize = 104;
-/// The control token is 32 random bytes, written as hex.
-const TOKEN_HEX_LEN: usize = 64;
 /// How long one control connection may sit idle. The shell's exchanges are
 /// short, and the socket serves one connection at a time, so a client that
 /// stops talking must not hold it.
@@ -84,7 +81,7 @@ fn run_worker(args: &[String]) -> Result<(), String> {
     std::thread::Builder::new()
         .name("damaian-worker-lifeline".to_string())
         .spawn(move || {
-            watch_lifeline(std::io::stdin().lock());
+            watch_lifeline(std::io::stdin().lock(), |_| {});
             lifeline.trigger();
         })
         .map_err(|error| format!("could not start the lifeline thread: {error}"))?;
@@ -118,22 +115,6 @@ fn run_worker(args: &[String]) -> Result<(), String> {
     let swept = registry.sweep_own(&audit);
     let _ = fs::remove_file(&socket_path);
     swept.map(|_| ()).map_err(|error| error.to_string())
-}
-
-/// Blocks until stdin reaches EOF or fails. The shell holds the write end for
-/// the worker's whole life, so this returns only when the shell let go of it
-/// or died, `SIGKILL` included: the kernel closes the pipe either way.
-fn watch_lifeline(mut stdin: impl Read) {
-    let mut buffer = [0_u8; 512];
-    loop {
-        match stdin.read(&mut buffer) {
-            Ok(0) => return,
-            // Nothing is expected after the handover; anything is discarded.
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(_) => return,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -176,151 +157,17 @@ fn parse_worker_args(args: &[String]) -> Result<WorkerArgs, String> {
     })
 }
 
-/// Session ids are `create_id` output; anything else is not one of ours.
-pub(crate) fn validate_session_id(session_id: &str) -> Result<(), String> {
-    let well_formed = !session_id.is_empty()
-        && session_id.len() <= MAX_SESSION_ID_BYTES
-        && session_id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-');
-    if well_formed {
-        Ok(())
-    } else {
-        Err("the session id is not a Damaian session id".to_string())
-    }
-}
-
-/// Worker mode cannot be run by hand: without the handover there is no key and
-/// no token, and a terminal on stdin means nobody is holding the lifeline.
-fn refuse_terminal_stdin(is_terminal: bool) -> Result<(), String> {
-    if is_terminal {
-        return Err(
-            "worker mode reads its handover from the shell and cannot run from a terminal"
-                .to_string(),
-        );
-    }
-    Ok(())
-}
-
-/// What the shell writes on the worker's stdin. `Debug` never prints either
-/// value.
-struct Handover {
-    api_key: String,
-    token: String,
-}
-
-impl std::fmt::Debug for Handover {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("Handover { .. }")
-    }
-}
-
-fn read_handover(reader: &mut impl BufRead) -> Result<Handover, String> {
-    let mut line = Vec::new();
-    reader
-        .take(MAX_HANDOVER_BYTES + 1)
-        .read_until(b'\n', &mut line)
-        .map_err(|_| "could not read the handover from stdin".to_string())?;
-    if line.len() as u64 > MAX_HANDOVER_BYTES {
-        return Err("the handover line is too long".to_string());
-    }
-    // A line without its newline means stdin closed part way: the shell that
-    // started this worker is already gone.
-    if line.pop() != Some(b'\n') {
-        return Err("stdin closed before the handover line ended".to_string());
-    }
-    parse_handover(&line)
-}
-
-/// Every refusal is a fixed string. In particular serde's own messages are
-/// never passed on, because some of them quote the input.
-fn parse_handover(line: &[u8]) -> Result<Handover, String> {
-    const MALFORMED: &str = "the handover line is not {\"apiKey\": …, \"token\": …}";
-    let Ok(Value::Object(mut fields)) = serde_json::from_slice::<Value>(line) else {
-        return Err(MALFORMED.to_string());
-    };
-    let (Some(Value::String(api_key)), Some(Value::String(token))) =
-        (fields.remove("apiKey"), fields.remove("token"))
-    else {
-        return Err(MALFORMED.to_string());
-    };
-    if !fields.is_empty() {
-        return Err("the handover line has an unexpected field".to_string());
-    }
-    if token.len() != TOKEN_HEX_LEN || !token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err("the control token is not 64 hex characters".to_string());
-    }
-    Ok(Handover { api_key, token })
-}
-
-/// `<data_dir>/workers/<16 hex of sha256(session id)>.sock`.
-///
-/// Named by a hash because the session id does not fit: measured on
-/// 2026-10-12, the id-named path is 107 bytes under the real Application
-/// Support directory and 132 under a `/var/folders/…` test directory, against
-/// `sun_path`'s 104. Refuses when even the hashed path does not fit.
+/// `<data_dir>/workers/<16 hex of sha256(session id)>.sock`; see
+/// [`host_socket_path`].
 pub fn worker_socket_path(data_dir: &Path, session_id: &str) -> Result<PathBuf, String> {
-    let digest = workspace_engine::hash::sha256(session_id);
-    let path = data_dir
-        .join("workers")
-        .join(format!("{}.sock", &digest[..16]));
-    let length = path.as_os_str().len();
-    if length >= SUN_PATH_CAPACITY {
-        return Err(format!(
-            "the worker socket path is {length} bytes, and macOS allows {} \
-             (sun_path is {SUN_PATH_CAPACITY} bytes with its NUL); use a shorter \
-             data directory",
-            SUN_PATH_CAPACITY - 1
-        ));
-    }
-    Ok(path)
+    host_socket_path(data_dir, HostKind::Worker, session_id)
 }
 
-/// Binds `0600` in a `0700` directory. The directory is private before the
-/// socket exists, so nobody else can reach it between `bind` and `chmod`.
 fn bind_control_socket(
     data_dir: &Path,
     session_id: &str,
 ) -> Result<(UnixListener, PathBuf), String> {
-    let path = worker_socket_path(data_dir, session_id)?;
-    let dir = path
-        .parent()
-        .ok_or_else(|| "the worker socket has no directory".to_string())?;
-    fs::create_dir_all(data_dir)
-        .map_err(|error| format!("could not create the data directory: {error}"))?;
-    match fs::symlink_metadata(dir) {
-        Ok(meta) if meta.file_type().is_dir() => {}
-        Ok(_) => return Err(format!("{} is not a directory", dir.display())),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            fs::DirBuilder::new()
-                .mode(0o700)
-                .create(dir)
-                .map_err(|error| format!("could not create {}: {error}", dir.display()))?;
-        }
-        Err(error) => return Err(format!("could not inspect {}: {error}", dir.display())),
-    }
-    fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
-        .map_err(|error| format!("could not make {} private: {error}", dir.display()))?;
-
-    match fs::symlink_metadata(&path) {
-        Ok(meta) if meta.file_type().is_socket() => {
-            // A socket someone still answers on belongs to a live worker for
-            // this session. One left by a crash refuses the connection.
-            if UnixStream::connect(&path).is_ok() {
-                return Err("a worker is already serving this session".to_string());
-            }
-            fs::remove_file(&path)
-                .map_err(|error| format!("could not remove a stale worker socket: {error}"))?;
-        }
-        Ok(_) => return Err(format!("{} is not a socket", path.display())),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(format!("could not inspect {}: {error}", path.display())),
-    }
-    let listener = UnixListener::bind(&path)
-        .map_err(|error| format!("could not bind the worker socket: {error}"))?;
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
-        .map_err(|error| format!("could not make the worker socket private: {error}"))?;
-    Ok((listener, path))
+    bind_host_socket(data_dir, HostKind::Worker, session_id)
 }
 
 /// The worker's config comes from the data directory the shell named, never
@@ -531,17 +378,6 @@ fn parse_command(
     Ok(parsed)
 }
 
-/// Compares every byte whatever the first mismatch, so the time an answer
-/// takes says nothing about how much of a guess was right.
-fn tokens_match(offered: &str, expected: &str) -> bool {
-    offered.len() == expected.len()
-        && offered
-            .bytes()
-            .zip(expected.bytes())
-            .fold(0_u8, |difference, (a, b)| difference | (a ^ b))
-            == 0
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WorkerState {
     Idle,
@@ -562,40 +398,6 @@ impl WorkerState {
             Self::WaitingForApproval => "waiting_for_approval",
             Self::ShuttingDown => "shutting_down",
         }
-    }
-}
-
-/// Set once, by the lifeline or by `shutdown`; the main thread waits on it.
-#[derive(Debug, Default)]
-struct ShutdownSignal {
-    requested: Mutex<bool>,
-    changed: Condvar,
-}
-
-impl ShutdownSignal {
-    fn trigger(&self) {
-        *self.lock() = true;
-        self.changed.notify_all();
-    }
-
-    fn is_triggered(&self) -> bool {
-        *self.lock()
-    }
-
-    fn wait(&self) {
-        let mut requested = self.lock();
-        while !*requested {
-            requested = self
-                .changed
-                .wait(requested)
-                .unwrap_or_else(|poison| poison.into_inner());
-        }
-    }
-
-    fn lock(&self) -> std::sync::MutexGuard<'_, bool> {
-        self.requested
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
     }
 }
 
@@ -1866,8 +1668,9 @@ fn serve_connection(stream: UnixStream, token: &str, host: &WorkerHost) -> bool 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::host::MAX_HANDOVER_BYTES;
     use std::io::Cursor;
-    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
 
     const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     const KEY: &str = "sk-test-handover-key-not-real";

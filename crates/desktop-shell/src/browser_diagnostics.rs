@@ -4,7 +4,7 @@
 use super::*;
 
 pub(crate) fn handle_reveal_web_diagnostic_artifact(
-    stream: &mut TcpStream,
+    stream: &mut dyn Write,
     request: &Request,
 ) -> Result<(), String> {
     let form = parse_form(&request.body);
@@ -22,7 +22,7 @@ pub(crate) fn handle_reveal_web_diagnostic_artifact(
 }
 
 pub(crate) fn handle_web_diagnostic_artifact(
-    stream: &mut TcpStream,
+    stream: &mut dyn Write,
     request: &Request,
 ) -> Result<(), String> {
     let repo = request.param("repo").unwrap_or_default();
