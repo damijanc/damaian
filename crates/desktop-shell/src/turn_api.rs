@@ -3,7 +3,7 @@
 
 use super::*;
 
-pub(crate) fn handle_ask(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+pub(crate) fn handle_ask(stream: &mut dyn Write, request: &Request) -> Result<(), String> {
     let form = parse_form(&request.body);
     // The non-streaming fallback: there is no stream for a client to
     // abort, so nothing here can be stopped. The events go nowhere.
@@ -18,7 +18,7 @@ pub(crate) fn handle_ask(stream: &mut TcpStream, request: &Request) -> Result<()
     )
 }
 
-pub(crate) fn handle_ask_stream(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+pub(crate) fn handle_ask_stream(stream: &mut dyn Write, request: &Request) -> Result<(), String> {
     let form = parse_form(&request.body);
     write_event_stream_headers(stream, request)?;
     stream_turn(stream, move |cancel, events| {
@@ -27,7 +27,7 @@ pub(crate) fn handle_ask_stream(stream: &mut TcpStream, request: &Request) -> Re
 }
 
 pub(crate) fn handle_resume_command_stream(
-    stream: &mut TcpStream,
+    stream: &mut dyn Write,
     request: &Request,
 ) -> Result<(), String> {
     let form = parse_form(&request.body);
@@ -38,7 +38,7 @@ pub(crate) fn handle_resume_command_stream(
 }
 
 pub(crate) fn handle_resume_fetch_stream(
-    stream: &mut TcpStream,
+    stream: &mut dyn Write,
     request: &Request,
 ) -> Result<(), String> {
     let form = parse_form(&request.body);
@@ -55,7 +55,7 @@ pub(crate) fn handle_resume_fetch_stream(
 /// SSE, and the place a wrong-kind pause or an unknown decision becomes a
 /// stated `{error, code, message}` instead of an SSE failure event.
 pub(crate) fn handle_fetch_decision(
-    stream: &mut TcpStream,
+    stream: &mut dyn Write,
     request: &Request,
 ) -> Result<(), String> {
     let form = parse_form(&request.body);
@@ -103,7 +103,7 @@ pub(crate) fn fetch_decision_error_json(code: &str, message: &str) -> String {
 }
 
 pub(crate) fn handle_verify_stream(
-    stream: &mut TcpStream,
+    stream: &mut dyn Write,
     request: &Request,
 ) -> Result<(), String> {
     let form = parse_form(&request.body);
@@ -117,7 +117,7 @@ pub(crate) fn handle_verify_stream(
 /// engine-authorized run. The engine re-reads the task and its report, so a
 /// stale card or a second click creates nothing.
 pub(crate) fn handle_continue_task_stream(
-    stream: &mut TcpStream,
+    stream: &mut dyn Write,
     request: &Request,
 ) -> Result<(), String> {
     let form = parse_form(&request.body);
@@ -130,7 +130,7 @@ pub(crate) fn handle_continue_task_stream(
 /// Spec 96: the user's explicit decision to start one more repair attempt
 /// after the verification repair limit.
 pub(crate) fn handle_continue_repair_stream(
-    stream: &mut TcpStream,
+    stream: &mut dyn Write,
     request: &Request,
 ) -> Result<(), String> {
     let form = parse_form(&request.body);
@@ -144,7 +144,7 @@ pub(crate) fn handle_continue_repair_stream(
 /// turn from it. No non-streaming fallback exists, as with a plan decision: the
 /// action *is* a turn.
 pub(crate) fn handle_continue_worker_result_stream(
-    stream: &mut TcpStream,
+    stream: &mut dyn Write,
     request: &Request,
 ) -> Result<(), String> {
     let form = parse_form(&request.body);
@@ -155,7 +155,7 @@ pub(crate) fn handle_continue_worker_result_stream(
 }
 
 pub(crate) fn handle_resume_checks_stream(
-    stream: &mut TcpStream,
+    stream: &mut dyn Write,
     request: &Request,
 ) -> Result<(), String> {
     let form = parse_form(&request.body);
@@ -166,7 +166,7 @@ pub(crate) fn handle_resume_checks_stream(
 }
 
 pub(crate) fn handle_resume_plan_stream(
-    stream: &mut TcpStream,
+    stream: &mut dyn Write,
     request: &Request,
 ) -> Result<(), String> {
     let form = parse_form(&request.body);
@@ -179,7 +179,7 @@ pub(crate) fn handle_resume_plan_stream(
 /// Spec 94: the worker prompt for a turn paused on its plan review, built
 /// from the plan as the card has it. Read-only; the pause is untouched.
 pub(crate) fn handle_plan_worker_prompt(
-    stream: &mut TcpStream,
+    stream: &mut dyn Write,
     request: &Request,
 ) -> Result<(), String> {
     let form = parse_form(&request.body);
@@ -205,7 +205,7 @@ pub(crate) fn handle_plan_worker_prompt(
 
 /// Spec 94: ends the paused turn once the worker it was handed to started.
 pub(crate) fn handle_plan_to_worker(
-    stream: &mut TcpStream,
+    stream: &mut dyn Write,
     request: &Request,
 ) -> Result<(), String> {
     let form = parse_form(&request.body);
@@ -227,7 +227,7 @@ pub(crate) fn handle_plan_to_worker(
 }
 
 pub(crate) fn handle_resume_context_stream(
-    stream: &mut TcpStream,
+    stream: &mut dyn Write,
     request: &Request,
 ) -> Result<(), String> {
     let form = parse_form(&request.body);
@@ -238,7 +238,7 @@ pub(crate) fn handle_resume_context_stream(
 }
 
 pub(crate) fn handle_answer_question_stream(
-    stream: &mut TcpStream,
+    stream: &mut dyn Write,
     request: &Request,
 ) -> Result<(), String> {
     let form = parse_form(&request.body);
@@ -249,7 +249,7 @@ pub(crate) fn handle_answer_question_stream(
 }
 
 pub(crate) fn handle_resume_fallback_stream(
-    stream: &mut TcpStream,
+    stream: &mut dyn Write,
     request: &Request,
 ) -> Result<(), String> {
     let form = parse_form(&request.body);
@@ -260,7 +260,7 @@ pub(crate) fn handle_resume_fallback_stream(
 }
 
 pub(crate) fn handle_resume_round_budget_stream(
-    stream: &mut TcpStream,
+    stream: &mut dyn Write,
     request: &Request,
 ) -> Result<(), String> {
     let form = parse_form(&request.body);

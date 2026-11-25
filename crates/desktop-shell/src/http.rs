@@ -174,7 +174,7 @@ pub(crate) fn index_html() -> String {
 }
 
 pub(crate) fn write_response(
-    stream: &mut TcpStream,
+    stream: &mut dyn Write,
     request: &Request,
     status: u16,
     content_type: &str,
@@ -184,7 +184,7 @@ pub(crate) fn write_response(
 }
 
 pub(crate) fn write_basic_response(
-    stream: &mut TcpStream,
+    stream: &mut dyn Write,
     status: u16,
     content_type: &str,
     body: &str,
@@ -200,7 +200,7 @@ pub(crate) fn write_basic_response(
 }
 
 pub(crate) fn write_binary_response(
-    stream: &mut TcpStream,
+    stream: &mut dyn Write,
     request: &Request,
     status: u16,
     content_type: &str,
@@ -219,7 +219,7 @@ pub(crate) fn write_binary_response(
 }
 
 pub(crate) fn write_preflight_response(
-    stream: &mut TcpStream,
+    stream: &mut dyn Write,
     request: &Request,
 ) -> Result<(), String> {
     if allowed_cors_origin(request).is_none() {
@@ -235,7 +235,7 @@ pub(crate) fn write_preflight_response(
 }
 
 pub(crate) fn write_response_with_extra_headers(
-    stream: &mut TcpStream,
+    stream: &mut dyn Write,
     request: &Request,
     status: u16,
     content_type: &str,
@@ -254,7 +254,7 @@ pub(crate) fn write_response_with_extra_headers(
 }
 
 pub(crate) fn write_event_stream_headers(
-    stream: &mut TcpStream,
+    stream: &mut dyn Write,
     request: &Request,
 ) -> Result<(), String> {
     let cors_headers = cors_headers(request);
@@ -317,7 +317,7 @@ pub(crate) fn generate_api_token() -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-pub(crate) fn write_sse_event<W: Write>(
+pub(crate) fn write_sse_event<W: Write + ?Sized>(
     out: &mut W,
     event: &str,
     data: &str,

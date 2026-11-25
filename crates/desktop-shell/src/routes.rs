@@ -373,11 +373,11 @@ pub(crate) fn route_for(method: &str, path: &str) -> Option<Route> {
 /// any session is doing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RouteClass {
-    /// `None` when the request does not name its session: the first message
-    /// of a new session (which claims the new session's lane as soon as its id
-    /// exists), or a request that names only a patch, batch, checkpoint or
-    /// command proposal. Spec 110 Task 1b resolves those to a session, because
-    /// it must route each to that session's host.
+    /// `None` when no session can be found for the request: the first
+    /// message of a new session (which claims the new session's lane as soon
+    /// as its id exists), or work whose record names none. A request that
+    /// names only a paused turn, a patch or a checkpoint is resolved to that
+    /// record's session (Task 1b), so it goes to that session's host.
     SessionWork(Option<String>),
     Ui,
 }
@@ -531,6 +531,25 @@ impl Route {
         }
     }
 
+    /// Whether this session work runs in the session's host process when
+    /// hosting is on (spec 110 Task 1b). The few exceptions act on state only
+    /// the shell process holds, and run there under the session's lane:
+    /// starting a worker (the shell's supervisor holds every worker's
+    /// lifeline, spec 57) and recovery decisions (the launch sweep's snapshot
+    /// lives in the shell).
+    pub(crate) fn runs_in_session_host(self) -> bool {
+        // Derived from the exhaustive `is_session_work`, so a new session-work
+        // route runs in its session's host unless it is added here.
+        self.is_session_work()
+            && !matches!(
+                self,
+                Route::StartWorker
+                    | Route::PlanToWorker
+                    | Route::RecoveryDecision
+                    | Route::RecoveryApprovalResolved
+            )
+    }
+
     /// What the sidebar and a refusal call this work until the turn says more.
     pub(crate) fn work_label(self) -> &'static str {
         match self {
@@ -622,6 +641,22 @@ mod tests {
         // `/api/workers` is listed for its POST only; the GET lists workers.
         assert!(!Route::ListWorkers.is_session_work());
         assert_eq!(session_work, expected);
+        // Every session-work route but the four that act on shell-only state
+        // runs in the session's host; no UI route ever does.
+        for (_, path, route) in ROUTES {
+            let shell_only = matches!(
+                route,
+                Route::StartWorker
+                    | Route::PlanToWorker
+                    | Route::RecoveryDecision
+                    | Route::RecoveryApprovalResolved
+            );
+            assert_eq!(
+                route.runs_in_session_host(),
+                route.is_session_work() && !shell_only,
+                "{path}"
+            );
+        }
         for ui in [
             "/api/sessions",
             "/api/session",

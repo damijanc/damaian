@@ -39,7 +39,7 @@ pub(crate) enum TurnEvent {
 /// Runs on the thread that owns the socket while the turn itself runs on a
 /// worker, because the turn spends most of its time blocked on the provider and
 /// could not otherwise notice a disconnect.
-pub(crate) fn relay_turn_events<W: Write>(
+pub(crate) fn relay_turn_events<W: Write + ?Sized>(
     out: &mut W,
     cancel: &CancelToken,
     notes: Option<&std::sync::Arc<lanes::NoteQueue>>,
@@ -146,7 +146,7 @@ pub(crate) fn relay_turn_events<W: Write>(
 }
 
 /// Runs `turn` on a worker thread and relays its events to `stream`.
-pub(crate) fn stream_turn<F>(stream: &mut TcpStream, turn: F) -> Result<(), String>
+pub(crate) fn stream_turn<F>(stream: &mut dyn Write, turn: F) -> Result<(), String>
 where
     F: FnOnce(&CancelToken, &std::sync::mpsc::Sender<TurnEvent>) -> Result<ChatTurnResult, String>
         + Send

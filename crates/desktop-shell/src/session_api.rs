@@ -4,7 +4,7 @@
 use super::*;
 
 pub(crate) fn handle_session_export(
-    stream: &mut TcpStream,
+    stream: &mut dyn Write,
     request: &Request,
 ) -> Result<(), String> {
     let session_id = required_param(request, "session_id")?;
@@ -31,14 +31,14 @@ pub(crate) fn handle_session_export(
     write_response_with_extra_headers(stream, request, 200, content_type, &content, &disposition)
 }
 
-pub(crate) fn handle_recovery(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+pub(crate) fn handle_recovery(stream: &mut dyn Write, request: &Request) -> Result<(), String> {
     let payload = recovery::sweep_json()?;
     write_response(stream, request, 200, "application/json", &payload)
 }
 
 /// The pending card of one waiting task, read without side effects, so a
 /// reload can redraw a decision raised while the app runs.
-pub(crate) fn handle_pending_card(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+pub(crate) fn handle_pending_card(stream: &mut dyn Write, request: &Request) -> Result<(), String> {
     let session_id = required_param(request, "session_id")?;
     let task_id = required_param(request, "task_id")?;
     let payload = recovery::pending_card_json(&session_id, &task_id)?;
@@ -46,7 +46,7 @@ pub(crate) fn handle_pending_card(stream: &mut TcpStream, request: &Request) -> 
 }
 
 pub(crate) fn handle_recovery_decision(
-    stream: &mut TcpStream,
+    stream: &mut dyn Write,
     request: &Request,
 ) -> Result<(), String> {
     let form = parse_form(&request.body);
@@ -55,7 +55,7 @@ pub(crate) fn handle_recovery_decision(
 }
 
 pub(crate) fn handle_recovery_approval_resolved(
-    stream: &mut TcpStream,
+    stream: &mut dyn Write,
     request: &Request,
 ) -> Result<(), String> {
     let form = parse_form(&request.body);
@@ -63,7 +63,7 @@ pub(crate) fn handle_recovery_approval_resolved(
     write_response(stream, request, 200, "application/json", &payload)
 }
 
-pub(crate) fn handle_session(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+pub(crate) fn handle_session(stream: &mut dyn Write, request: &Request) -> Result<(), String> {
     let session_id = required_param(request, "session_id")?;
     let engine = default_engine()?;
     let Some(session) = engine
@@ -325,7 +325,7 @@ pub(crate) fn conversation_json(engine: &WorkspaceEngine, session_id: &str) -> S
 ///
 /// It takes no approval and touches no file. The engine appends one event or
 /// nothing; the response says which, so the UI can report it.
-pub(crate) fn handle_compact(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+pub(crate) fn handle_compact(stream: &mut dyn Write, request: &Request) -> Result<(), String> {
     let form = parse_form(&request.body);
     let repo = required_form(&form, "repo")?;
     let session_id = required_form(&form, "session_id")?;
@@ -413,7 +413,7 @@ pub(crate) fn compact_session(
 }
 
 pub(crate) fn handle_session_rename(
-    stream: &mut TcpStream,
+    stream: &mut dyn Write,
     request: &Request,
 ) -> Result<(), String> {
     let form = parse_form(&request.body);
@@ -434,7 +434,7 @@ pub(crate) fn handle_session_rename(
     )
 }
 
-pub(crate) fn handle_session_mode(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+pub(crate) fn handle_session_mode(stream: &mut dyn Write, request: &Request) -> Result<(), String> {
     let form = parse_form(&request.body);
     let session_id = required_form(&form, "session_id")?;
     let requested = required_form(&form, "mode")?;
@@ -479,7 +479,7 @@ pub(crate) fn handle_session_mode(stream: &mut TcpStream, request: &Request) -> 
 ///
 /// `action` is required and unknown values are refused rather than defaulted:
 /// a typo must not turn into a clear.
-pub(crate) fn handle_context_pin(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+pub(crate) fn handle_context_pin(stream: &mut dyn Write, request: &Request) -> Result<(), String> {
     let form = parse_form(&request.body);
     let session_id = required_form(&form, "session_id")?;
     let action = required_form(&form, "action")?;
@@ -565,7 +565,7 @@ fn parse_context_range(form: &HashMap<String, String>) -> Result<Option<LineRang
 
 /// Sets or clears the session's path restriction (spec 27 §5.4).
 pub(crate) fn handle_context_restriction(
-    stream: &mut TcpStream,
+    stream: &mut dyn Write,
     request: &Request,
 ) -> Result<(), String> {
     let form = parse_form(&request.body);
@@ -619,7 +619,7 @@ pub(crate) fn handle_context_restriction(
 
 /// Removes one optional item from a paused review (spec 27 §5.4).
 pub(crate) fn handle_context_remove(
-    stream: &mut TcpStream,
+    stream: &mut dyn Write,
     request: &Request,
 ) -> Result<(), String> {
     let form = parse_form(&request.body);
@@ -646,7 +646,7 @@ pub(crate) fn handle_context_remove(
 
 /// Removes the conversation summary from a paused review (spec 27 §5.4).
 pub(crate) fn handle_context_remove_summary(
-    stream: &mut TcpStream,
+    stream: &mut dyn Write,
     request: &Request,
 ) -> Result<(), String> {
     let form = parse_form(&request.body);
@@ -676,7 +676,7 @@ pub(crate) fn handle_context_remove_summary(
 /// A client cannot send a statement, and an id from another project resolves to
 /// `deleted` rather than exposing it.
 pub(crate) fn handle_context_memory(
-    stream: &mut TcpStream,
+    stream: &mut dyn Write,
     request: &Request,
 ) -> Result<(), String> {
     let form = parse_form(&request.body);
@@ -709,7 +709,7 @@ pub(crate) fn handle_context_memory(
 /// with a worker this shell started (`workers.rs`), and every one but
 /// `GET /api/workers` and `GET /api/workers-enabled` refuses while
 /// `enable_worker_sessions` is off.
-pub(crate) fn handle_worker_route(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+pub(crate) fn handle_worker_route(stream: &mut dyn Write, request: &Request) -> Result<(), String> {
     let config = Config::load_for_repository(None).map_err(|error| error.to_string())?;
     let form = parse_form(&request.body);
     let answer = workers::route(
@@ -737,7 +737,7 @@ pub(crate) fn handle_worker_route(stream: &mut TcpStream, request: &Request) -> 
 
 /// `POST /api/session-archive` and `/api/session-unarchive` (spec 108 D3).
 pub(crate) fn handle_session_archive(
-    stream: &mut TcpStream,
+    stream: &mut dyn Write,
     request: &Request,
     archive: bool,
 ) -> Result<(), String> {
@@ -750,6 +750,10 @@ pub(crate) fn handle_session_archive(
     // Only the supervisor knows whether a worker's process is still alive.
     let worker_running = archive && workers::global().is_alive(&session_id);
     let (status, body) = session_archive_answer(&engine, &session_id, archive, worker_running);
+    if archive && status == 200 {
+        // An archived session works no more: its idle host ends (spec 110).
+        session_hosts::shutdown_session_host(&session_id);
+    }
     write_response(stream, request, status, "application/json", &body)
 }
 
@@ -759,7 +763,7 @@ pub(crate) fn handle_session_archive(
 /// engine checks it qualifies under the repository's config; the client then
 /// approves the card as usual, and that run is the first one it covers.
 pub(crate) fn handle_command_session_approval(
-    stream: &mut TcpStream,
+    stream: &mut dyn Write,
     request: &Request,
 ) -> Result<(), String> {
     let form = parse_form(&request.body);
@@ -792,7 +796,7 @@ pub(crate) fn handle_command_session_approval(
 /// `POST /api/session-approvals-revoke` (spec 109 D5): **Revoke session
 /// approvals** from the session ⋮ menu. Answers how many it ended.
 pub(crate) fn handle_session_approvals_revoke(
-    stream: &mut TcpStream,
+    stream: &mut dyn Write,
     request: &Request,
 ) -> Result<(), String> {
     let form = parse_form(&request.body);
@@ -841,7 +845,7 @@ fn working_session_ids() -> std::collections::HashSet<String> {
 }
 
 pub(crate) fn handle_working_sessions(
-    stream: &mut TcpStream,
+    stream: &mut dyn Write,
     request: &Request,
 ) -> Result<(), String> {
     let sessions = lanes::working()
@@ -869,7 +873,7 @@ pub(crate) fn handle_working_sessions(
 /// does. A UI route, so it is answered while that work runs. It never resolves
 /// an approval: a turn paused for one is not running and holds no lane.
 pub(crate) fn handle_cancel_session_work(
-    stream: &mut TcpStream,
+    stream: &mut dyn Write,
     request: &Request,
 ) -> Result<(), String> {
     let form = parse_form(&request.body);
@@ -894,7 +898,7 @@ pub(crate) fn handle_cancel_session_work(
 /// answered while that turn runs. It only ever enters a running turn: a turn
 /// paused for an approval or a question is not running, and gets
 /// `not_working` here, so a note can never answer or approve anything.
-pub(crate) fn handle_session_note(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+pub(crate) fn handle_session_note(stream: &mut dyn Write, request: &Request) -> Result<(), String> {
     let form = parse_form(&request.body);
     let session_id = required_form(&form, "session_id")?;
     let text = form.get("text").map(|text| text.trim()).unwrap_or_default();
@@ -958,7 +962,7 @@ pub(crate) fn session_archive_answer(
 }
 
 pub(crate) fn handle_session_delete(
-    stream: &mut TcpStream,
+    stream: &mut dyn Write,
     request: &Request,
 ) -> Result<(), String> {
     let form = parse_form(&request.body);
@@ -981,6 +985,7 @@ pub(crate) fn handle_session_delete(
     engine
         .delete_session(&session_id, &repo)
         .map_err(|error| error.to_string())?;
+    session_hosts::shutdown_session_host(&session_id);
     write_response(
         stream,
         request,
@@ -993,7 +998,7 @@ pub(crate) fn handle_session_delete(
     )
 }
 
-pub(crate) fn handle_sessions(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+pub(crate) fn handle_sessions(stream: &mut dyn Write, request: &Request) -> Result<(), String> {
     let repo = required_param(request, "repo")?;
     let engine = engine_for_repo(&repo)?;
     let repository_id = engine
@@ -1024,7 +1029,7 @@ pub(crate) fn handle_sessions(stream: &mut TcpStream, request: &Request) -> Resu
 }
 
 pub(crate) fn handle_session_search(
-    stream: &mut TcpStream,
+    stream: &mut dyn Write,
     request: &Request,
 ) -> Result<(), String> {
     let query = required_param(request, "query")?;
@@ -1067,7 +1072,7 @@ pub(crate) fn handle_session_search(
     )
 }
 
-pub(crate) fn handle_checkpoints(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+pub(crate) fn handle_checkpoints(stream: &mut dyn Write, request: &Request) -> Result<(), String> {
     let repo = required_param(request, "repo")?;
     let engine = engine_for_repo(&repo)?;
     let repository_id = engine
@@ -1090,7 +1095,7 @@ pub(crate) fn handle_checkpoints(stream: &mut TcpStream, request: &Request) -> R
     )
 }
 
-pub(crate) fn handle_rewind(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+pub(crate) fn handle_rewind(stream: &mut dyn Write, request: &Request) -> Result<(), String> {
     let form = parse_form(&request.body);
     let repo = required_form(&form, "repo")?;
     let checkpoint_id = required_form(&form, "checkpoint_id")?;
@@ -1136,7 +1141,7 @@ pub(crate) fn handle_rewind(stream: &mut TcpStream, request: &Request) -> Result
 }
 
 pub(crate) fn handle_session_create(
-    stream: &mut TcpStream,
+    stream: &mut dyn Write,
     request: &Request,
 ) -> Result<(), String> {
     let form = parse_form(&request.body);
@@ -1165,7 +1170,7 @@ pub(crate) fn handle_session_create(
     )
 }
 
-pub(crate) fn handle_context_file(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+pub(crate) fn handle_context_file(stream: &mut dyn Write, request: &Request) -> Result<(), String> {
     let form = parse_form(&request.body);
     let repo = required_form(&form, "repo")?;
     let path = required_form(&form, "path")?;

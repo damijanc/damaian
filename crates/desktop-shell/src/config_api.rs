@@ -3,7 +3,7 @@
 
 use super::*;
 
-pub(crate) fn handle_config(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+pub(crate) fn handle_config(stream: &mut dyn Write, request: &Request) -> Result<(), String> {
     let repo = request.param("repo");
     let config = Config::load_for_repository(repo.as_deref().map(Path::new))
         .map_err(|error| error.to_string())?;
@@ -25,7 +25,7 @@ pub(crate) fn handle_config(stream: &mut TcpStream, request: &Request) -> Result
 /// the editor asks rather than showing "Automatic" with no value. No models
 /// asks for the provider's own default.
 pub(crate) fn handle_provider_token_defaults(
-    stream: &mut TcpStream,
+    stream: &mut dyn Write,
     request: &Request,
 ) -> Result<(), String> {
     let requested = request.param("provider").unwrap_or_default();
@@ -70,7 +70,7 @@ pub(crate) fn handle_provider_token_defaults(
 }
 
 pub(crate) fn handle_get_config_file(
-    stream: &mut TcpStream,
+    stream: &mut dyn Write,
     request: &Request,
 ) -> Result<(), String> {
     let scope = request.param("scope");
@@ -99,7 +99,7 @@ pub(crate) fn handle_get_config_file(
 }
 
 pub(crate) fn handle_model_key_status(
-    stream: &mut TcpStream,
+    stream: &mut dyn Write,
     request: &Request,
 ) -> Result<(), String> {
     let repo = request.param("repo").unwrap_or_default();
@@ -114,7 +114,7 @@ pub(crate) fn handle_model_key_status(
 }
 
 pub(crate) fn handle_repository_config_review(
-    stream: &mut TcpStream,
+    stream: &mut dyn Write,
     request: &Request,
 ) -> Result<(), String> {
     let repo = request.param("repo").unwrap_or_default();
@@ -128,7 +128,7 @@ pub(crate) fn handle_repository_config_review(
 }
 
 pub(crate) fn handle_repository_config_allowlist(
-    stream: &mut TcpStream,
+    stream: &mut dyn Write,
     request: &Request,
 ) -> Result<(), String> {
     let form = parse_form(&request.body);
@@ -169,7 +169,7 @@ fn hooks_json(repo: &str) -> Result<String, String> {
     .map_err(|error| error.to_string())
 }
 
-pub(crate) fn handle_hooks(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+pub(crate) fn handle_hooks(stream: &mut dyn Write, request: &Request) -> Result<(), String> {
     let repo = request.param("repo").unwrap_or_default();
     write_response(
         stream,
@@ -180,7 +180,7 @@ pub(crate) fn handle_hooks(stream: &mut TcpStream, request: &Request) -> Result<
     )
 }
 
-pub(crate) fn handle_hook_review(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+pub(crate) fn handle_hook_review(stream: &mut dyn Write, request: &Request) -> Result<(), String> {
     let form = parse_form(&request.body);
     let repo = required_form(&form, "repo")?;
     let hook = required_form(&form, "hook")?;
@@ -213,7 +213,7 @@ pub(crate) fn handle_hook_review(stream: &mut TcpStream, request: &Request) -> R
     )
 }
 
-pub(crate) fn handle_hook_enabled(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+pub(crate) fn handle_hook_enabled(stream: &mut dyn Write, request: &Request) -> Result<(), String> {
     let form = parse_form(&request.body);
     let repo = required_form(&form, "repo")?;
     let hook = required_form(&form, "hook")?;
@@ -238,7 +238,7 @@ pub(crate) fn handle_hook_enabled(stream: &mut TcpStream, request: &Request) -> 
     )
 }
 
-pub(crate) fn handle_hook_test(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+pub(crate) fn handle_hook_test(stream: &mut dyn Write, request: &Request) -> Result<(), String> {
     let form = parse_form(&request.body);
     let repo = required_form(&form, "repo")?;
     let hook_id = required_form(&form, "hook")?;
@@ -269,7 +269,7 @@ pub(crate) fn handle_hook_test(stream: &mut TcpStream, request: &Request) -> Res
     )
 }
 
-pub(crate) fn handle_config_set(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+pub(crate) fn handle_config_set(stream: &mut dyn Write, request: &Request) -> Result<(), String> {
     let form = parse_form(&request.body);
     let scope = form.get("scope").map(String::as_str);
     let key = required_form(&form, "key")?;
@@ -286,7 +286,7 @@ pub(crate) fn handle_config_set(stream: &mut TcpStream, request: &Request) -> Re
 }
 
 pub(crate) fn handle_post_config_file(
-    stream: &mut TcpStream,
+    stream: &mut dyn Write,
     request: &Request,
 ) -> Result<(), String> {
     let form = parse_form(&request.body);
@@ -310,7 +310,7 @@ pub(crate) fn handle_post_config_file(
     )
 }
 
-pub(crate) fn handle_model_key(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+pub(crate) fn handle_model_key(stream: &mut dyn Write, request: &Request) -> Result<(), String> {
     let form = parse_form(&request.body);
     let scope = form.get("scope").map(String::as_str);
     let repo = form.get("repo").cloned().unwrap_or_default();
@@ -338,7 +338,7 @@ pub(crate) fn handle_model_key(stream: &mut TcpStream, request: &Request) -> Res
     )
 }
 
-pub(crate) fn handle_provider_key(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+pub(crate) fn handle_provider_key(stream: &mut dyn Write, request: &Request) -> Result<(), String> {
     let form = parse_form(&request.body);
     let account = required_form(&form, "account")?;
     let api_key = required_form(&form, "api_key")?;
@@ -359,7 +359,7 @@ pub(crate) fn handle_provider_key(stream: &mut TcpStream, request: &Request) -> 
 }
 
 pub(crate) fn handle_model_key_delete(
-    stream: &mut TcpStream,
+    stream: &mut dyn Write,
     request: &Request,
 ) -> Result<(), String> {
     let form = parse_form(&request.body);
@@ -379,7 +379,7 @@ pub(crate) fn handle_model_key_delete(
     )
 }
 
-pub(crate) fn handle_mcp_test(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+pub(crate) fn handle_mcp_test(stream: &mut dyn Write, request: &Request) -> Result<(), String> {
     let form = parse_form(&request.body);
     let config = Config::load_for_repository(None).map_err(|error| error.to_string())?;
     let body = match mcp_test_connection(&form, &config.data_dir) {
@@ -427,7 +427,7 @@ pub(crate) fn effective_policy_for_repo(repo: &str) -> (String, String) {
 /// Settings › General draws as a table. With a session, the header shows the
 /// profile intersected with that session's mode (proposal §5.6).
 pub(crate) fn handle_effective_policy(
-    stream: &mut TcpStream,
+    stream: &mut dyn Write,
     request: &Request,
 ) -> Result<(), String> {
     let repo = request.param("repo").unwrap_or_default();
@@ -441,7 +441,7 @@ pub(crate) fn handle_effective_policy(
 /// file has gone missing can still be switched away from it (spec 31 Task 3,
 /// deviation 2).
 pub(crate) fn handle_permission_profile(
-    stream: &mut TcpStream,
+    stream: &mut dyn Write,
     request: &Request,
 ) -> Result<(), String> {
     let form = parse_form(&request.body);
@@ -463,7 +463,7 @@ pub(crate) fn handle_permission_profile(
 /// `GET /api/permission-profiles`: the custom profiles the picker offers
 /// beside the built-ins (spec 31 Task 7, deviation 4).
 pub(crate) fn handle_permission_profiles(
-    stream: &mut TcpStream,
+    stream: &mut dyn Write,
     request: &Request,
 ) -> Result<(), String> {
     let config = Config::load_for_repository(None).map_err(|error| error.to_string())?;
@@ -479,7 +479,7 @@ pub(crate) fn handle_permission_profiles(
 /// `GET /api/permission-profile-export?profile=<id>`: the profile as a file
 /// someone can share, carrying only profile keys (spec 31, `context.md` §9).
 pub(crate) fn handle_permission_profile_export(
-    stream: &mut TcpStream,
+    stream: &mut dyn Write,
     request: &Request,
 ) -> Result<(), String> {
     let requested = request.param("profile").unwrap_or_default();
@@ -496,7 +496,7 @@ pub(crate) fn handle_permission_profile_export(
 /// (`context.md` §9). The import writes a profile file, never user config,
 /// so the editor's copy of `user.conf` cannot go stale (Task 7, deviation 6).
 pub(crate) fn handle_permission_profile_import(
-    stream: &mut TcpStream,
+    stream: &mut dyn Write,
     request: &Request,
 ) -> Result<(), String> {
     let form = parse_form(&request.body);
@@ -566,6 +566,14 @@ pub(crate) fn resolve_model_api_key(reference: &str) -> Result<String, String> {
         if let Some(api_key) = cached_model_api_key(account) {
             return Ok(api_key);
         }
+        // A session host has only the keys the shell handed it (spec 110
+        // D1a); the shell sends none it could not read, so this is the
+        // shell's own refusal.
+        if crate::session_host::keys_from_shell_only() {
+            return Err(format!(
+                "Keychain API key '{account}' is required. Open Settings and save the model API key."
+            ));
+        }
         let api_key = keychain::read_password(account).map_err(|error| {
             format!(
                 "Keychain API key '{}' is required. Open Settings and save the model API key. {error}",
@@ -619,6 +627,9 @@ pub(crate) fn resolve_mcp_token(reference: &str) -> Option<String> {
     if let Some(account) = keychain::account_from_reference(reference) {
         if let Some(token) = cached_model_api_key(account) {
             return Some(token);
+        }
+        if crate::session_host::keys_from_shell_only() {
+            return None;
         }
         if let Ok(token) = keychain::read_password(account) {
             remember_model_api_key(account, &token);
@@ -968,7 +979,7 @@ fn apply_model_form_options(
 /// own list, which Settings edits; `effective` is what applies after the
 /// repository's config narrowed it, if it did.
 pub(crate) fn handle_project_checks(
-    stream: &mut TcpStream,
+    stream: &mut dyn Write,
     request: &Request,
 ) -> Result<(), String> {
     let repo = required_param(request, "repo")?;
@@ -983,7 +994,7 @@ pub(crate) fn handle_project_checks(
 /// command; a `|` would split it into two, so it is refused rather than
 /// silently changing what was typed.
 pub(crate) fn handle_project_checks_set(
-    stream: &mut TcpStream,
+    stream: &mut dyn Write,
     request: &Request,
 ) -> Result<(), String> {
     let form = parse_form(&request.body);
@@ -1067,7 +1078,7 @@ fn project_checks_json(repo: &str) -> Result<String, String> {
 /// repository the old keys cannot be read as rules (D10), so only the
 /// `command_rule` lines are listed.
 pub(crate) fn handle_command_rules(
-    stream: &mut TcpStream,
+    stream: &mut dyn Write,
     request: &Request,
 ) -> Result<(), String> {
     let repo = request.param("repo").unwrap_or_default();
@@ -1086,7 +1097,7 @@ pub(crate) fn handle_command_rules(
 /// Always allow, or an edit by hand) is refused rather than overwritten, and
 /// so is any line the rule parser refuses, naming its position.
 pub(crate) fn handle_command_rules_set(
-    stream: &mut TcpStream,
+    stream: &mut dyn Write,
     request: &Request,
 ) -> Result<(), String> {
     let form = parse_form(&request.body);

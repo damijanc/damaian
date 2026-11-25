@@ -6,7 +6,7 @@ use super::*;
 /// `GET /api/findings`. Every findings route takes `repo`, because staleness
 /// is derived against the repository's files, and refuses a session from
 /// another repository (spec 22 `context.md` §16).
-pub(crate) fn handle_findings(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+pub(crate) fn handle_findings(stream: &mut dyn Write, request: &Request) -> Result<(), String> {
     let repo = required_param(request, "repo")?;
     let session_id = required_param(request, "session_id")?;
     let engine = engine_for_repo(&repo)?;
@@ -24,7 +24,7 @@ pub(crate) fn handle_findings(stream: &mut TcpStream, request: &Request) -> Resu
 /// `POST /api/finding-status`, answered with the refreshed findings so the
 /// panel redraws from what was stored.
 pub(crate) fn handle_finding_status(
-    stream: &mut TcpStream,
+    stream: &mut dyn Write,
     request: &Request,
 ) -> Result<(), String> {
     let form = parse_form(&request.body);
@@ -50,7 +50,7 @@ pub(crate) fn handle_finding_status(
 /// `POST /api/findings-repair`. Marks nothing: it returns the request and its
 /// rendered prompt, or `null` when nothing is left to repair (§15, §16).
 pub(crate) fn handle_findings_repair(
-    stream: &mut TcpStream,
+    stream: &mut dyn Write,
     request: &Request,
 ) -> Result<(), String> {
     let form = parse_form(&request.body);
@@ -89,7 +89,7 @@ pub(crate) fn handle_findings_repair(
 /// got it (spec 24 Task 8). Shaped like `damaian repo-map --json`, so the UI
 /// and the CLI read the same JSON.
 pub(crate) fn handle_repository_map(
-    stream: &mut TcpStream,
+    stream: &mut dyn Write,
     request: &Request,
 ) -> Result<(), String> {
     let repo = required_param(request, "repo")?;
@@ -113,7 +113,7 @@ pub(crate) fn handle_repository_map(
 /// is not a usable directory, or lies outside `allowed_roots`, is refused, so
 /// an override is only ever written inside a repository the user may open.
 pub(crate) fn handle_repository_roots(
-    stream: &mut TcpStream,
+    stream: &mut dyn Write,
     request: &Request,
 ) -> Result<(), String> {
     let form = parse_form(&request.body);
@@ -160,7 +160,7 @@ const SYMBOL_SEARCH_LIMIT: usize = 50;
 /// `GET /api/symbols?repo=&q=`: the repository's symbol lookup, each match
 /// carrying its `Symbol`, match quality and `provenance`. A heuristic match is
 /// labelled as one by the payload, so the UI never has to infer it.
-pub(crate) fn handle_symbols(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+pub(crate) fn handle_symbols(stream: &mut dyn Write, request: &Request) -> Result<(), String> {
     let repo = required_param(request, "repo")?;
     let query = required_param(request, "q")?;
     let engine = engine_for_repo(&repo)?;
@@ -179,7 +179,7 @@ pub(crate) fn handle_symbols(stream: &mut TcpStream, request: &Request) -> Resul
 /// answer, unchanged, for the UI. `available: false` is a normal answer: the
 /// heuristic tier does not guess references.
 pub(crate) fn handle_symbol_references(
-    stream: &mut TcpStream,
+    stream: &mut dyn Write,
     request: &Request,
 ) -> Result<(), String> {
     let repo = required_param(request, "repo")?;
@@ -223,7 +223,7 @@ pub(crate) fn handle_symbol_references(
 /// the hub's live state once a lookup has started one. Settings can therefore
 /// show a configured server before anything has spawned it.
 pub(crate) fn handle_language_servers(
-    stream: &mut TcpStream,
+    stream: &mut dyn Write,
     request: &Request,
 ) -> Result<(), String> {
     let repo = required_param(request, "repo")?;
@@ -300,7 +300,7 @@ pub(crate) fn repository_config_write_target(
 /// carries neither (spec 24 Task 8); the shell reads them from the
 /// `CommandStore` the proposal was written to instead of changing `chat.rs`.
 pub(crate) fn handle_command_proposal(
-    stream: &mut TcpStream,
+    stream: &mut dyn Write,
     request: &Request,
 ) -> Result<(), String> {
     let repo = required_param(request, "repo")?;

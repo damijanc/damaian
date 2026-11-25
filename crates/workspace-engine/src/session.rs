@@ -2567,6 +2567,14 @@ impl SessionStore {
             && crate::process_registry::live_worker_registered(&self.data_dir, session_id)?)
     }
 
+    /// [`Self::has_live_worker`] widened to spec 110's session hosts: a live
+    /// host process holds the session's work, so its tasks are in flight
+    /// there, not left by a crash. Crash recovery asks this.
+    pub fn has_live_host(&self, session_id: &str) -> Result<bool> {
+        Ok(self.has_live_worker(session_id)?
+            || crate::process_registry::live_session_host_registered(&self.data_dir, session_id)?)
+    }
+
     /// The session's own worker record, or `None` for an ordinary session.
     ///
     /// Reads with `parsed_events`, not `active_events`, for the reason
