@@ -55,6 +55,7 @@ coding agents are in [AGENTS.md](../AGENTS.md).
 | `Refused: …` from a mode, a profile or the command policy | [The assistant was refused](#the-assistant-was-refused-the-session-mode-the-permission-profile-or-the-command-policy) |
 | `Refused by hook …`, or a hook blocked, warned, timed out or did not run | [A hook refused, blocked, or did not run](#a-hook-refused-blocked-or-did-not-run) |
 | A command that used to run unasked now asks | [A command that used to run unasked now asks](#a-command-that-used-to-run-unasked-now-asks) |
+| A command I approved for this session asks again | [A command approved for this session asks again](#a-command-approved-for-this-session-asks-again) |
 | A setting will not stick, or a repository config key has no effect | [Configuration layers](#configuration-layers), [Why a rule is in force](#why-a-rule-is-in-force) |
 | Memory will not save, a project's memory is missing (including a shallow clone), or the store was refused | [Memory](#memory) |
 | A memory was or was not recalled, is marked "may be out of date", or disappeared from recall | [Memory](#memory) |
@@ -1386,11 +1387,15 @@ session events:
 | `verification_due` | a settled Code-mode patch needs verification; names the task and patch |
 | `verification_started` | one attempt, with its number and the selected checks |
 | `verification_check` | one check's outcome, or its skip reason, plus the hash of every changed file when it ran |
-| `verification_baseline` | one check's pre-patch baseline: `passed`, `failed` with a redacted fingerprint, `declined`, or `unavailable` with the environment termination |
+| `verification_build` | one build check after a change, run or reused: its command, root and result; never a check result (spec 109 D10) |
+| `verification_reused` | a check not run because its recorded run covered exactly the current files; the original `verification_check` stays the evidence |
+| `verification_deferred` | a check this run left to its open plan step, with the step |
+| `verification_deferred_to_completion` | a detected or plan check this run left to task completion |
+| `verification_baseline` | one check's failure-time baseline on the task-start files: `passed`, `failed` with a redacted fingerprint, `declined`, or `unavailable` with the reason; `tests` names the tests a narrowed rerun covered (absent: the whole check) |
 | `verification_provenance` | one post-patch classification (`new_regression`, `pre_existing`, `worsened`, `unchanged_failure`, `environment_failure`, `unknown_provenance`) with the redacted evidence and introduced delta |
 | `verification_repair_state` | one repair attempt's comparable state: failure fingerprint, proposed-patch digest and task-diff digest, all hashes or digests rather than content |
 | `verification_repair_stalled` | the terminal no-progress stop, with the same state and the typed reason (`identical_state`, `repeated_failure`, `equivalent_patch`, `unchanged_task_diff`, `oscillation`); the state folds this to the `repair_stalled` outcome |
-| `verification_finished` | the attempt's outcome (`passed`, `nothing_verified` when every check was skipped (spec 78), `failed`, `repair_limit_exhausted`, `no_repair_applied`, `no_checks_available`, `only_documentation_changed`) |
+| `verification_finished` | the attempt's outcome (`passed`, `nothing_verified` when every check was skipped (spec 78) or deferred, `build_failed` when the build check failed and nothing else ran, `failed`, `repair_limit_exhausted`, `no_repair_applied`, `no_checks_available`, `only_documentation_changed`) |
 
 A stall writes only `verification_repair_stalled`, not a `verification_finished`
 event: the one terminal event carries the state and the stop, so replay cannot
@@ -1410,10 +1415,11 @@ including the repository root, runs once when the assistant answers. A patch
 from the one-shot patch flow writes no such event and still runs the full set
 each time.
 
-**A check failed before the patch too.** The report calls it `pre_existing` and
-starts no repair. The pre-apply baseline ran the same check against the reviewed
-bytes and recorded a matching redacted fingerprint. Fix it separately if you
-want it addressed; the task did not cause it.
+**A check failed before the task too.** The report calls it `pre_existing` and
+starts no repair. The baseline ran the same check on the task-start files and
+recorded a matching redacted fingerprint (or, for a narrowed Rust test rerun,
+the same tests failed then). Fix it separately if you want it addressed; the
+task did not cause it.
 
 **A check could not run at all.** A missing executable, a process that could not
 be started, a policy refusal or unavailable test infrastructure is
@@ -1421,21 +1427,85 @@ be started, a policy refusal or unavailable test infrastructure is
 offers **Fix the environment**; no repair turn is sent. The same rule applies to
 a command that exits 127: it is recorded as `missing_executable`.
 
-**The failure is `unknown_provenance`.** No usable baseline exists: you declined
-it, it could not run, or the log predates this feature. The failure can still
-fail completion, but Damaian will not assume the task introduced it and starts no
-repair. A later patch can offer a baseline for that check.
+**The failure is `unknown_provenance`.** No usable baseline exists: you skipped
+or cancelled it, it could not run, the task-start files could not be rebuilt
+exactly, or the log predates this feature. The files cannot be rebuilt when the
+repository is not a Git checkout or has submodules, when a file the task changed
+has no recorded pre-change bytes (a command changed it without checkpoint
+coverage, for example in a working tree over `checkpoint_census_max_paths`), or
+when the recorded bytes no longer match their hash; the audit log's
+`verification_baseline_unavailable` names which. In those cases no baseline
+command runs at all. The failure can still fail completion, but Damaian will not
+assume the task introduced it and starts no repair.
 
-**The baseline card appeared before the patch.** Running a selected check against
-the pre-patch files is its own ordinary command decision. Approving the patch
-does not approve the baseline, and skipping the baseline does not skip the patch.
-If a baseline command changes a tracked file, the reviewed patch is stale and
-must be previewed again. The card is recorded as `verification_baseline_paused`
-and `verification_baseline_resumed` in the audit log. A baseline you stopped with
+**A card asks "A check failed: is the failure new?".** Since spec 109 there is
+no baseline before a patch. A baseline is taken only after a check fails with a
+code result, once per check per task, on a temporary copy of the files as they
+were when the task started (under `baselines/trees/` in the data directory,
+removed when it ends; your checkout and its `.git` are not touched). The card
+is its own command decision, recorded as `verification_baseline_paused` and
+`verification_baseline_resumed` in the audit log. A baseline you stopped with
 **Cancel** writes `verification_baseline_cancelled`, and its checks — the one
 that was running and every approved one not yet started — are recorded as
 `declined` baselines, the same record skipping leaves. That is why a later
-failure in such a check is `unknown_provenance`.
+failure in such a check is `unknown_provenance`. A later failure of the same
+check reuses the first baseline, unless that one ran only some tests and the new
+failure is in others; then a baseline of all of them runs and replaces it.
+
+**The baseline ran only some tests.** For `cargo test` and `cargo nextest run`,
+when every error of the failed run is a named test, the baseline is the check's
+command plus `-- --exact <names>` (nextest also `--no-tests=pass`, so a test the
+task added, which does not exist at task start, reads as passing then). A
+compile error, a doctest, a failure without a test name, or a command that
+already has `--` or shell control characters reruns the whole check. So does a
+narrowed command that would need a card when the whole check would not.
+`verification_baseline`'s `tests` field lists what the narrowed run covered.
+Because the narrowed run never sees a test the patch fixed, "fewer failures than
+at task start" reads `pre_existing`, not `unchanged_failure`; both start no
+repair.
+
+**A Rust baseline is slow the first time.** It builds in a fresh tree, into
+Damaian's own cache at `baselines/cargo-target/<hash>` in the data directory
+rather than your `target/`. The first baseline in a repository compiles
+everything; later ones reuse that cache. Deleting the directory is safe; it is
+rebuilt on the next baseline.
+
+**My own edit during the task counted as task-start state.** A file the task
+never changed is copied into the baseline tree as it is now. If you edited such
+a file yourself mid-task, the baseline sees your edit, so a failure your edit
+caused can read `pre_existing`.
+
+**The verification says "does not build".** The build check (`cargo check
+--tests` on a Cargo root, or the plan step's `build` command) failed, so the
+verification ended `build_failed`: no check and no baseline ran, and the
+compiler's first five errors (with a count of the rest) went to the assistant's
+next request, marked when they are in files the task did not touch. A build
+check is never a passed check; a passing one shows "builds" in the **Build** row
+and does not satisfy any required check. The audit log has
+`verification_build_recorded` (or `verification_build_reused` for an unchanged
+tree).
+
+**A check did not run because it was "reused".** Its earlier run covered
+exactly the current files (same task, same changed files with the same hashes,
+no change since), so its recorded result — passed or failed — stands. The
+report lists it under **Checks reused** and the audit log has
+`verification_check_reused`. Any change to one of the task's files runs it
+again. A stopped, timed-out, signalled or environment-failed run is never
+reused.
+
+**A check was "left to its plan step" or "left to task completion".** With an
+approved plan, only the current step's required check runs after a patch, and it
+stands in for the detected checks of the folder it covers; a finished step's
+check and the detected `cargo test` run once, when the task completes. A run
+that left everything to later ends `nothing_verified` with a summary naming
+where each check went, never `passed`. See [The Plan Panel](USER_GUIDE.md#the-plan-panel).
+
+**The report says no checks were available.** For every root the task touched,
+Damaian found no detected check, the approved plan has no required check
+covering it, and you have no project check for it. Add one in **Settings ›
+General › Project checks** (`project_checks.<repository_id>`), or approve a plan
+that names the repository's own check. A repository's config cannot add a
+project check, only remove one of yours.
 
 **Automatic repair stopped and says `repair stalled`.** This is progress
 detection, not the numeric limit. Two consecutive attempts left the same failure,
@@ -1727,14 +1797,13 @@ turn has ended.
   disabled and reads "Answer the question" — that is deliberate, not a
   frozen app. The plan step reads **waiting for you**. Nothing times out; the
   task waits, across reloads and restarts, until you decide.
-- **It reads "Running baseline: …".** A pre-apply baseline you approved is
-  running the check against the pre-patch files; a workspace `cargo test` can
-  take several minutes. The baseline card shows the check ("(1 of 2)" when
-  several run), its clock, its latest output line and **Cancel**. Cancelling
-  records the baseline as declined and leaves the patch for you to apply or
-  reject; see [Verification](#verification-which-checks-ran-and-why-one-was-skipped).
-  A baseline that needed no approval runs inside **Apply** and shows no progress
-  or Cancel.
+- **It reads "Running baseline: …".** A check failed, and Damaian is running
+  it on the task-start files to tell whether the failure is new; "only the 2
+  failing tests" means a narrowed Rust test rerun. The first Rust baseline in a
+  repository compiles everything into its own cache and can take several
+  minutes. **Stop** (or **Cancel** on the card) ends it and records the baseline
+  as declined, so the failure reads unknown provenance; see
+  [Verification](#verification-which-checks-ran-and-why-one-was-skipped).
 - **There is no status line, and no card above the prompt box.** The turn has
   ended. Its message carries the mark that says how ([A turn stopped
   early](#a-turn-stopped-early-which-budget-ran-out)), or a **Task incomplete**
@@ -1760,8 +1829,8 @@ To confirm from the logs which decision a task is waiting on, read the newest
 `pendingApproval` or `pendingQuestion` link (the `jq` in [Session
 logs](#session-logs) prints it). `/api/session` reports the same decision as the
 task's `turnPresentation.pendingDecision` (`kind`, `label`, `statusLabel`,
-`cardId`); a pending baseline appears there as kind `baseline` on a waiting
-patch.
+`cardId`); a pending baseline appears there as kind `checks`, like a check
+card.
 
 ### A turn stopped early: which budget ran out
 
@@ -3129,6 +3198,36 @@ line of the approval card names the deciding cause — for shell control and
 paths it names the construct or path, and for anything else it names the
 keyword, setting or program that refused it. **Why this command** repeats every
 reason the classifier recorded. This is the boundary working, not a regression.
+
+### A command approved for this session asks again
+
+**Approve for this session** ([user guide](USER_GUIDE.md#approve-for-this-session))
+covers one exact command in one directory in one session. It asks again when:
+
+- **A run it covered changed the repository.** Damaian compares `HEAD` and Git's
+  view of changed and untracked files (with their contents) before and after
+  every covered run; ignored output such as `target/` and Damaian's own data
+  directory do not count. Any difference revokes the approval at once, and the
+  turn names the files that changed. The audit log has
+  `command_session_approval_revoked` with reason `changed_repository` and the
+  paths in `changed`. If the command writes tracked files as a side effect
+  (a snapshot update, a generated file), it cannot keep a session approval;
+  write a rule in **Settings → Commands** if you want it to run unasked.
+- **The repository or a profile turned the option off.** `session_command_approval=false`
+  in any scope stops earlier approvals applying as well as new ones.
+- **The session was archived**, or you chose **Revoke session approvals**
+  (audited with reason `revoked_by_user`). Unarchiving does not restore them.
+- **It is not the same command or directory.** `cargo test` and `cargo test -p
+  engine` are different commands; the same command in `crates/engine` and at the
+  root are different approvals. A new session starts with none.
+- **The command is no longer offered it**: *Ask before every command* is on, a
+  rule of yours now asks about it, or the repository is not a Git checkout.
+
+The build check after each change (`cargo check --tests`) is approved the same
+way on its card, so it asks once per session rather than after every patch.
+Each approval is recorded as `command_session_approved` in the session log and
+`command_approved_for_session` in the audit log; a run it let through has
+`approvedBy=session_approval` on `stored_command_executed`.
 
 ### Reading an approval's cause
 

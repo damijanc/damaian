@@ -1,6 +1,7 @@
 # Feature Spec: Fast Verification
 
-Status: In progress (started 2026-11-11; Tasks 1–6, 8 and 9 done, Task 7 next; Tasks 1–9 in [tasks.md](tasks.md))
+Status: Done 2026-11-25 (started 2026-11-11; Tasks 1–9 in [tasks.md](tasks.md); the live
+measurement of the spec 33 Task 1 shape was not taken, see §4)
 Order: 109 of 109
 Plan: none. Written from the owner's spec 33 Task 1 run on Damaian v0.69.0
 (2026-11-11); the code survey and decisions are in [context.md](context.md).
@@ -132,4 +133,8 @@ check in the same task; and a result for an unchanged tree is already known.
 - On Damaian's own repository, the spec 33 Task 1 shape (one small engine patch)
   costs one scoped check run per patch and one floor run at the end — measured
   and recorded in tasks.md against the 2026-11-11 run.
+  *Open at close-out (2026-11-25):* the live run needs the app and a real model
+  provider and was not taken; the shape is proved by deterministic tests (Task
+  7's progress row names them), and the live numbers are owed on the next spec
+  33 run.
 - `USER_GUIDE.md` and `TROUBLESHOOTING.md` describe the new flow.

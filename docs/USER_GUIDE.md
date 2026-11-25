@@ -1135,7 +1135,32 @@ the completion run may still rerun it so a repair does not leave the check it
 selected earlier stale. Each row of the check card says where its check runs. A
 documentation-only change (`.md`, `.txt`, `.rst`, `.adoc`) selects nothing and
 says so. A Cargo root currently detects one check, `cargo test`; detection finds
-no separate clippy or build command, so the report cannot claim one ran.
+no separate clippy command, so the report cannot claim one ran.
+
+With an approved plan, the plan's checks narrow this further (see [The Plan
+Panel](#the-plan-panel)): after a patch, the required check of the step the
+change belongs to — `cargo nextest run -p workspace-engine --test foundation`,
+say — stands in for the crate's whole `cargo test`, which then runs once, when
+the task completes.
+
+**A build check after every change.** Before any check, each change is compiled
+— compile only, no tests — so a change that does not build is caught at once
+instead of several patches later. The plan names each step's build check; with
+none and a Cargo root, Damaian runs `cargo check --tests` there. Other projects
+without a build check in the plan run none. A build that fails ends that
+verification as **does not build**: the compiler's first errors go straight
+back to the assistant in the same turn (errors in files the task did not touch
+are marked as such), and no check or baseline runs. A build check is feedback
+only: it never counts as a passed check, never satisfies a plan step's
+required check and is shown in the report's own **Build** row ("builds",
+"does not build: 3 errors").
+
+**An unchanged tree is not checked twice.** When a check (or a build check)
+already ran on exactly the files as they are now — the same files, with the
+same contents, and no change since — its recorded result is used instead of
+running it again, passed or failed. The report lists it under **Checks
+reused**. Any change to a file the task touched runs it again. A check that
+was stopped, timed out or could not start is never reused.
 
 **Approval.** Checks that would need approval arrive on **one card**, not one
 prompt each. The boxes start unticked: tick the checks you want to run. The
@@ -1146,37 +1171,63 @@ check never reaches the card and is reported with the policy's reason.
 **Allow Always** stays per check, exact-command, and is qualified with the root
 when the check runs in a sub-root. A session with
 `require_approval_for_all_commands` gets a card even for a check that would
-otherwise run without asking.
+otherwise run without asking. A check or baseline card can be approved
+**For this session** per check, so the same command in the same directory
+does not ask again in this session ([Approve for this
+session](#approve-for-this-session)).
 
-**Baseline before the patch.** Once you approve a patch that selects a check,
-Damaian offers to run that check against the current, pre-patch files before
-anything is written. This is an ordinary command decision on its own card:
-approving the patch does not approve it, and skipping the baseline does not skip
-the patch. The baseline is what lets Damaian tell a failure the patch introduced
-from one that was already there. A check first selected by a later patch is
-baselined before that patch applies. If a baseline command itself changes a
-tracked file, the reviewed patch becomes stale and needs a fresh preview rather
-than applying over bytes you did not see.
+**While a check runs** its card shows which check is running, how long it has
+run and its latest output line, with **Cancel** in place of the run button; the
+status line and the line above the prompt box say the same ("Running cargo
+test (crates/workspace-engine) · 1m 12s") with **Stop**. Stopping a check
+records it as stopped, never as passed.
 
-A baseline can take minutes (a workspace `cargo test`), so once you run it the
-card shows which check is running ("Running baseline: cargo test (crates/a)
-(1 of 2)"), how long it has run, its latest output line, and **Cancel**. The
-status line says the same. **Cancel** stops the running check and records it,
-and every approved check not yet started, as a **declined** baseline — exactly
-what skipping the baselines records — and writes nothing. The patch is left
-undecided: **Apply** or **Reject** it as you choose, as after skipping. A
-failure in a check whose baseline was cancelled is later reported as unknown
-provenance. A baseline that needs no approval runs as part of **Apply** and
-cannot be cancelled from the card.
+**A baseline only when a check fails.** A patch applies without running
+anything first. Only when a check fails after it does Damaian ask whether the
+failure is new: it runs the same check on the files as they were **when the
+task started**, and compares. That run is the *baseline*. It happens once per
+check per task, only for a check that failed with a code result (not one that
+was skipped, stopped or could not start), and is reused for later failures of
+the same check. A passing check never takes a baseline.
+
+The baseline runs in a temporary copy, never in your checkout: a shared clone
+of `HEAD` under Damaian's data directory, with your other uncommitted changes
+copied in as they are now and every file the task changed put back to its
+recorded bytes from before the task. It is removed when the baseline ends,
+however it ends. Rust baselines build into Damaian's own cache
+(`baselines/cargo-target/` in the data directory), never into your `target/`,
+so the second baseline of a repository reuses compiled dependencies. When the
+task-start files cannot be rebuilt exactly (a file changed by a command with no
+checkpoint, a recorded hash that no longer matches, a repository that is not a
+Git checkout, or one with submodules), no baseline runs and the failure is
+reported as unknown provenance. A file the task never changed is taken as it is
+now, so an edit you made yourself during the task counts as task-start state.
+
+**Only the failing tests rerun.** For `cargo test` and `cargo nextest run`, when
+every failure names a test, the baseline reruns just those tests by name
+(`cargo test -- --exact tests::a tests::b`; nextest also gets
+`--no-tests=pass`, because a test the task added does not exist at task
+start). A compile error, a doctest or any other failure reruns the whole check,
+as does every other kind of check.
+
+A baseline that needs approval pauses on a card titled "A check failed: is the
+failure new?", showing the exact command it would run — the narrowed one for a
+Rust test failure. Skipping it writes nothing and leaves the failure's cause
+unknown. **Cancel** while it runs records it as declined. If the narrowed command
+would need a card but the whole check would not (because you allowed `cargo
+test` exactly, say), the whole check runs instead, so narrowing never adds a
+card.
 
 **What a failure is attributed to.** The report keeps six outcomes apart rather
 than calling everything failed:
 
-- **Introduced regression** — the check passed before the patch and fails now.
+- **Introduced regression** — the check passed when the task started and fails
+  now.
   Only this, or the new part of a worsened result, starts a repair.
 - **Worsened** — the check already failed, and the patch added findings to it.
   Only the new findings go to repair.
-- **Pre-existing** — the check fails the same way it did before the patch. No
+- **Pre-existing** — the check fails the same way it did when the task started
+  (or fails only in tests that already failed then). No
   repair turn starts, and the report says to fix it separately if you want it
   addressed.
 - **Unchanged failure** — an earlier attempt already saw this same failure. No
@@ -1185,8 +1236,8 @@ than calling everything failed:
   missing, policy refused it, or the test infrastructure is unavailable. The
   report offers an action to fix the environment and never sends this to code
   repair.
-- **Unknown provenance** — the baseline was declined, could not run, or is
-  absent. The failure can still prevent completion, but Damaian does not assume
+- **Unknown provenance** — the baseline was declined, could not run, the
+  task-start files could not be rebuilt exactly, or it is absent. The failure can still prevent completion, but Damaian does not assume
   the task caused it.
 
 **Repair.** A failing check becomes findings, and the agent may propose a repair
@@ -1218,6 +1269,8 @@ does not offer this action.
 **The report** lists:
 
 - **Files changed** — the paths this task applied.
+- **Build** — the build check: builds, or does not build with its error count.
+  Never counted as a passed check.
 - **Checks passed** — only checks that ran and exited zero. A killed or
   signalled command is never here.
 - **Checks failed** — with the exit code or the browser diagnostic's verdict.
@@ -1225,6 +1278,10 @@ does not offer this action.
 - **Checks stale** — the files a check saw changed after it ran (a rollback, a
   later patch, or an edit outside Damaian). A stale check is not rerun silently
   and is not reported as passed.
+- **Checks reused** — checks whose earlier result on the same files was used
+  instead of a new run.
+- **Checks deferred** — checks this verification did not run on purpose: left
+  to the plan step that runs them, or left to task completion.
 - **Failure provenance** — introduced, worsened, pre-existing, unchanged,
   environment and unknown failures, each in its own group with its own action.
 - **Repair stalled** — when automatic repair stopped for no progress, with the
@@ -1248,12 +1305,28 @@ patch proposed with the one-shot patch flow (no tools) still ends with the
 report and its full completion set, as before.
 
 **"No checks were available" is not "checks passed".** A project with no
-detected checks, or a documentation-only change, says so in its own words. So
-does a verification where you declined every check, or policy blocked them: it
+check Damaian can find, or a documentation-only change, says so in its own
+words. "No checks available" means three things are all missing for the roots
+the task touched: a check Damaian detects, a check in the approved plan that
+covers them, and a project check of yours (below). So does a verification where you declined every check, or policy blocked them: it
 ends as **nothing verified** ("No check ran: 2 checks skipped, so nothing was
 verified"), never as passed. Declining is a named waiver, so it does not block
 the task by itself: the task still completes when everything else is closed, and
 a task with open plan steps still continues.
+
+**Project checks.** For a project whose checks Damaian does not detect — one
+built by a `Makefile`, `stack.yaml` or a script of its own — two things still
+verify it. An approved plan's required checks (the planning prompt asks the
+assistant to take them from the repository's CI files, `Makefile`, `justfile`
+or README) become the completion checks of the folder they cover. And
+**Settings › General › Project checks** holds your own list for the selected
+repository: one command per line, run at the repository root, or
+`<directory>::<command>` to run it in a directory. A project check joins the
+completion checks whenever the task changed a file inside its directory (a
+documentation change does not count); it is not run after every patch. The
+list is saved in your user configuration as `project_checks.<repository_id>`
+(see [CONFIGURATION.md](CONFIGURATION.md)); the repository's own config can
+only remove an entry, never add one.
 
 **Browser checks.** When a changed path is a web asset and the session already
 has a diagnostic target, the loop reruns an inspection at that page under the
@@ -1263,10 +1336,8 @@ check is skipped with `no running target`; it is never inferred as verified.
 Verification runs only in Code mode. Ask, Plan and Review have nothing applied
 to verify. From the command line, `damaian verify <repo> <session>` runs it and
 prints the report; `--decline-checks` answers an approval card with every check
-declined. `damaian apply-patch` offers the same pre-apply baseline decisions
-before it writes: at a terminal it confirms each check, and a non-interactive
-run declines them, which leaves a later failure unknown rather than
-task-caused. At the repair limit, `damaian continue-repair <repo> <session>` is
+declined. `damaian apply-patch` runs no check or baseline before it writes. At
+the repair limit, `damaian continue-repair <repo> <session>` is
 the same one-attempt explicit decision the report card offers. This checks that
 the project's own tests pass — it does not prove the change is correct, and the
 report is written to avoid implying that.
@@ -2071,7 +2142,7 @@ A test, build or lint command such as `cargo test`, `stack test` or `go test ./.
 
 Which commands are offered it does not depend on a list of languages or tools. It follows from why Damaian asks: only a command it asks about because it does not know the program, or because checks ask first, is offered it. A command is never offered it when it chains or redirects (`&&`, `|`, `;`, `>`), may use the network, runs Docker, reaches outside the repository, cannot be analysed (`make $TARGET`), is blocked, is something a rule of yours asks about every time, or is a known writer of files (a formatter without `--check`, anything with `--fix` or `--write`, `rm`, `mv`, `git add`, `sed -i`, …). It is not offered while *Ask before every command* is on, outside a Git checkout, or on a worker's card.
 
-After every run it covers, Damaian compares the repository before and after (Git's view of changed and untracked files, so ignored build output such as `target/` does not count). If the run changed anything, the approval is revoked at once, the turn says which files changed, and the next run asks again.
+After every run it covers, Damaian compares the repository before and after (Git's view of changed and untracked files, so ignored build output such as `target/` does not count). If the run changed anything, the approval is revoked at once, the turn says which files changed, and the next run asks again. The build check after each change (`cargo check --tests`) can be approved this way on its card too, so it asks once per session instead of after every patch. [Troubleshooting](TROUBLESHOOTING.md#a-command-approved-for-this-session-asks-again) lists every reason an approved command asks again.
 
 It is never an *Always allow*: nothing is written to your config, another session or another directory still asks, and a new session starts with none. A restart keeps it. It ends when you archive or delete the session, or choose **Revoke session approvals** in the session's ⋮ menu. A repository may turn the option off with `session_command_approval=false`, which also stops earlier session approvals applying; it cannot turn it on. To let a command run without asking in every session, write a rule in **Settings → Commands** instead.
 
