@@ -623,8 +623,9 @@ pub fn reattach_pending_approvals(
 /// it, which is why it runs once per process. This read is for redrawing the
 /// card of a pause raised while the process runs, on every session reload:
 /// `None` when the task is not waiting, when a live worker owns the session's
-/// approvals (spec 57 C12), when a patch was already decided file by file, or
-/// when the proposal cannot be re-presented. Nothing is failed or recorded
+/// approvals (spec 57 C12; a spec 110 session host does not), when a patch
+/// was already decided file by file, or when the proposal cannot be
+/// re-presented. Nothing is failed or recorded
 /// then; the next launch's sweep is what closes an unrestorable task.
 pub fn read_pending_approval(
     store: &SessionStore,
@@ -634,7 +635,11 @@ pub fn read_pending_approval(
     session_id: &str,
     task_id: &str,
 ) -> Result<Option<ReattachedApproval>> {
-    if store.has_live_host(session_id)? {
+    // Only a worker answers its own approvals. A spec 110 session host owns
+    // none: the card's answer is forwarded to it, and every session with work
+    // has one for as long as the app runs, so asking `has_live_host` here hid
+    // the card of every paused session the user came back to.
+    if store.has_live_worker(session_id)? {
         return Ok(None);
     }
     let waiting = store

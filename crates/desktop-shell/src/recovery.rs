@@ -2311,6 +2311,70 @@ mod tests {
         );
     }
 
+    /// Owner report 2026-11-25: two sessions of one project paused on command
+    /// approvals at once, each in its own spec 110 session host. After the
+    /// first was approved, the second, reloaded, had no card left to answer:
+    /// the read took the session's live host for a spec 57 worker that owns
+    /// its approvals. A session host owns none — the card's answer is
+    /// forwarded to it — so each session keeps its card while its host runs.
+    #[test]
+    fn a_session_with_a_live_session_host_keeps_its_pending_card() {
+        let (engine, dir) = engine("pending-card-hosts");
+        let first = engine
+            .validation_orchestrator
+            .propose_command(&dir, "ls -la", "Desktop command proposal")
+            .unwrap();
+        let second = engine
+            .validation_orchestrator
+            .propose_command(&dir, "git status", "Desktop command proposal")
+            .unwrap();
+        let (first_session, first_task) = paused_on(&engine, &dir, "command", &first.id, None);
+        let (second_session, second_task) = paused_on(&engine, &dir, "command", &second.id, None);
+        // Two live processes stand in for the two hosts: the registry names an
+        // entry by pid, so one pid cannot register both sessions.
+        let registry = workspace_engine::ProcessRegistry::open(&dir).unwrap();
+        let mut stand_in = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("a stand-in host process");
+        let _first_host = registry
+            .register(
+                workspace_engine::ProcessKind::SessionHost,
+                &first_session,
+                std::process::id(),
+            )
+            .unwrap();
+        let _second_host = registry
+            .register(
+                workspace_engine::ProcessKind::SessionHost,
+                &second_session,
+                stand_in.id(),
+            )
+            .unwrap();
+        assert!(
+            engine.session_store.has_live_host(&second_session).unwrap(),
+            "the stand-in host is not registered as live"
+        );
+
+        // The first session's approval resumed its turn.
+        engine
+            .session_store
+            .update_task_status(&first_task, TaskStatus::Complete, None)
+            .unwrap();
+        let first_card = pending_card(&engine, &first_session, &first_task.id)["card"].clone();
+        let second_card = pending_card(&engine, &second_session, &second_task.id)["card"].clone();
+        let _ = stand_in.kill();
+        let _ = stand_in.wait();
+
+        assert_eq!(first_card, serde_json::Value::Null);
+        assert_eq!(second_card["kind"], "command", "{second_card}");
+        assert_eq!(
+            second_card["payload"]["proposalId"],
+            second.id.as_str(),
+            "{second_card}"
+        );
+    }
+
     /// A task that is not waiting has no card, even when its old pause link is
     /// still in the log.
     #[test]
