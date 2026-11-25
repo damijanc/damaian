@@ -6575,12 +6575,12 @@ fn mcp_tool_config_round_trips_through_overlay() {
 
     let create_issue = config.mcp_tool_config("github", "create_issue").unwrap();
     assert!(!create_issue.enabled);
-    assert!(create_issue.require_approval);
+    assert_eq!(create_issue.require_approval, Some(true));
     assert!(!create_issue.pinned);
 
     let search_code = config.mcp_tool_config("github", "search_code").unwrap();
     assert!(search_code.enabled);
-    assert!(!search_code.require_approval);
+    assert_eq!(search_code.require_approval, Some(false));
     assert!(search_code.pinned);
 
     // Serialization is loadable again and preserves the per-tool entries.
@@ -6605,8 +6605,60 @@ fn unknown_mcp_tools_default_to_enabled_approval_gated_and_unpinned() {
     let config = Config::default();
     let settings = config.mcp_tool_settings("github", "never_seen");
     assert!(settings.enabled);
-    assert!(settings.require_approval);
+    assert_eq!(settings.require_approval, None, "left to the server");
     assert!(!settings.pinned);
+    assert!(
+        config.mcp_tool_requires_approval("github", "never_seen"),
+        "an unknown server's tool asks"
+    );
+}
+
+/// Spec 33 D1: a tool's approval is its own setting when it has one, and its
+/// server's otherwise (default true). A per-tool value is exact-tool: it
+/// never reaches a sibling. The read-only claim plays no part.
+#[test]
+fn mcp_tool_approval_resolves_per_tool_over_the_server() {
+    let mut config = Config::default();
+    config.apply_overlay(
+        ConfigOverlay::parse(
+            "mcp_server.github.command=github-mcp\n\
+             mcp_server.github.enabled=true\n\
+             mcp_server.github.tool.search_code.require_approval=false\n\
+             mcp_server.quiet.command=quiet-mcp\n\
+             mcp_server.quiet.enabled=true\n\
+             mcp_server.quiet.require_approval=false\n\
+             mcp_server.quiet.tool.publish.require_approval=true\n\
+             mcp_server.quiet.tool.lookup.enabled=false\n",
+        )
+        .unwrap(),
+    );
+    // Server default true: only the exact tool is waived.
+    assert!(!config.mcp_tool_requires_approval("github", "search_code"));
+    assert!(config.mcp_tool_requires_approval("github", "create_issue"));
+    // Server waived: a tool may still ask, and an entry that sets only
+    // `enabled` keeps following its server.
+    assert!(config.mcp_tool_requires_approval("quiet", "publish"));
+    assert!(!config.mcp_tool_requires_approval("quiet", "lookup"));
+    assert!(!config.mcp_tool_requires_approval("quiet", "anything_else"));
+
+    // An unset per-tool value is not written back as an explicit one, or a
+    // reload would pin the tool to the server's value of the day.
+    let policy = config.to_policy_text();
+    assert!(!policy.contains("tool.lookup.require_approval"), "{policy}");
+    let mut reloaded = Config::default();
+    reloaded.apply_overlay(ConfigOverlay::parse(&policy).unwrap());
+    for (server, tool) in [
+        ("github", "search_code"),
+        ("github", "create_issue"),
+        ("quiet", "publish"),
+        ("quiet", "lookup"),
+    ] {
+        assert_eq!(
+            reloaded.mcp_tool_requires_approval(server, tool),
+            config.mcp_tool_requires_approval(server, tool),
+            "{server}/{tool}"
+        );
+    }
 }
 
 #[test]

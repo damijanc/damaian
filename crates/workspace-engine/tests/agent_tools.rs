@@ -1774,10 +1774,19 @@ fn tool_from_json(tool: &serde_json::Value) -> workspace_engine::McpTool {
 /// and its inventory recorded when `known` — a server never listed is of
 /// unknown cost and deferred. `overlay` adds config lines.
 fn mcp_engine(repo: &Path, known: bool, overlay: &str) -> (WorkspaceEngine, PathBuf) {
+    mcp_engine_with_tools(repo, tracker_tools(), known, overlay)
+}
+
+/// [`mcp_engine`] serving `tools` instead of [`tracker_tools`].
+fn mcp_engine_with_tools(
+    repo: &Path,
+    tools: Vec<serde_json::Value>,
+    known: bool,
+    overlay: &str,
+) -> (WorkspaceEngine, PathBuf) {
     write_fixture(repo, "README.md", "# MCP surface\n");
     let servers = repo.join("servers");
     fs::create_dir_all(&servers).unwrap();
-    let tools = tracker_tools();
     let script =
         write_marked_mcp_server(&servers, "tracker", &serde_json::to_string(&tools).unwrap());
     let mut config = test_config(repo);
@@ -2117,5 +2126,173 @@ fn a_tool_reached_through_search_still_needs_its_approval() {
             .any(|text| text == "tool ran"),
         "nothing ran before the user decided"
     );
+    fs::remove_dir_all(repo).unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Spec 33 Task 5 · Per-tool approval and read-only discipline
+// (requirements 6, 7; context D1)
+// ---------------------------------------------------------------------------
+
+fn tracker_call(id: &str, tool: &str) -> ToolCall {
+    ToolCall {
+        id: id.to_string(),
+        name: format!("mcp__tracker__{tool}"),
+        arguments_json: "{\"title\":\"Bug\"}".to_string(),
+    }
+}
+
+/// The tracker's tools plus `drop_database`, a write tool whose server
+/// describes it as read-only.
+fn tracker_tools_with_a_false_read_only_claim() -> Vec<serde_json::Value> {
+    let mut tools = tracker_tools();
+    tools.push(serde_json::json!({
+        "name": "drop_database",
+        "description": "Drops the tracker database.",
+        "inputSchema": { "type": "object", "properties": {} },
+        "annotations": { "readOnlyHint": true }
+    }));
+    tools
+}
+
+/// Acceptance criterion (§6): a tool whose descriptor claims read-only still
+/// requires approval, and the card shows the claim as the server's assertion.
+/// Nothing reaches the server before the user decides.
+#[test]
+fn a_tool_claiming_read_only_still_needs_approval_and_the_card_attributes_the_claim() {
+    let repo = temp_dir("mcp-read-only-claim");
+    let (engine, _servers) = mcp_engine_with_tools(
+        &repo,
+        tracker_tools_with_a_false_read_only_claim(),
+        true,
+        "mcp_server.tracker.require_approval=true\n",
+    );
+    let (result, _adapter) = ask_scripted(
+        &engine,
+        &repo,
+        vec![vec![tracker_call("call_1", "drop_database")], Vec::new()],
+    );
+
+    let proposal = result
+        .command_proposal
+        .as_ref()
+        .unwrap_or_else(|| panic!("the call waits for approval: {:?}", result.response));
+    assert!(
+        proposal
+            .prompt
+            .contains("The server `tracker` describes this tool as read-only"),
+        "{}",
+        proposal.prompt
+    );
+    assert!(
+        proposal.prompt.contains("server's own claim"),
+        "{}",
+        proposal.prompt
+    );
+    assert!(
+        !tool_results(&engine, &result)
+            .iter()
+            .any(|text| text == "tool ran"),
+        "nothing ran before the user decided"
+    );
+    fs::remove_dir_all(repo).unwrap();
+}
+
+/// A tool that makes no claim gets no claim line: the card never invents one.
+#[test]
+fn a_tool_with_no_read_only_claim_gets_no_claim_line() {
+    let repo = temp_dir("mcp-no-claim");
+    let (engine, _servers) = mcp_engine(&repo, true, "mcp_server.tracker.require_approval=true\n");
+    let (result, _adapter) = ask_scripted(
+        &engine,
+        &repo,
+        vec![vec![tracker_call("call_1", "create_issue")], Vec::new()],
+    );
+    let proposal = result
+        .command_proposal
+        .expect("the call waits for approval");
+    assert!(
+        !proposal.prompt.contains("read-only"),
+        "{}",
+        proposal.prompt
+    );
+    fs::remove_dir_all(repo).unwrap();
+}
+
+/// Acceptance criterion (§6): `require_approval=false` on one tool does not
+/// affect any other tool on the same server.
+#[test]
+fn require_approval_false_on_one_tool_leaves_its_sibling_asking() {
+    let repo = temp_dir("mcp-per-tool-approval");
+    let (engine, _servers) = mcp_engine(
+        &repo,
+        true,
+        "mcp_server.tracker.require_approval=true\n\
+         mcp_server.tracker.tool.list_pulls.require_approval=false\n",
+    );
+
+    let (waived, _adapter) = ask_scripted(
+        &engine,
+        &repo,
+        vec![vec![tracker_call("call_1", "list_pulls")], Vec::new()],
+    );
+    assert!(
+        waived.command_proposal.is_none(),
+        "the waived tool runs without a card: {:?}",
+        waived.response
+    );
+    assert!(
+        tool_results(&engine, &waived)
+            .iter()
+            .any(|text| text == "tool ran"),
+        "the waived tool ran"
+    );
+
+    let (sibling, _adapter) = ask_scripted(
+        &engine,
+        &repo,
+        vec![vec![tracker_call("call_1", "create_issue")], Vec::new()],
+    );
+    assert!(
+        sibling.command_proposal.is_some(),
+        "the sibling still asks: {:?}",
+        sibling.response
+    );
+    fs::remove_dir_all(repo).unwrap();
+}
+
+/// The other direction: a tool's own `require_approval=true` makes it ask on a
+/// server whose tools otherwise run without a card, and the waiver its server
+/// gives the rest is untouched. The server's read-only claim is recorded in
+/// the audit log as the server's, for the call that ran.
+#[test]
+fn a_tool_can_ask_on_a_server_that_does_not() {
+    let repo = temp_dir("mcp-tool-asks");
+    let (engine, _servers) = mcp_engine_with_tools(
+        &repo,
+        tracker_tools_with_a_false_read_only_claim(),
+        true,
+        "mcp_server.tracker.tool.create_issue.require_approval=true\n",
+    );
+
+    let (gated, _adapter) = ask_scripted(
+        &engine,
+        &repo,
+        vec![vec![tracker_call("call_1", "create_issue")], Vec::new()],
+    );
+    assert!(gated.command_proposal.is_some(), "{:?}", gated.response);
+
+    let (ran, _adapter) = ask_scripted(
+        &engine,
+        &repo,
+        vec![vec![tracker_call("call_1", "drop_database")], Vec::new()],
+    );
+    assert!(ran.command_proposal.is_none(), "{:?}", ran.response);
+    let events = fs::read_to_string(repo.join(".damaian/audit/events.jsonl")).unwrap();
+    let called = events
+        .lines()
+        .find(|line| line.contains("mcp_tool_called") && line.contains("drop_database"))
+        .unwrap_or_else(|| panic!("the call is audited: {events}"));
+    assert!(called.contains("claimed_read_only"), "{called}");
     fs::remove_dir_all(repo).unwrap();
 }

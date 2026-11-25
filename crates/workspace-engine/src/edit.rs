@@ -313,7 +313,7 @@ impl EditOrchestrator {
         });
         let capabilities = self.config.profile_capabilities();
         let permission = if session_id.is_empty() {
-            profile_permits(&capabilities, &action, None, None)
+            profile_permits(&capabilities, &action, None)
         } else {
             permits(
                 self.session_store.session_mode(session_id),

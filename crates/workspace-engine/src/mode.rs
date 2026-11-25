@@ -144,7 +144,7 @@ pub(crate) fn permits(
     mcp_tool_read_only: Option<bool>,
 ) -> Permission {
     match mode_permits(mode, action, command, mcp_tool_read_only) {
-        Permission::Allowed => profile_permits(capabilities, action, command, mcp_tool_read_only),
+        Permission::Allowed => profile_permits(capabilities, action, command),
         refused => refused,
     }
 }
@@ -154,11 +154,14 @@ pub(crate) fn permits(
 /// classification's `blocked`, which also means the blocklist, a local policy
 /// verdict that keeps its own blocked-proposal path. Every variant is named,
 /// so a new tool class has to be placed here.
+///
+/// It takes no read-only claim: a server's `readOnlyHint` is its own assertion
+/// and must not carry a call past the user's profile (spec 33 D1). Only the
+/// mode layer reads the claim, and only to decide what is offered.
 pub(crate) fn profile_permits(
     capabilities: &ProfileCapabilities,
     action: &ToolAction,
     command: Option<&CommandClassification>,
-    mcp_tool_read_only: Option<bool>,
 ) -> Permission {
     let limit = match action {
         ToolAction::ReadFile { .. }
@@ -205,7 +208,8 @@ pub(crate) fn profile_permits(
         ToolAction::McpCall { .. } => {
             if !capabilities.mcp_enabled {
                 Some(ProfileLimit::McpDisabled)
-            } else if !capabilities.allow_mutating_mcp_tools && mcp_tool_read_only != Some(true) {
+            } else if !capabilities.allow_mutating_mcp_tools {
+                // Spec 33 D1: refused whatever the server claims about the tool.
                 Some(ProfileLimit::MutatingMcpTools)
             } else {
                 None
@@ -648,8 +652,9 @@ mod tests {
                 [F, F, T, T],
                 [F, T, T, F],
             ),
-            // Offline private turns MCP off altogether.
-            (mcp(), None, Some(true), [T, T, T, T], [T, T, T, F]),
+            // Offline private turns MCP off altogether. Spec 33 D1: a
+            // read-only claim widens the mode axis only, never the profile.
+            (mcp(), None, Some(true), [T, T, T, T], [F, T, T, F]),
             (mcp(), None, Some(false), [F, F, T, F], [F, T, T, F]),
             (mcp(), None, None, [F, F, T, F], [F, T, T, F]),
         ];

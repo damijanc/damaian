@@ -190,6 +190,14 @@ impl ChatOrchestrator {
                 );
                 if !permission.is_allowed() {
                     refusal_message(permission)
+                } else if !self.mcp_tool_callable(&mcp_call.server_id, &mcp_call.tool_name) {
+                    // The per-tool decision is read again under the current
+                    // config (spec 33 D1): a tool disabled while the card
+                    // waited is not called on the strength of that card.
+                    format!(
+                        "The MCP tool `{}` on server `{}` is not available in this session.",
+                        mcp_call.tool_name, mcp_call.server_id
+                    )
                 } else {
                     let (content, outcome) = match mcp.call_tool(
                         &mcp_call.server_id,
