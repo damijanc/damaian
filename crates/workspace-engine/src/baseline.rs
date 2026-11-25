@@ -45,7 +45,7 @@ use crate::session::SessionStore;
 use crate::validation::{CommandProposal, ValidationOrchestrator};
 use crate::verification::{
     CheckBaseline, CheckId, CheckTermination, FailureFingerprint, FindingEvidence,
-    VerificationEvent, environment_termination,
+    VerificationEvent, baseline_result_word, environment_termination,
 };
 
 /// Why a failure-time baseline is proposed. Stored with the proposal, so the
@@ -1076,23 +1076,14 @@ enum BaselineRun {
     NotStarted,
 }
 
-/// The wire word for a recorded baseline in a [`BaselineProgress::Finished`].
-fn baseline_result_word(baseline: &CheckBaseline) -> &'static str {
-    match baseline {
-        CheckBaseline::Passed => "passed",
-        CheckBaseline::Failed { .. } => "failed",
-        CheckBaseline::Declined => "declined",
-        CheckBaseline::Uncertain => "uncertain",
-        CheckBaseline::Unavailable { .. } => "unavailable",
-    }
-}
-
-/// The engine's line for a baseline that starts running.
+/// The engine's line for a baseline that starts running. It says what the
+/// run is for (spec 114 D5), not only that it runs.
 fn running_label(check: &str, tests: &[String]) -> String {
+    let base = format!("Checking whether {check} failed before this task's changes");
     match tests.len() {
-        0 => format!("Running baseline: {check}"),
-        1 => format!("Running baseline: {check}, only the failing test"),
-        count => format!("Running baseline: {check}, only the {count} failing tests"),
+        0 => base,
+        1 => format!("{base}, only the failing test"),
+        count => format!("{base}, only the {count} failing tests"),
     }
 }
 
@@ -1180,15 +1171,10 @@ fn baseline_covers(
     wanted.is_some_and(|wanted| wanted.iter().all(|name| covered.contains(name)))
 }
 
-/// The engine's line for a finished baseline.
+/// The engine's line for a finished baseline (spec 114 D5); the report's
+/// `baselines` use the same words.
 fn finished_label(result: &str, check: &str) -> String {
-    match result {
-        "passed" => format!("Baseline passed: {check}"),
-        "failed" => format!("Baseline failed: {check}"),
-        "unavailable" => format!("Baseline could not run: {check}"),
-        "cancelled" => format!("Baseline cancelled: {check}"),
-        _ => format!("Baseline skipped: {check}"),
-    }
+    crate::verification::baseline_finished_label(result, check)
 }
 
 fn unavailable(check: &CheckId, termination: CheckTermination) -> CheckBaseline {

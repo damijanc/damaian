@@ -635,7 +635,8 @@ fn a_baseline_cancelled_while_it_runs_is_declined_and_its_tree_is_removed() {
     let mut on_token = |_token: &str| {};
     let mut on_progress = |event: TurnProgress| {
         if let TurnProgress::Phase(phase) = &event
-            && phase.label.starts_with("Running baseline")
+            && phase.baseline
+            && phase.label.starts_with("Checking whether")
         {
             started = true;
             cancel.cancel();

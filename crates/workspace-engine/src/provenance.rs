@@ -329,10 +329,10 @@ fn introduced_findings(
 /// derive it from the enum or from check counts.
 pub fn provenance_label(provenance: FailureProvenance) -> &'static str {
     match provenance {
-        FailureProvenance::NewRegression => "Introduced regressions",
-        FailureProvenance::Worsened => "Worsened failures",
-        FailureProvenance::PreExisting => "Pre-existing failures",
-        FailureProvenance::UnchangedFailure => "Unchanged failures",
+        FailureProvenance::NewRegression => "Caused by this task",
+        FailureProvenance::Worsened => "Made worse by this task",
+        FailureProvenance::PreExisting => "Failed before this task too",
+        FailureProvenance::UnchangedFailure => "Failing as before this task",
         FailureProvenance::EnvironmentFailure => "Environment failures",
         FailureProvenance::Uncertain => "Uncertain provenance",
         FailureProvenance::UnknownProvenance => "Unknown provenance",
@@ -344,16 +344,16 @@ pub fn provenance_label(provenance: FailureProvenance) -> &'static str {
 pub fn provenance_summary(provenance: FailureProvenance) -> &'static str {
     match provenance {
         FailureProvenance::NewRegression => {
-            "These checks passed before the patch and fail now. Automatic repair receives only these findings."
+            "These checks passed before this task's changes and fail now. Automatic repair receives only these findings."
         }
         FailureProvenance::Worsened => {
-            "These checks failed before the patch and now report new findings. Automatic repair receives only the new findings."
+            "These checks failed before this task's changes and now report new findings. Automatic repair receives only the new findings."
         }
         FailureProvenance::PreExisting => {
-            "These checks failed before the patch too, so no repair was attempted."
+            "These checks failed before this task's changes too, so this task did not cause them and no repair was attempted."
         }
         FailureProvenance::UnchangedFailure => {
-            "These checks still fail the same way, so no repair was attempted."
+            "These checks fail the same way as before this task's changes, so no repair was attempted."
         }
         FailureProvenance::EnvironmentFailure => {
             "These checks could not run for an environment reason. No code repair was attempted."
@@ -362,7 +362,7 @@ pub fn provenance_summary(provenance: FailureProvenance) -> &'static str {
             "These required checks became required after the task had already changed files, so there is no task-start baseline. Damaian reported them instead of assuming the task caused them; repair waits for your decision."
         }
         FailureProvenance::UnknownProvenance => {
-            "There is no usable pre-patch baseline, so Damaian cannot tell whether the patch caused these failures. No repair was attempted."
+            "There is no usable baseline from before this task's changes, so Damaian cannot tell whether this task caused these failures. No repair was attempted."
         }
     }
 }
@@ -391,12 +391,12 @@ pub fn provenance_action(
         FailureProvenance::PreExisting => (
             VerificationActionKind::ReviewPreExistingFailure,
             "Review the pre-existing failure",
-            "The check failed before the patch. Fix it separately if you want it addressed.",
+            "The check failed before this task's changes. Fix it separately if you want it addressed.",
         ),
         FailureProvenance::UnchangedFailure => (
             VerificationActionKind::ReviewUnchangedFailure,
             "Review the unchanged failure",
-            "The check still fails the same way. Damaian did not start another repair.",
+            "The check fails the same way as before this task's changes. Damaian did not start another repair.",
         ),
         FailureProvenance::EnvironmentFailure => (
             VerificationActionKind::FixEnvironment,
@@ -421,14 +421,27 @@ pub fn provenance_action(
     })
 }
 
-/// A count phrase the summary can use. Singular and plural are the engine's
-/// wording, not a renderer's.
+/// A count phrase in the report's wording (spec 114 D7): it counts checks and
+/// says whose failure they are. Singular and plural are the engine's wording,
+/// not a renderer's. The model-facing `VerificationReport::summary` keeps its
+/// own, older phrases so the text a model sees does not change (spec 114 D1).
 pub fn provenance_count(provenance: FailureProvenance, count: usize) -> String {
     let (singular, plural) = match provenance {
-        FailureProvenance::NewRegression => ("introduced regression", "introduced regressions"),
-        FailureProvenance::Worsened => ("worsened failure", "worsened failures"),
-        FailureProvenance::PreExisting => ("pre-existing failure", "pre-existing failures"),
-        FailureProvenance::UnchangedFailure => ("unchanged failure", "unchanged failures"),
+        FailureProvenance::NewRegression => {
+            ("check caused by this task", "checks caused by this task")
+        }
+        FailureProvenance::Worsened => (
+            "check made worse by this task",
+            "checks made worse by this task",
+        ),
+        FailureProvenance::PreExisting => (
+            "check that failed before this task too",
+            "checks that failed before this task too",
+        ),
+        FailureProvenance::UnchangedFailure => (
+            "check failing as before this task",
+            "checks failing as before this task",
+        ),
         FailureProvenance::EnvironmentFailure => ("environment failure", "environment failures"),
         FailureProvenance::Uncertain => (
             "failure with no task-start baseline",
@@ -440,6 +453,40 @@ pub fn provenance_count(provenance: FailureProvenance, count: usize) -> String {
         ),
     };
     format!("{count} {}", if count == 1 { singular } else { plural })
+}
+
+/// The engine's one line on what a failed check's baseline found (spec 114
+/// requirement 2). It compares against "before this task's changes", the
+/// task-start tree a baseline runs on (spec 109 D2). `tests` is the narrowed
+/// set the baseline reran by name; empty means the whole check ran.
+pub fn baseline_line(
+    provenance: FailureProvenance,
+    baseline: Option<&CheckBaseline>,
+    tests: &[String],
+) -> String {
+    let found = match baseline {
+        None => "no baseline was recorded, so Damaian cannot compare".to_string(),
+        Some(CheckBaseline::Passed) => match tests.len() {
+            0 => "passed".to_string(),
+            1 => "the failing test passed when run alone".to_string(),
+            count => format!("the {count} failing tests passed when run alone"),
+        },
+        Some(CheckBaseline::Failed { .. }) => match provenance {
+            FailureProvenance::PreExisting | FailureProvenance::UnchangedFailure => {
+                "failed the same way".to_string()
+            }
+            FailureProvenance::Worsened => "failed, but without the new findings".to_string(),
+            _ => "failed".to_string(),
+        },
+        Some(CheckBaseline::Declined) => "not checked: the baseline was skipped".to_string(),
+        Some(CheckBaseline::Uncertain) => {
+            "not checked: the check became required after the task had changed files".to_string()
+        }
+        Some(CheckBaseline::Unavailable { termination, .. }) => {
+            format!("could not run ({})", termination.description())
+        }
+    };
+    format!("Before this task's changes: {found}")
 }
 
 /// One check inside a provenance partition.
@@ -465,6 +512,11 @@ pub struct ProvenanceCheck {
     /// classes.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub introduced: Vec<FindingEvidence>,
+    /// The engine's one line on what this check's baseline found, for
+    /// example "Before this task's changes: failed the same way" (spec 114
+    /// requirement 2). Empty in reports written before that spec.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub baseline: String,
 }
 
 impl ProvenanceCheck {
@@ -489,7 +541,14 @@ impl ProvenanceCheck {
             evidence,
             evidence_lines,
             introduced,
+            baseline: String::new(),
         }
+    }
+
+    /// The same entry with the engine's baseline line ([`baseline_line`]).
+    pub fn with_baseline(mut self, baseline: String) -> Self {
+        self.baseline = baseline;
+        self
     }
 
     /// The report line for this check, with its full redacted evidence. The
@@ -497,6 +556,9 @@ impl ProvenanceCheck {
     /// view never reaches the model through that path.
     pub fn render(&self) -> String {
         let mut text = format!("{} — {}", self.label, self.reason);
+        if !self.baseline.is_empty() {
+            text.push_str(&format!("\n                       {}", self.baseline));
+        }
         for line in &self.evidence_lines {
             text.push_str(&format!("\n                       - {line}"));
         }

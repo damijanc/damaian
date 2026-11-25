@@ -5,10 +5,11 @@ use super::*;
 
 /// Adds `explorationRound`/`maxExplorationRounds` beside the action counts;
 /// older readers ignore the new fields (spec 59 §5.5). `notesChars` is the
-/// turn's notes size for the progress label (spec 65 §5.8).
+/// turn's notes size for the progress label (spec 65 §5.8). `baseline` is
+/// written only when true: a baseline run's phase (spec 114 D5).
 pub(crate) fn phase_json(phase: &TurnPhase) -> String {
     format!(
-        "{{\"phase\":\"{}\",\"label\":\"{}\",\"round\":{},\"maxRounds\":{},\"explorationRound\":{},\"maxExplorationRounds\":{},\"notesChars\":{},\"reasoningChars\":{}}}",
+        "{{\"phase\":\"{}\",\"label\":\"{}\",\"round\":{},\"maxRounds\":{},\"explorationRound\":{},\"maxExplorationRounds\":{},\"notesChars\":{},\"reasoningChars\":{}{}}}",
         phase.kind.as_str(),
         escape_json(&phase.label),
         phase.round,
@@ -16,7 +17,12 @@ pub(crate) fn phase_json(phase: &TurnPhase) -> String {
         phase.exploration_round,
         phase.max_exploration_rounds,
         phase.notes_chars,
-        phase.reasoning_chars
+        phase.reasoning_chars,
+        if phase.baseline {
+            ",\"baseline\":true"
+        } else {
+            ""
+        }
     )
 }
 

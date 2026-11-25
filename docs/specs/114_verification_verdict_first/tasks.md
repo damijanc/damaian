@@ -1,6 +1,6 @@
 # Spec 114 tasks
 
-**Started:** not started
+**Started:** 2026-11-25
 
 Implementation plan for [`proposal.md`](proposal.md). The evidence, the code
 survey and the decisions are in [`context.md`](context.md).
@@ -31,7 +31,7 @@ survey and the decisions are in [`context.md`](context.md).
 
 | Task | State | Durable result |
 |---|---|---|
-| 1 · Verdict and whose failure it is (req 1, 2, D1, D7) | Not started | — |
+| 1 · Verdict and whose failure it is (req 1, 2, D1, D7) | Done 2026-11-25 | **Verdict.** `VerificationReport.verdict: Option<Verdict>` (`kind: VerdictKind`, `headline`, `detail`), computed once at the end of `VerificationReport::build` (`compute_verdict`) with D1's precedence. `build_failed` keys on `outcome == BuildFailed`; `caused_by_task` counts the checks in the `new_regression`/`worsened` groups ("This task's changes break N checks"); its detail depends on the outcome (repair limit → Continue repair; stall; no repair applied; a pre-finish report with targets → repair starting); `cause_unknown` = any environment/uncertain/unknown group; `not_caused_by_task` = only `pre_existing`/`unchanged_failure`; `not_verified` = skipped + stale + failed checks with no provenance entry ("no result was recorded": the run did not finish) — "Not verified: N checks did not run or finish" — and, with N = 0, due, `no_checks_available`, `only_documentation_changed` or nothing passed (own headlines: "…verification has not run yet", "…no checks were available", "…only documentation changed", "…no check has run"); otherwise `passed`. `Option` with `serde(default)`, so a stored report without one reads back as `None` (nothing invented). `render()` now starts with headline, detail and a blank line; the reloaded text and the CLI (which prints the turn response) get it through `render()`. **`summary()` is byte-identical:** it used `provenance_count`, which D7 rewords, so its old count phrases are frozen in a private `verification::summary_count` (**deviation**: D7 says `provenance_count` follows the new wording — it does, but `summary()` no longer calls it). **D7 wording** (`provenance.rs`): labels "Caused by this task", "Made worse by this task", "Failed before this task too", "Failing as before this task" (environment/uncertain/unknown unchanged); summaries and the pre-existing/unchanged action details say "before this task's changes"; `provenance_count` counts "checks caused by this task" etc. Action labels and `VerificationActionKind` unchanged; wire names unchanged. **Baseline line:** `ProvenanceCheck.baseline` (serde default, omitted when empty) from new `provenance::baseline_line(provenance, baseline, tests)`: "Before this task's changes: passed / the N failing tests passed when run alone / failed the same way / failed, but without the new findings / failed / could not run (…) / not checked: …" or "no baseline was recorded, so Damaian cannot compare"; rendered as an indented line under the check. **Baselines:** `VerificationReport.baselines: Vec<ReportBaseline {check, result, tests, label}>` for each failed, classified check that has a baseline, in selected order, plus a `Baselines` text section. Built from `VerificationState.baselines` and a new `VerificationState.baseline_tests` (folded from `verification_baseline.tests`) — the session fold the report already reads, not `task_verification_baseline_scopes`, so it agrees with the report's provenance groups. **Progress labels (D5):** `baseline.rs` running "Checking whether {check label} failed before this task's changes[, only the N failing tests]"; finished "Before this task's changes: {check label} passed / failed / could not run / was cancelled / was skipped" via the shared `verification::baseline_finished_label` (also the report's label) and `baseline_result_word` (moved from `baseline.rs`). The check label has no backticks (`cargo test (crates/a)`), unlike D5's sketch. **Typed marker — chosen: a flag.** `TurnPhase.baseline: bool`, set by `chat/verify.rs` `baseline_turn_progress` on the running, output and finished phases; `phase_json` writes `"baseline":true` only when set. A flag, not a `PhaseKind`, so a baseline's output stays an `output` line and every existing reader of `phase` is unchanged. Worker rows (`workers.rs`) do not forward it (spec 57/99 own them). **Tests:** new `tests/verification_verdict.rs` (10): every kind, D1 precedence (caused > unknown > not caused > not verified > passed), `render()` starts with the verdict, exact `summary()` strings for three fixtures, baseline lines and `baselines`, a stored report without a verdict. Updated label pins in `repair_targets`, `verification_loop`, desktop-shell `verification_report_json` test (now also asserts the verdict JSON); `repair_baseline`'s stop-at-start test keys on `phase.baseline`; desktop-shell `a_baseline_phase_carries_its_marker`. No eval assertion pinned the old labels. **Checks passed locally:** `scripts/quality-gate.sh fmt node lint typos deny`; `cargo clippy -p workspace-engine -p desktop-shell -p damaian-cli --all-targets --locked -- -D warnings`; `cargo nextest run -p workspace-engine --test verification_loop --test repair_provenance --test repair_baseline --test repair_targets --test verification_verdict --test plan_turn --test closed_task_completion --lib` (1144 passed); `cargo nextest run -p desktop-shell -p damaian-cli -p eval-harness` (542 passed, outside the sandbox); deterministic eval tier 66/66. Workspace clippy and tests left to CI. **For later tasks:** Task 2 adds `FailureProvenance::PassesAlone`: add it to `provenance_label`/`summary`/`action`/`provenance_count`, `build_partitions`' ORDER, the frozen `summary_count`, `baseline_line`, and to `compute_verdict`'s `not_caused_by_task` set (D3). Task 4 reads `report.verdict`, `report.baselines`, `provenance[].checks[].baseline` and the phase's `baseline` flag; `app.js` does not read any of them yet and still prints `report.outcome` as the badge. |
 | 2 · Tests that pass alone (req 4, D3) | Not started | — |
 | 3 · A failed task explains itself (req 5, D2, D4) | Not started | — |
 | 4 · Report card, Baseline tag, failed task card (req 3, 5, 6, D5, D6) | Not started | — |
@@ -39,19 +39,19 @@ survey and the decisions are in [`context.md`](context.md).
 
 ## Task 1 · Verdict and whose failure it is (req 1, 2, D1, D7)
 
-- [ ] `VerificationReport.verdict` (`kind`, `headline`, `detail`), computed
+- [x] `VerificationReport.verdict` (`kind`, `headline`, `detail`), computed
       once in `verification.rs` with D1's precedence. `render()` starts with
       the headline. `summary()` is unchanged.
-- [ ] D7's labels, summaries and count phrases in `provenance.rs`. Each
+- [x] D7's labels, summaries and count phrases in `provenance.rs`. Each
       `ProvenanceCheck` gets an engine `baseline` line ("Before this task's
       changes: …").
-- [ ] `VerificationReport.baselines` (`check`, `result`, `tests`, `label`)
+- [x] `VerificationReport.baselines` (`check`, `result`, `tests`, `label`)
       from the baselines `finish_verification` already reads. Baseline
       running and finished labels per D5, and a typed marker on the baseline
       progress phase (a `PhaseKind` or a flag; choose one and record it).
-- [ ] Update any test, eval assertion or CLI output that pins the old
+- [x] Update any test, eval assertion or CLI output that pins the old
       labels. The CLI prints the verdict through `render()`.
-- [ ] Engine tests: every verdict kind, precedence, `summary()` unchanged.
+- [x] Engine tests: every verdict kind, precedence, `summary()` unchanged.
 
 Files: `crates/workspace-engine/src/{verification.rs,provenance.rs,baseline.rs,chat/verify.rs}`,
 `crates/desktop-shell/src/json.rs` if the report JSON needs it, and tests.

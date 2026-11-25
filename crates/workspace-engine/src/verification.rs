@@ -26,7 +26,9 @@ use crate::command_policy::relative_location;
 use crate::error::{ClientError, Result};
 use crate::finding::{Finding, FindingSource, Severity};
 use crate::plan::{PlanReport, TaskPlan};
-use crate::provenance::{ProvenanceCheck, build_partitions, provenance_reason, repair_targets};
+use crate::provenance::{
+    ProvenanceCheck, baseline_line, build_partitions, provenance_reason, repair_targets,
+};
 use crate::repository_map::RepositoryMap;
 use crate::validation::{CommandProposal, ValidationOrchestrator};
 
@@ -1504,6 +1506,9 @@ pub struct VerificationState {
     /// written before this spec, and replay leaves it empty rather than
     /// guessing a provenance.
     pub baselines: BTreeMap<CheckId, CheckBaseline>,
+    /// The failing tests each baseline in `baselines` reran by name; absent
+    /// when it ran the whole check (spec 109 D3).
+    pub baseline_tests: BTreeMap<CheckId, Vec<String>>,
     /// The latest post-patch classification per check (spec 102).
     pub provenance: BTreeMap<CheckId, CheckProvenanceRecord>,
     /// The bounded repair-state window, oldest first (spec 102 requirement 7).
@@ -1658,9 +1663,17 @@ impl VerificationState {
                 self.in_progress = false;
             }
             VerificationEvent::Baseline {
-                check, baseline, ..
+                check,
+                baseline,
+                tests,
+                ..
             } => {
                 self.baselines.insert(check.clone(), baseline.clone());
+                if tests.is_empty() {
+                    self.baseline_tests.remove(check);
+                } else {
+                    self.baseline_tests.insert(check.clone(), tests.clone());
+                }
             }
             VerificationEvent::Provenance { record, .. } => {
                 self.provenance.insert(record.check.clone(), record.clone());
@@ -1748,6 +1761,66 @@ pub struct SkippedCheck {
     pub reason_label: String,
 }
 
+/// What a verification came to, in the user's terms (spec 114 D1). The kinds
+/// are listed in precedence order: when several apply, the first wins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerdictKind {
+    /// The change does not build.
+    BuildFailed,
+    /// A check has findings this task introduced.
+    CausedByTask,
+    /// Environment, uncertain or unknown failures, and nothing introduced.
+    CauseUnknown,
+    /// Only failures that were there before this task's changes.
+    NotCausedByTask,
+    /// Nothing failed, but something is due, missing, skipped or unfinished.
+    NotVerified,
+    Passed,
+}
+
+impl VerdictKind {
+    /// The wire name, matching the serde representation.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::BuildFailed => "build_failed",
+            Self::CausedByTask => "caused_by_task",
+            Self::CauseUnknown => "cause_unknown",
+            Self::NotCausedByTask => "not_caused_by_task",
+            Self::NotVerified => "not_verified",
+            Self::Passed => "passed",
+        }
+    }
+}
+
+/// The engine's verdict on a verification (spec 114 requirement 1). A
+/// renderer prints `headline` and `detail` verbatim and never derives them
+/// from the outcome, the provenance groups or a check count.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Verdict {
+    pub kind: VerdictKind,
+    pub headline: String,
+    /// One sentence: what happens next, or what the user can do.
+    pub detail: String,
+}
+
+/// One baseline the report compared a failed check against (spec 114 D5).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReportBaseline {
+    pub check: CheckId,
+    /// The recorded baseline's wire word: `passed`, `failed`, `declined`,
+    /// `uncertain` or `unavailable`.
+    pub result: String,
+    /// The failing tests it reran by name; empty when the whole check ran.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tests: Vec<String>,
+    /// The engine's line, for example "Before this task's changes: cargo test
+    /// (repository root) failed".
+    pub label: String,
+}
+
 /// Proposal §5.7's report, as data and as text.
 ///
 /// The four partitions — `passed`, `failed`, `skipped`, `stale` — together hold
@@ -1806,6 +1879,14 @@ pub struct VerificationReport {
     /// prints them and never infers a stall kind from a check count.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repair_stall: Option<crate::stagnation::RepairStall>,
+    /// The engine's verdict (spec 114 requirement 1). Every report built now
+    /// has one; a report stored before that spec has none, and reading it
+    /// back does not invent one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verdict: Option<Verdict>,
+    /// The baselines the failed checks were compared against (spec 114 D5).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub baselines: Vec<ReportBaseline>,
 }
 
 impl VerificationReport {
@@ -1861,6 +1942,8 @@ impl VerificationReport {
             repair_targets: Vec::new(),
             actions: Vec::new(),
             repair_stall: state.repair_stall.clone(),
+            verdict: None,
+            baselines: Vec::new(),
         };
         for check in &state.selected {
             let Some(run) = state.checks.get(check) else {
@@ -1932,6 +2015,20 @@ impl VerificationReport {
                 // failure with a provenance.
                 continue;
             };
+            let baseline = state.baselines.get(check);
+            let tests = state
+                .baseline_tests
+                .get(check)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            if let Some(recorded) = baseline {
+                report.baselines.push(ReportBaseline {
+                    check: check.clone(),
+                    result: baseline_result_word(recorded).to_string(),
+                    tests: tests.to_vec(),
+                    label: baseline_finished_label(baseline_result_word(recorded), &check.label()),
+                });
+            }
             if let Some(record) = state.provenance.get(check) {
                 entries.push((
                     record.provenance,
@@ -1942,7 +2039,12 @@ impl VerificationReport {
                         Some(record.fingerprint.clone()),
                         record.findings.clone(),
                         record.introduced.clone(),
-                    ),
+                    )
+                    .with_baseline(baseline_line(
+                        record.provenance,
+                        baseline,
+                        tests,
+                    )),
                 ));
             } else {
                 let provenance = if termination.is_environment_failure() {
@@ -1959,7 +2061,8 @@ impl VerificationReport {
                         None,
                         Vec::new(),
                         Vec::new(),
-                    ),
+                    )
+                    .with_baseline(baseline_line(provenance, baseline, tests)),
                 ));
             }
         }
@@ -1988,7 +2091,159 @@ impl VerificationReport {
             });
             report.actions.push(stall.action.clone());
         }
+        report.verdict = Some(report.compute_verdict());
         report
+    }
+
+    /// Spec 114 D1: the one verdict, in precedence order `build_failed` >
+    /// `caused_by_task` > `cause_unknown` > `not_caused_by_task` >
+    /// `not_verified` > `passed`. Computed once, from the report's own data.
+    fn compute_verdict(&self) -> Verdict {
+        let verdict = |kind, headline: String, detail: &str| Verdict {
+            kind,
+            headline,
+            detail: detail.to_string(),
+        };
+        if self.outcome == Some(VerificationOutcome::BuildFailed) {
+            return verdict(
+                VerdictKind::BuildFailed,
+                "The change does not build".to_string(),
+                "No other check ran; the build errors go back to the model to fix first.",
+            );
+        }
+        let checks_in = |classes: &[FailureProvenance]| -> usize {
+            self.provenance
+                .iter()
+                .filter(|partition| classes.contains(&partition.provenance))
+                .map(|partition| partition.checks.len())
+                .sum()
+        };
+        let caused = checks_in(&[
+            FailureProvenance::NewRegression,
+            FailureProvenance::Worsened,
+        ]);
+        if caused > 0 {
+            let detail = if self.outcome == Some(VerificationOutcome::RepairLimitExhausted) {
+                "The repair limit was reached: use Continue repair for another attempt, or fix the failures yourself."
+            } else if self.repair_stall.is_some() {
+                "Automatic repair stopped because it was not making progress; review the failures and fix them yourself."
+            } else if self.outcome == Some(VerificationOutcome::NoRepairApplied) {
+                "No repair patch was applied; review the failures, then fix them or ask Damaian to try again."
+            } else if !self.repair_targets.is_empty() && self.outcome.is_none() {
+                "Damaian is starting a repair that receives only the failures this task caused."
+            } else {
+                "Review the failures this task caused, then fix them or ask Damaian to continue."
+            };
+            return verdict(
+                VerdictKind::CausedByTask,
+                format!("This task's changes break {}", count(caused, "check")),
+                detail,
+            );
+        }
+        let unknown = checks_in(&[
+            FailureProvenance::EnvironmentFailure,
+            FailureProvenance::Uncertain,
+            FailureProvenance::UnknownProvenance,
+        ]);
+        if unknown > 0 {
+            let detail = if checks_in(&[FailureProvenance::Uncertain]) > 0 {
+                "Damaian did not start a repair; decide whether this task should fix them."
+            } else if checks_in(&[FailureProvenance::EnvironmentFailure]) == unknown {
+                "Damaian did not start a repair; fix what stopped the checks from running, then verify again."
+            } else {
+                "Damaian did not start a repair; review the failures before deciding what to fix."
+            };
+            return verdict(
+                VerdictKind::CauseUnknown,
+                "Checks fail; Damaian could not tell whether this task caused it".to_string(),
+                detail,
+            );
+        }
+        let not_caused = checks_in(&[
+            FailureProvenance::PreExisting,
+            FailureProvenance::UnchangedFailure,
+        ]);
+        if not_caused > 0 {
+            return verdict(
+                VerdictKind::NotCausedByTask,
+                "Checks fail, but not because of this task's changes".to_string(),
+                "They failed the same way before this task's changes, so no repair was attempted; fix them separately if you want them addressed.",
+            );
+        }
+        // A failed check with no provenance entry has no recorded result: the
+        // verification did not finish it.
+        let unfinished = self
+            .failed
+            .iter()
+            .filter(|failed| {
+                !self.provenance.iter().any(|partition| {
+                    partition
+                        .checks
+                        .iter()
+                        .any(|check| check.check == failed.check)
+                })
+            })
+            .count();
+        let not_run = unfinished + self.skipped.len() + self.stale.len();
+        if not_run > 0 {
+            return verdict(
+                VerdictKind::NotVerified,
+                format!(
+                    "Not verified: {} did not run or finish",
+                    count(not_run, "check")
+                ),
+                if self.skipped.is_empty() {
+                    "Run the verification again to check the current files."
+                } else {
+                    "Approve or allow the skipped checks, then run the verification again."
+                },
+            );
+        }
+        if self.due {
+            return verdict(
+                VerdictKind::NotVerified,
+                "Not verified: verification has not run yet".to_string(),
+                "Run the verification to check this task's changes.",
+            );
+        }
+        match self.outcome {
+            Some(VerificationOutcome::NoChecksAvailable) => {
+                return verdict(
+                    VerdictKind::NotVerified,
+                    "Not verified: no checks were available".to_string(),
+                    "Damaian found no check to run for these files; add a project check if they need one.",
+                );
+            }
+            Some(VerificationOutcome::OnlyDocumentationChanged) => {
+                return verdict(
+                    VerdictKind::NotVerified,
+                    "Not verified: only documentation changed".to_string(),
+                    "No check covers documentation, so nothing ran.",
+                );
+            }
+            _ => {}
+        }
+        if self.passed.is_empty() {
+            let detail = if self.deferred.is_empty() && self.deferred_to_completion.is_empty() {
+                "Nothing has checked this task's changes yet."
+            } else {
+                "The checks for this change run later, with their plan step or at task completion."
+            };
+            return verdict(
+                VerdictKind::NotVerified,
+                "Not verified: no check has run".to_string(),
+                detail,
+            );
+        }
+        verdict(
+            VerdictKind::Passed,
+            "Checks passed".to_string(),
+            if self.passed.len() == 1 {
+                "The selected check passed on the current files."
+            } else {
+                "Every selected check passed on the current files."
+            },
+        )
     }
 
     /// One line for the top of the panel or the end of a turn.
@@ -2202,9 +2457,7 @@ impl VerificationReport {
         }
         self.provenance
             .iter()
-            .map(|partition| {
-                crate::provenance::provenance_count(partition.provenance, partition.checks.len())
-            })
+            .map(|partition| summary_count(partition.provenance, partition.checks.len()))
             .collect::<Vec<_>>()
             .join(", ")
     }
@@ -2223,6 +2476,13 @@ impl VerificationReport {
     /// renderer that makes them clickable is the shell's.
     pub fn render(&self) -> String {
         let mut lines = Vec::new();
+        // Spec 114 D1: the text copy starts with the verdict, so a reloaded
+        // report says the same thing first as the live card.
+        if let Some(verdict) = &self.verdict {
+            lines.push(verdict.headline.clone());
+            lines.push(verdict.detail.clone());
+            lines.push(String::new());
+        }
         lines.push(section("Files changed", &list_or_none(&self.files_changed)));
         // Only when a build check ran or was reused (spec 109 D10), so every
         // other report renders exactly as it did.
@@ -2367,6 +2627,17 @@ impl VerificationReport {
                 .join("\n                     ");
             lines.push(section(&partition.label, &value));
         }
+        if !self.baselines.is_empty() {
+            let baselines: Vec<String> = self
+                .baselines
+                .iter()
+                .map(|baseline| baseline.label.clone())
+                .collect();
+            lines.push(section(
+                "Baselines",
+                &baselines.join("\n                     "),
+            ));
+        }
         if let Some(stall) = &self.repair_stall {
             lines.push(section(&stall.label, &stall.explanation));
         }
@@ -2445,6 +2716,55 @@ impl VerificationReport {
         }
         "none".to_string()
     }
+}
+
+/// The count phrases of the model-facing [`VerificationReport::summary`].
+/// Frozen on purpose: spec 114 D1 keeps the text a model sees, and the eval
+/// assertions on it, unchanged while the report's own wording (D7,
+/// [`crate::provenance::provenance_count`]) says whose failure it is.
+fn summary_count(provenance: FailureProvenance, count: usize) -> String {
+    let (singular, plural) = match provenance {
+        FailureProvenance::NewRegression => ("introduced regression", "introduced regressions"),
+        FailureProvenance::Worsened => ("worsened failure", "worsened failures"),
+        FailureProvenance::PreExisting => ("pre-existing failure", "pre-existing failures"),
+        FailureProvenance::UnchangedFailure => ("unchanged failure", "unchanged failures"),
+        FailureProvenance::EnvironmentFailure => ("environment failure", "environment failures"),
+        FailureProvenance::Uncertain => (
+            "failure with no task-start baseline",
+            "failures with no task-start baseline",
+        ),
+        FailureProvenance::UnknownProvenance => (
+            "failure of unknown provenance",
+            "failures of unknown provenance",
+        ),
+    };
+    format!("{count} {}", if count == 1 { singular } else { plural })
+}
+
+/// The wire word for a recorded baseline, as `verification_baseline` and the
+/// report's `baselines` name it.
+pub fn baseline_result_word(baseline: &CheckBaseline) -> &'static str {
+    match baseline {
+        CheckBaseline::Passed => "passed",
+        CheckBaseline::Failed { .. } => "failed",
+        CheckBaseline::Declined => "declined",
+        CheckBaseline::Uncertain => "uncertain",
+        CheckBaseline::Unavailable { .. } => "unavailable",
+    }
+}
+
+/// The engine's line for a finished baseline (spec 114 D5), used by the
+/// baseline's progress phase and by the report's `baselines`. `result` is a
+/// [`baseline_result_word`] or `cancelled`.
+pub fn baseline_finished_label(result: &str, check: &str) -> String {
+    let what = match result {
+        "passed" => "passed",
+        "failed" => "failed",
+        "unavailable" => "could not run",
+        "cancelled" => "was cancelled",
+        _ => "was skipped",
+    };
+    format!("Before this task's changes: {check} {what}")
 }
 
 fn labels(checks: &[CheckId]) -> Vec<String> {

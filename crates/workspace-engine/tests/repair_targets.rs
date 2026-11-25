@@ -581,8 +581,8 @@ fn the_report_partitions_every_failure_and_only_repairs_introduced_evidence() {
 
     let rendered = report.render();
     for expected in [
-        "Introduced regressions",
-        "Pre-existing failures",
+        "Caused by this task",
+        "Failed before this task too",
         "Environment failures",
         "Unknown provenance",
         "What you can do",

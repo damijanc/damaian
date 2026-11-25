@@ -182,6 +182,12 @@ pub struct TurnPhase {
     /// Characters of reasoning this model call has streamed so far. Non-zero
     /// only on a `Thinking` phase (spec 81); a count, never the text.
     pub reasoning_chars: usize,
+    /// The phase belongs to a failure-time baseline run (spec 114 D5): its
+    /// running and finished lines and its output. A flag rather than a new
+    /// [`PhaseKind`], so a baseline's output stays an `Output` line and every
+    /// reader of the kind is unchanged; a client keys its Baseline tag on
+    /// this, never on the label's text.
+    pub baseline: bool,
 }
 
 impl TurnPhase {
@@ -203,6 +209,7 @@ impl TurnPhase {
             max_exploration_rounds,
             notes_chars,
             reasoning_chars: 0,
+            baseline: false,
         }
     }
 }
