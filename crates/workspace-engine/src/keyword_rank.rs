@@ -43,6 +43,12 @@ const RANGE_PADDING: usize = 8;
 /// declaration that encloses it.
 const DECLARATION_REACH: usize = 40;
 
+/// The most text a hit's range may cover. [`WINDOW_LINES`] assumes lines of
+/// code; in a file of long lines (prose, data, minified code) the same window
+/// ran to tens of kilobytes, and context assembly sends a hit's whole range,
+/// so one hit could outgrow a small model's request window by itself.
+const RANGE_BYTES: usize = 6 * 1024;
+
 /// Stage two reads at most this much candidate text in total, in stage one's
 /// order. A candidate past it keeps its stage-one score, so a handful of very
 /// large files (generated bindings run to megabytes) cannot make one search
@@ -218,6 +224,8 @@ struct Hits {
     phrases: Vec<(usize, usize)>,
     /// Byte offset of each line's start.
     line_starts: Vec<usize>,
+    /// The text's length in bytes, where the last line ends.
+    len: usize,
 }
 
 impl Hits {
@@ -273,11 +281,19 @@ impl Hits {
             terms,
             phrases,
             line_starts,
+            len: bytes.len(),
         }
     }
 
     fn total_lines(&self) -> usize {
         self.line_starts.len()
+    }
+
+    /// Bytes from the start of line `first` to the end of line `last`, both
+    /// 1-based and inclusive.
+    fn bytes_between(&self, first: usize, last: usize) -> usize {
+        let end = self.line_starts.get(last).copied().unwrap_or(self.len);
+        end.saturating_sub(self.line_starts[first - 1])
     }
 
     /// The text of `range`, at most 500 characters.
@@ -423,20 +439,29 @@ fn inline_tests_start(file: &FileRecord, text: &str, hits: &Hits) -> Option<usiz
 }
 
 /// The range a hit reports: the window's matches, padded, reaching back to an
-/// enclosing declaration when one starts shortly above.
-fn hit_range(file: &FileRecord, window: Window, total_lines: usize) -> LineRange {
-    let mut start = window.first.saturating_sub(RANGE_PADDING).max(1);
-    if let Some(declaration) = file
+/// enclosing declaration when one starts shortly above, within
+/// [`RANGE_BYTES`]. Over the cap, the declaration goes first, then the padding
+/// above the first match, then lines from the end; the first match stays.
+fn hit_range(file: &FileRecord, window: Window, hits: &Hits) -> LineRange {
+    let padded = window.first.saturating_sub(RANGE_PADDING).max(1);
+    let declaration = file
         .declarations
         .iter()
         .map(|declaration| declaration.line as usize)
         .filter(|line| *line <= window.first && window.first - line <= DECLARATION_REACH)
-        .max()
-    {
-        start = start.min(declaration);
-    }
-    let end = (window.last + RANGE_PADDING).min(total_lines.max(window.last));
-    LineRange { start, end }
+        .max();
+    let end = (window.last + RANGE_PADDING).min(hits.total_lines().max(window.last));
+    let start = [declaration.map(|line| line.min(padded)), Some(padded)]
+        .into_iter()
+        .flatten()
+        .find(|&start| hits.bytes_between(start, end) <= RANGE_BYTES)
+        .unwrap_or(window.first);
+    // The last line whose end still keeps the range within the cap.
+    let fits = (start..=end)
+        .take_while(|&line| hits.bytes_between(start, line) <= RANGE_BYTES)
+        .last()
+        .unwrap_or(start);
+    LineRange { start, end: fits }
 }
 
 /// The file's indexed text: its chunks are contiguous slices of it.
@@ -658,9 +683,7 @@ pub(crate) fn rank(
                 .then(|| inline_tests_start(file, &text, &hits))
                 .flatten();
             let found = proximity(&hits, query, test_from);
-            let range = found
-                .best
-                .map(|window| hit_range(file, window, hits.total_lines()));
+            let range = found.best.map(|window| hit_range(file, window, &hits));
             let snippet = range
                 .map(|range| hits.snippet(&text, range))
                 .unwrap_or_else(|| text.chars().take(500).collect());

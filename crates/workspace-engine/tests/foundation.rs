@@ -374,6 +374,39 @@ fn marks_restricted_dotenv_files() {
     assert!(!policy.is_restricted("src/app.js", false));
 }
 
+/// A keyword hit's range is sent to the model whole, so it must stay small in
+/// a file of long lines, where a window of lines that suits code (60 lines)
+/// once ran to about 40 KB and alone overflowed a 10k-token request window.
+#[test]
+fn a_keyword_hit_in_a_file_of_long_lines_stays_small() {
+    let repo = temp_dir("long-lines");
+    let line = "line of text that makes a read large ".repeat(15);
+    write_fixture(&repo, "big.txt", &format!("{line}\n").repeat(400));
+
+    let scanner = SecretScanner::default();
+    let indexer = ProjectIndexer::new(
+        test_config(&repo),
+        scanner.clone(),
+        test_audit(&repo, scanner),
+    );
+    let index = indexer.index_repository(&repo).unwrap();
+    let hit = index
+        .keyword_search("read large", 1)
+        .into_iter()
+        .next()
+        .expect("the file matches");
+    let lines = hit.lines.expect("a keyword hit reports its lines");
+    let covered = lines.end - lines.start + 1;
+    assert!(
+        covered * (line.len() + 1) <= 6 * 1024,
+        "the hit covers {covered} lines of {} bytes: {lines:?}",
+        line.len() + 1
+    );
+    assert!(covered >= 1, "the first match stays");
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
 #[test]
 fn indexes_source_files_while_respecting_gitignore_and_redacting_secrets() {
     let repo = temp_dir("indexer");
