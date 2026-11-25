@@ -158,6 +158,53 @@ manages. `crates/workspace-engine/src/chat.rs` (23,166 lines) is the orchestrato
   it contradicts its own semantics. Keep health in memory per shell process,
   keyed by repository and server, served by a new `GET /api/mcp-health`; only
   the inventory (D4) persists. The proposal's §5.3 records this correction.
+  **As built (Task 6, 2026-11-25), adjusted for spec 110 Task 1b's session
+  hosts:** "per shell process" no longer describes where MCP runs. Since
+  2026-11-25 each session's turns — and so its MCP contacts — run in a
+  `--session-host` process of its own, while the shell only forwards and
+  supervises. Health is therefore kept **wherever MCP runs**: a process-wide
+  in-memory store in the engine (`workspace_engine::mcp_health`), keyed by
+  repository id and server id, holding the latest `McpHealthObservation`
+  (`health`, `observedAtMs`, the contacting `sessionId`). It is process-wide
+  because the engine is rebuilt per request and `McpRuntime` per turn; the
+  process is the narrowest thing that outlives a turn. In the desktop app a
+  session host's store is exactly that session's health, which is what
+  `Unknown` ("never contacted this session") and `Failed` ("not retried
+  automatically this session") are defined against; the shell's own store
+  holds only what the shell itself contacted (with hosting off — library
+  tests, the CLI — every session runs in one process and shares it). Nothing
+  is persisted. `McpRuntime` records on every contact: a successful
+  connect-and-list or call → `Ready`; a timeout in any phase → `Timeout`; HTTP
+  401/403 (now surfaced as `ClientError::AccessDenied`, never with the token)
+  → `Unauthenticated`; a JSON-RPC error answer to a *call* (now
+  `ClientError::InvalidInput`) leaves the server `Ready`, since it answered;
+  anything else — spawn, network, handshake, a server that cannot list, a
+  server that exited (no longer misreported as a timeout) → `Unreachable`; a
+  stopped turn records nothing. `Failed` is not set yet (Task 7).
+  **For Task 7's `GET /api/mcp-health`:** the shell cannot read hosts' memory,
+  so the route must gather it. Add an `mcp_health` command to
+  `serve_host_connection` in `crates/desktop-shell/src/session_host.rs`
+  answering `workspace_engine::mcp_health_snapshot()`, ask every live session
+  host for it through the same `exchange` the `status` command uses, add the
+  shell's own `mcp_health_snapshot()`, fold them with
+  `workspace_engine::merge_mcp_health` (latest `observedAtMs` per repository
+  and server), and report every configured server absent from the result as
+  `Unknown`. A host ended by archive, delete or quit takes its observations
+  with it, which is correct: that session is over. Worker processes
+  (`--worker`) run MCP too and keep their own store; decide whether the route
+  asks them as well. `Failed` and its manual retry are per session, so they
+  must act in the session's host (the offer path already reads
+  `mcp_server_health` in the process that builds the offer); `/api/mcp-test`
+  runs in the shell through `McpClient` directly and records nothing today.
+  **Lazy startup as built:** Task 6 also stopped the *direct* and *pinned*
+  offers from starting a server. A server not yet listed this turn has its
+  tools offered from the inventory's recorded schemas (Task 4 stored them)
+  whenever the record holds every wanted tool with a schema; only a call, or
+  a search of a server of unknown cost, starts one. So a session that never
+  searches or calls starts no server process even with a known server under
+  the ceiling, and that server's health stays `Unknown` — and its inventory is
+  refreshed only when it is next listed (a call, or an older record without
+  schemas).
 - **D6 — timeout config (decided 2026-11-10).** Three keys,
   `mcp_connect_timeout_ms` (default 15,000), `mcp_list_timeout_ms` (default
   15,000), `mcp_call_timeout_ms` (default 60,000), replacing the two consts.

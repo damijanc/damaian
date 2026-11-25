@@ -13,6 +13,7 @@ use crate::cancel::CancelToken;
 use crate::command_runner::kill_process_group;
 use crate::config::{McpServerConfig, McpTransport};
 use crate::error::{ClientError, Result};
+use crate::mcp_health::{McpContactPhase, health_after_failure, record_mcp_health};
 use crate::mcp_inventory::McpToolInventory;
 use crate::model::{ToolDefinition, escape_curl_config_value};
 use crate::process_registry::{ProcessKind, ProcessRegistry, RegistrationHandle};
@@ -32,10 +33,11 @@ use std::time::{Duration, Instant};
 const PROTOCOL_VERSION: &str = "2025-06-18";
 
 /// Health of one MCP server within this session (spec 33 §5.3, context D5).
-/// Held in memory, keyed by repository and server, and never persisted: the
-/// states are defined in terms of *this session* (`Unknown` = "never contacted
-/// this session", `Failed` = "not retried automatically this session"), so
-/// persisting them would contradict their own semantics.
+/// Held in memory by [`crate::mcp_health`], keyed by repository and server,
+/// and never persisted: the states are defined in terms of *this session*
+/// (`Unknown` = "never contacted this session", `Failed` = "not retried
+/// automatically this session"), so persisting them would contradict their
+/// own semantics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum McpServerHealth {
@@ -253,7 +255,12 @@ impl McpClient {
                 .get("message")
                 .and_then(Value::as_str)
                 .unwrap_or("unknown error");
-            return Err(ClientError::Io(format!("MCP {method} failed: {message}")));
+            // `InvalidInput`, not `Io`: the server answered and refused this
+            // request, which says it is up (spec 33 §5.3 health), and an
+            // answered refusal is no transport failure to retry.
+            return Err(ClientError::InvalidInput(format!(
+                "MCP {method} failed: {message}"
+            )));
         }
         Ok(response.get("result").cloned().unwrap_or(Value::Null))
     }
@@ -466,9 +473,14 @@ impl RpcTransport for StdioTransport {
             let line = match self.lines.recv_timeout(remaining.min(CANCEL_POLL_INTERVAL)) {
                 Ok(line) => line,
                 Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                // The server closed its output — it exited. That is no
+                // timeout (spec 33 Task 6): the server is gone, not slow, so
+                // its health is `Unreachable`. The wording stays clear of
+                // `is_retryable_message`'s words, so nothing re-sends a call
+                // the server may have acted on before exiting.
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    return Err(ClientError::McpTimeout(
-                        "Timed out waiting for MCP server response".to_string(),
+                    return Err(ClientError::Io(
+                        "The MCP server exited before answering".to_string(),
                     ));
                 }
             };
@@ -610,6 +622,12 @@ impl HttpTransport {
             )));
         }
         let (headers, body) = split_headers_body(&raw);
+        if let Some(status) = refused_credentials_status(headers) {
+            // The token itself is never part of the message.
+            return Err(ClientError::AccessDenied(format!(
+                "MCP server refused the credentials (HTTP {status})"
+            )));
+        }
         if let Some(session) = header_value(headers, "mcp-session-id") {
             self.session_id = Some(session);
         }
@@ -649,6 +667,20 @@ fn split_headers_body(raw: &str) -> (&str, &str) {
         }
     }
     (headers, rest)
+}
+
+/// The status of a final response that refused the request's credentials —
+/// 401 or 403 — read from its status line, or `None` for any other response.
+fn refused_credentials_status(headers: &str) -> Option<u16> {
+    let status: u16 = headers
+        .lines()
+        .next()?
+        .strip_prefix("HTTP/")?
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()?;
+    matches!(status, 401 | 403).then_some(status)
 }
 
 fn header_value(headers: &str, name: &str) -> Option<String> {
@@ -821,6 +853,19 @@ impl McpRuntime {
         }
     }
 
+    /// Records what a contact with `server_id` showed in this process's
+    /// health store (spec 33 §5.3, D5): `Ready` on success, otherwise what
+    /// the failure implies. A stopped turn records nothing.
+    fn record_health(&self, server_id: &str, phase: McpContactPhase, error: Option<&ClientError>) {
+        let health = match error {
+            None => Some(McpServerHealth::Ready),
+            Some(error) => health_after_failure(phase, error),
+        };
+        if let Some(health) = health {
+            record_mcp_health(&self.repository_id, server_id, &self.session_id, health);
+        }
+    }
+
     fn connection(&mut self, server_id: &str) -> Result<&mut McpClient> {
         if !self.connections.contains_key(server_id) {
             let Some(server) = self.server(server_id) else {
@@ -877,10 +922,13 @@ impl McpRuntime {
     pub fn list_server(&mut self, server_id: &str) -> &[McpTool] {
         if !self.tools.contains_key(server_id) && self.has_server(server_id) {
             let list_timeout = self.list_timeout;
-            match self
+            let listing = self
                 .connection(server_id)
-                .and_then(|client| client.list_tools(list_timeout))
-            {
+                .and_then(|client| client.list_tools(list_timeout));
+            // A server that cannot list its tools is as unusable as one that
+            // cannot be reached, so both phases read as one contact.
+            self.record_health(server_id, McpContactPhase::Connect, listing.as_ref().err());
+            match listing {
                 Ok(tools) => {
                     self.record(
                         "mcp_tools_listed",
@@ -958,9 +1006,16 @@ impl McpRuntime {
         arguments_json: &str,
     ) -> Result<McpToolResult> {
         let call_timeout = self.call_timeout;
-        let result = self
-            .connection(server_id)
-            .and_then(|client| client.call_tool(tool_name, arguments_json, call_timeout));
+        let (phase, result) = match self.connection(server_id) {
+            Ok(client) => (
+                McpContactPhase::Call,
+                client.call_tool(tool_name, arguments_json, call_timeout),
+            ),
+            Err(error) => (McpContactPhase::Connect, Err(error)),
+        };
+        if self.has_server(server_id) {
+            self.record_health(server_id, phase, result.as_ref().err());
+        }
         // Spec 33 §5.5: recorded as the server's claim, never as a fact.
         let claim = read_only_claim_label(self.tool_read_only_hint(server_id, tool_name));
         match &result {
@@ -1081,6 +1136,18 @@ mod tests {
             Some("abc123")
         );
         assert_eq!(body, "{\"result\":1}");
+    }
+
+    #[test]
+    fn only_a_401_or_403_reads_as_refused_credentials() {
+        assert_eq!(
+            refused_credentials_status("HTTP/1.1 401 Unauthorized\r\nwww-authenticate: Bearer"),
+            Some(401)
+        );
+        assert_eq!(refused_credentials_status("HTTP/2 403"), Some(403));
+        assert_eq!(refused_credentials_status("HTTP/1.1 200 OK"), None);
+        assert_eq!(refused_credentials_status("HTTP/1.1 404 Not Found"), None);
+        assert_eq!(refused_credentials_status(""), None);
     }
 
     #[test]
