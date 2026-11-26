@@ -93,6 +93,11 @@ when the turn ended. Local OBSERVATIONS 94.
     forwarded to it), and with hosts kept until archive or quit the widened
     check hid every paused session's card after the user left and came back
     (owner report 2026-11-25, two sessions paused on command approvals).
+    The recovery close-out stays in the shell while the resumed turn runs in
+    the host, so the two must not both decide the task's status: the
+    close-out writes only while the task still waits on the card's proposal
+    (spec 45 §5.7; owner report 2026-11-26, a resumed turn's plan review
+    closed as failed).
   - **Split (recorded in tasks.md).** Task 1 lands the shell side with the work
     still in the shell process, each session's work behind an in-process
     per-session lane; Task 1b moves the lane's work into the host. The lane's
