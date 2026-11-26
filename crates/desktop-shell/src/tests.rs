@@ -2910,6 +2910,53 @@ fn app_js_a_reloaded_pending_card_is_drawn() {
     );
 }
 
+/// Owner report 2026-11-26, reproduced in the real UI: "approved", typed but
+/// not sent in one session, was in the composer of the next session opened,
+/// where it would have been sent to that session — over a waiting plan, as
+/// its decline-with-changes. Every switch in `loadSession` swaps the draft:
+/// the leaving session's is kept, the entering session's comes back.
+#[test]
+fn app_js_a_composer_draft_stays_with_its_session() {
+    // Keyed by the composer's own session, not `currentSessionId`: a sidebar
+    // click selects the session in `loadSessions` before `loadSession` runs,
+    // which hid the switch from a swap keyed on it (seen in the real UI).
+    let swap = app_js_function("swapComposerDraft");
+    for part in [
+        "const leaving = composerDraftSession;",
+        "composerDraftSession = entering;",
+        "if (leaving === entering) return;",
+        "composerDrafts.set(leaving, field.value)",
+        "field.value = composerDrafts.get(entering) || \"\";",
+    ] {
+        assert!(swap.contains(part), "{part}: {swap}");
+    }
+    let load = app_js_function("loadSession");
+    for (swapped, assigned) in [
+        ("swapComposerDraft(\"\");", "currentSessionId = \"\";"),
+        (
+            "swapComposerDraft(payload.session.id);",
+            "currentSessionId = payload.session.id;",
+        ),
+    ] {
+        let at = load
+            .find(swapped)
+            .unwrap_or_else(|| panic!("{swapped} in loadSession: {load}"));
+        assert!(
+            at < load.find(assigned).unwrap(),
+            "{swapped} before {assigned}"
+        );
+    }
+    let start = app_js_function("startNewSession");
+    assert!(start.contains("swapComposerDraft(\"\");"), "{start}");
+    // A first turn's `session` event names the view's own session: its text
+    // stays, under the new id.
+    let follow = app_js_function("followTurnSession");
+    assert!(
+        follow.contains("composerDraftSession = sessionId;"),
+        "{follow}"
+    );
+}
+
 /// Spec 112 requirement 7: a session row draws the worker dot's look for
 /// `working`, `needs_you` and `failed` in place of its time, named for screen
 /// readers and on hover; any other session keeps its time. A collapsed
