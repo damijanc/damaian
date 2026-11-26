@@ -336,7 +336,30 @@ fn resolve_reattached_approval_with(
 ) -> Result<String, String> {
     let session_id = crate::required_form(form, "session_id")?;
     let task_id = crate::required_form(form, "task_id")?;
+    let proposal_id = crate::required_form(form, "proposal_id")?;
     let outcome = crate::required_form(form, "outcome")?;
+
+    // A reattached command whose paused turn was saved is resumable: approving
+    // it continues that turn (in the session's host), which then owns the
+    // task's status — a new pause, or an end of its own. Cancelling it here
+    // would mark a running or paused-again turn failed (observed 2026-11-26).
+    // The close-out applies only while the task still waits on this proposal;
+    // any later status event clears that link.
+    let still_waiting = engine
+        .session_store
+        .pending_approval_for(&session_id, &task_id)
+        .map_err(|error| error.to_string())?
+        .is_some_and(|pending| pending.proposal_id == proposal_id);
+    if !still_waiting {
+        forget(&session_id, &task_id)?;
+        return Ok(format!(
+            "{{\"sessionId\":\"{}\",\"taskId\":\"{}\",\"outcome\":\"{}\",\"continued\":true}}",
+            escape_json(&session_id),
+            escape_json(&task_id),
+            escape_json(&outcome)
+        ));
+    }
+
     let reason = format!(
         "The proposal it was waiting on was {outcome} after a crash; the turn did not continue"
     );
@@ -370,7 +393,7 @@ fn resolve_reattached_approval_with(
     forget(&session_id, &task_id)?;
 
     Ok(format!(
-        "{{\"sessionId\":\"{}\",\"taskId\":\"{}\",\"outcome\":\"{}\"}}",
+        "{{\"sessionId\":\"{}\",\"taskId\":\"{}\",\"outcome\":\"{}\",\"continued\":false}}",
         escape_json(&session_id),
         escape_json(&task_id),
         escape_json(&outcome)
@@ -1875,6 +1898,7 @@ mod tests {
             &HashMap::from([
                 ("session_id".to_string(), session.id.clone()),
                 ("task_id".to_string(), task.id.clone()),
+                ("proposal_id".to_string(), proposal.id.clone()),
                 ("outcome".to_string(), "approved".to_string()),
             ]),
         )
@@ -1895,6 +1919,74 @@ mod tests {
         // The proposal itself is untouched: closing the turn is not the same as
         // discarding what it was waiting on.
         assert!(engine.command_store.load_proposal(&proposal.id).is_ok());
+    }
+
+    /// As observed on 2026-11-26 with session hosts: approving a reattached
+    /// command whose paused turn was still resumable continued that turn, which
+    /// raised a plan review, and the card's close-out then cancelled the task
+    /// with "the turn did not continue" — leaving the new pause unanswerable.
+    /// The close-out applies only while the task still waits on the proposal
+    /// the card showed.
+    #[test]
+    fn a_close_out_after_the_turn_continued_leaves_the_task_alone() {
+        let (engine, dir) = engine("resumed");
+        let session = engine
+            .session_store
+            .create_session("repo_1", "Recovery")
+            .unwrap();
+        let task = engine
+            .session_store
+            .create_task(&session.id, "review the game", "mock", "m")
+            .unwrap();
+        let proposal = engine
+            .validation_orchestrator
+            .propose_command(&dir, "ls -la", "Desktop command proposal")
+            .unwrap();
+        let waiting = engine
+            .session_store
+            .await_approval(
+                &task,
+                &PendingApprovalRef {
+                    kind: "command".to_string(),
+                    proposal_id: proposal.id.clone(),
+                },
+            )
+            .unwrap();
+        let (_, first) = sweep(&engine);
+        assert!(first.contains(&proposal.id), "got {first}");
+
+        // The resumed turn, as the session host writes it: it runs on and
+        // pauses again on a plan review, which links no command proposal.
+        let running = engine
+            .session_store
+            .update_task_status(&waiting, TaskStatus::PreparingContext, None)
+            .unwrap();
+        engine
+            .session_store
+            .update_task_status(&running, TaskStatus::WaitingForApproval, None)
+            .unwrap();
+
+        let response = super::resolve_reattached_approval_with(
+            &engine,
+            &HashMap::from([
+                ("session_id".to_string(), session.id.clone()),
+                ("task_id".to_string(), task.id.clone()),
+                ("proposal_id".to_string(), proposal.id.clone()),
+                ("outcome".to_string(), "approved".to_string()),
+            ]),
+        )
+        .unwrap();
+
+        assert!(response.contains("\"continued\":true"), "got {response}");
+        assert_eq!(
+            engine
+                .session_store
+                .read_task_statuses(&session.id)
+                .unwrap()
+                .get(&task.id)
+                .map(String::as_str),
+            Some("waiting_for_approval")
+        );
     }
 
     /// Spec 57 correction C12, as observed on 2026-10-16: the sweep ran while a

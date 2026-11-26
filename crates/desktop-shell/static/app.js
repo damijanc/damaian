@@ -9015,6 +9015,9 @@ async function resolveReattachedApproval(approval, outcome) {
       form({
         session_id: approval.sessionId,
         task_id: approval.taskId,
+        // The shell closes the task out only while it still waits on this
+        // proposal, so a turn that continued is never marked as one that died.
+        proposal_id: approval.payload?.proposalId || approval.payload?.patchId || "",
         outcome,
       }),
     );
@@ -16780,7 +16783,9 @@ function createCommandApprovalPreview(
           ? `exit ${payload.exitCode}\n${payload.stdout || ""}${payload.stderr || ""}`.trimEnd()
           : "Command rejected. The turn that proposed it ended with the crash, so nothing continues.";
       }
-      if (onResolved) await onResolved(approved);
+      // A resumed turn owns its task's status from here — a new pause or an
+      // end of its own — so the crash close-out is only for a turn that is gone.
+      if (onResolved && !resumedTurn) await onResolved(approved);
       await loadSessions(currentSessionId, false);
       await refreshFindings();
       void refreshRepoBar();
