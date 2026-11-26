@@ -542,12 +542,16 @@ fn passing(run: &CheckRun) -> bool {
 /// `pre_existing` or `unchanged_failure` with nothing introduced, and the
 /// task-start baseline actually ran and failed. A declined, unavailable or
 /// `uncertain` baseline never qualifies: without a real starting point the
-/// engine cannot know the task did not cause the failure.
+/// engine cannot know the task did not cause the failure. A `passes_alone`
+/// check (spec 114 D3) is accepted on its own evidence instead.
 pub(crate) fn accepted_pre_existing_failure(
     check: &CheckId,
     verification: &VerificationState,
 ) -> Option<CompletionAcceptance> {
     let record = verification.current_provenance(check)?;
+    if record.provenance == FailureProvenance::PassesAlone {
+        return accepted_passes_alone(check, record, verification);
+    }
     if !matches!(
         record.provenance,
         FailureProvenance::PreExisting | FailureProvenance::UnchangedFailure
@@ -566,6 +570,49 @@ pub(crate) fn accepted_pre_existing_failure(
         provenance: record.provenance,
         explanation: format!(
             "{} still fails, but only as it did before this task started; the task did not cause it and did not change it.",
+            check.label()
+        ),
+    })
+}
+
+/// Spec 114 D3: a check whose every introduced failing test passed alone on
+/// the task-start tree (a narrowed `Passed` baseline) and passes alone on the
+/// current files (a rerun that ran). The explanation names the tests.
+fn accepted_passes_alone(
+    check: &CheckId,
+    record: &crate::verification::CheckProvenanceRecord,
+    verification: &VerificationState,
+) -> Option<CompletionAcceptance> {
+    if !record.introduced.is_empty()
+        || !matches!(
+            verification.baselines.get(check),
+            Some(CheckBaseline::Passed)
+        )
+    {
+        return None;
+    }
+    let rerun = verification.isolated_reruns.get(check)?;
+    if rerun.outcome != crate::verification::IsolatedRerunOutcome::Ran
+        || rerun.passed_alone.is_empty()
+    {
+        return None;
+    }
+    let names = rerun
+        .passed_alone
+        .iter()
+        .map(|name| format!("`{name}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let (tests, pass, they) = if rerun.passed_alone.len() == 1 {
+        ("test", "passes", "it fails")
+    } else {
+        ("tests", "pass", "they fail")
+    };
+    Some(CompletionAcceptance {
+        check: check.clone(),
+        provenance: record.provenance,
+        explanation: format!(
+            "{} still fails, but its failing {tests} {names} {pass} when run alone, before and after this task's changes; {they} only together with other tests, and the task did not cause it.",
             check.label()
         ),
     })

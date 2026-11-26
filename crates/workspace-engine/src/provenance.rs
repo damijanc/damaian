@@ -198,6 +198,34 @@ pub fn classify(
     }
 }
 
+/// Spec 114 D3: take the tests that pass alone on the current files out of a
+/// new regression's introduced set. A check with no introduced error left is
+/// `passes_alone`, with nothing introduced; a mixed check stays a new
+/// regression with only the remaining findings. Any other class, or an empty
+/// `passed_alone`, is returned unchanged.
+pub fn without_tests_passing_alone(
+    mut classification: ProvenanceClassification,
+    passed_alone: &[String],
+) -> ProvenanceClassification {
+    if classification.provenance != FailureProvenance::NewRegression || passed_alone.is_empty() {
+        return classification;
+    }
+    classification.introduced.retain(|finding| {
+        finding.source() != crate::finding::FindingSource::Test
+            || crate::finding::failed_test_name(finding.summary())
+                .is_none_or(|name| !passed_alone.iter().any(|alone| alone == name))
+    });
+    if !classification
+        .introduced
+        .iter()
+        .any(|finding| finding.severity() == Severity::Error)
+    {
+        classification.provenance = FailureProvenance::PassesAlone;
+        classification.introduced.clear();
+    }
+    classification
+}
+
 fn classification(
     provenance: FailureProvenance,
     result: &PostPatchResult,
@@ -336,6 +364,7 @@ pub fn provenance_label(provenance: FailureProvenance) -> &'static str {
         FailureProvenance::EnvironmentFailure => "Environment failures",
         FailureProvenance::Uncertain => "Uncertain provenance",
         FailureProvenance::UnknownProvenance => "Unknown provenance",
+        FailureProvenance::PassesAlone => "Passes when run alone",
     }
 }
 
@@ -363,6 +392,9 @@ pub fn provenance_summary(provenance: FailureProvenance) -> &'static str {
         }
         FailureProvenance::UnknownProvenance => {
             "There is no usable baseline from before this task's changes, so Damaian cannot tell whether this task caused these failures. No repair was attempted."
+        }
+        FailureProvenance::PassesAlone => {
+            "The failing tests pass when run alone, before and after this task's changes, so they fail only together with other tests and this task did not cause it. No repair was attempted."
         }
     }
 }
@@ -413,6 +445,11 @@ pub fn provenance_action(
             "Review the failure and provide a baseline",
             "A later patch can offer a baseline for this check. Damaian will not assume this failure was caused by the task.",
         ),
+        FailureProvenance::PassesAlone => (
+            VerificationActionKind::ReviewOrderDependentTests,
+            "Review the order-dependent tests",
+            "The tests fail only when run together with other tests. Damaian did not start a repair; fix how they share state separately if you want it addressed.",
+        ),
     };
     Some(VerificationAction {
         kind,
@@ -451,6 +488,10 @@ pub fn provenance_count(provenance: FailureProvenance, count: usize) -> String {
             "failure of unknown provenance",
             "failures of unknown provenance",
         ),
+        FailureProvenance::PassesAlone => (
+            "check whose failing tests pass when run alone",
+            "checks whose failing tests pass when run alone",
+        ),
     };
     format!("{count} {}", if count == 1 { singular } else { plural })
 }
@@ -466,11 +507,18 @@ pub fn baseline_line(
 ) -> String {
     let found = match baseline {
         None => "no baseline was recorded, so Damaian cannot compare".to_string(),
-        Some(CheckBaseline::Passed) => match tests.len() {
-            0 => "passed".to_string(),
-            1 => "the failing test passed when run alone".to_string(),
-            count => format!("the {count} failing tests passed when run alone"),
-        },
+        Some(CheckBaseline::Passed) => {
+            let alone = match tests.len() {
+                0 => "passed".to_string(),
+                1 => "the failing test passed when run alone".to_string(),
+                count => format!("the {count} failing tests passed when run alone"),
+            };
+            if provenance == FailureProvenance::PassesAlone {
+                format!("{alone}, and on the current files too")
+            } else {
+                alone
+            }
+        }
         Some(CheckBaseline::Failed { .. }) => match provenance {
             FailureProvenance::PreExisting | FailureProvenance::UnchangedFailure => {
                 "failed the same way".to_string()
@@ -602,6 +650,8 @@ pub enum VerificationActionKind {
     ProvideBaseline,
     DecideUncertainRepair,
     ReviewStalledRepair,
+    /// Spec 114 D3: tests that fail together and pass alone.
+    ReviewOrderDependentTests,
 }
 
 impl VerificationActionKind {
@@ -617,6 +667,7 @@ impl VerificationActionKind {
             Self::ProvideBaseline => "provide_baseline",
             Self::DecideUncertainRepair => "decide_uncertain_repair",
             Self::ReviewStalledRepair => "review_stalled_repair",
+            Self::ReviewOrderDependentTests => "review_order_dependent_tests",
         }
     }
 }
@@ -643,11 +694,12 @@ pub struct RepairTarget {
 pub fn build_partitions(
     entries: Vec<(FailureProvenance, ProvenanceCheck)>,
 ) -> Vec<ProvenancePartition> {
-    const ORDER: [FailureProvenance; 7] = [
+    const ORDER: [FailureProvenance; 8] = [
         FailureProvenance::NewRegression,
         FailureProvenance::Worsened,
         FailureProvenance::PreExisting,
         FailureProvenance::UnchangedFailure,
+        FailureProvenance::PassesAlone,
         FailureProvenance::EnvironmentFailure,
         // `uncertain` is more specific than the catch-all unknown group: the
         // engine knows the check was required, only the task-start baseline is
@@ -705,6 +757,10 @@ pub fn repair_targets(entries: &[(FailureProvenance, ProvenanceCheck)]) -> Vec<R
             fingerprint: check.fingerprint.clone(),
             evidence: match provenance {
                 FailureProvenance::Worsened => check.introduced.clone(),
+                // A new regression's introduced set is its whole result,
+                // less any test that passes alone (spec 114 D3). An entry
+                // built without one falls back to the whole result.
+                _ if !check.introduced.is_empty() => check.introduced.clone(),
                 _ => check.evidence.clone(),
             },
             reason: check.reason.clone(),

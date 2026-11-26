@@ -1,0 +1,74 @@
+name = "verification_tests_pass_alone"
+fixture = "rust-workspace"
+tier = "deterministic"
+prompt = "Add a retry to the upload client"
+
+# Specification 114 D3: a failing Rust test whose narrowed baseline passes is
+# rerun alone on the current files. The seeded test stands in for an
+# order-dependent one: it fails in the whole `cargo test` run and passes when
+# run by name with `--exact`, both at task start and after the patch. So the
+# check is `passes_alone`, no repair turn starts, and the gate accepts it.
+#
+# The rerun runs only when the policy would run it without a card, so this
+# run lets commands run without approval. With approval required the rerun is
+# skipped and the failure stays `new_regression` (an engine test covers that).
+verify_after_apply = true
+config_overlay = """
+require_approval_for_risky_commands=false
+"""
+seed_files = [
+  { path = "tests/order_dependent.rs", content = """
+#[test]
+fn passes_only_when_run_alone() {
+    // Deterministic stand-in for a test that depends on the order tests run in.
+    assert!(std::env::args().any(|arg| arg == "--exact"));
+}
+""" },
+]
+
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "read_file", arguments = { path = "src/upload.rs" } },
+]
+
+[[turn]]
+content = "I added a retry helper."
+tool_calls = [
+  { name = "propose_patch", arguments = { summary = "Add upload retry", files = [
+    { path = "src/upload.rs", status = "modified", content = """
+pub fn upload(payload: &str) -> Result<(), String> {
+    if payload.is_empty() {
+        return Err("payload was empty".to_string());
+    }
+    Ok(())
+}
+
+pub fn upload_with_retry(payload: &str, attempts: u32) -> Result<(), String> {
+    let mut last = Err("no attempt was made".to_string());
+    for _ in 0..attempts.max(1) {
+        last = upload(payload);
+        if last.is_ok() {
+            return last;
+        }
+    }
+    last
+}
+""" },
+  ] } },
+]
+
+[[turn]]
+content = "The retry helper is in; the failing test passes when run alone."
+
+[assert]
+# The narrowed baseline passed, so without the rerun this would be a
+# `new_regression` and a repair turn would start.
+verification_outcome = "only_pre_existing_failures"
+verification_baselines = [{ command = "cargo test", state = "passed" }]
+verification_provenances = [{ command = "cargo test", provenance = "passes_alone" }]
+verification_repair_targets = 0
+verification_action_kinds = ["review_order_dependent_tests"]
+repair_stall_reason = "none"
+model_calls_at_most = 3
+final_task_status = "complete"

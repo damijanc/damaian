@@ -16,6 +16,7 @@ use workspace_engine::{
     FailureProvenance, FindingEvidence, MAX_REPAIR_STATE_ENTRIES, RepairStateEntry, SecretScanner,
     SessionStore, VerificationEvent, VerificationState, fold_verification,
 };
+use workspace_engine::{PostPatchResult, classify, repair_targets, without_tests_passing_alone};
 
 fn finding(summary: &str, path: Option<&str>, line: Option<u32>) -> Finding {
     Finding::new(
@@ -587,4 +588,135 @@ fn temp_dir(name: &str) -> PathBuf {
     ));
     fs::create_dir_all(&dir).expect("temp dir should be created");
     dir
+}
+
+// --- Spec 114 D3: tests that pass alone leave the introduced set. ---
+
+fn warning(summary: &str) -> FindingEvidence {
+    FindingEvidence::from_finding(&Finding::new(
+        FindingDraft {
+            source: FindingSource::Command,
+            severity: Severity::Warning,
+            summary: summary.to_string(),
+            details: None,
+            range: None,
+            code: None,
+        },
+        &SecretScanner::default(),
+    ))
+}
+
+fn new_regression(findings: Vec<FindingEvidence>) -> workspace_engine::ProvenanceClassification {
+    classify(
+        &PostPatchResult::new(check(), exited(101), findings),
+        Some(&CheckBaseline::Passed),
+        None,
+    )
+}
+
+#[test]
+fn tests_that_pass_alone_leave_only_the_others_introduced() {
+    let findings = vec![
+        evidence("tests::a failed", None, None),
+        evidence("tests::b failed", None, None),
+        evidence("tests::c failed", None, None),
+    ];
+    let mixed = without_tests_passing_alone(
+        new_regression(findings.clone()),
+        &["tests::a".to_string(), "tests::b".to_string()],
+    );
+    assert_eq!(mixed.provenance, FailureProvenance::NewRegression);
+    assert_eq!(mixed.findings, findings, "the report keeps every finding");
+    assert_eq!(mixed.introduced, vec![findings[2].clone()]);
+    assert!(mixed.repair_eligible());
+
+    // The repair target carries only what is still introduced.
+    let record = mixed.record();
+    let entry = workspace_engine::ProvenanceCheck::new(
+        record.check.clone(),
+        "fails".to_string(),
+        record.termination.clone(),
+        Some(record.fingerprint.clone()),
+        record.findings.clone(),
+        record.introduced.clone(),
+    );
+    let targets = repair_targets(&[(record.provenance, entry)]);
+    assert_eq!(targets[0].evidence, vec![findings[2].clone()]);
+}
+
+#[test]
+fn a_regression_whose_every_failing_test_passes_alone_is_passes_alone() {
+    let findings = vec![
+        evidence("tests::a failed", None, None),
+        warning("unused variable"),
+    ];
+    let alone = without_tests_passing_alone(new_regression(findings), &["tests::a".to_string()]);
+    assert_eq!(
+        alone.provenance,
+        FailureProvenance::PassesAlone,
+        "a warning left over is not a failure of the task"
+    );
+    assert!(alone.introduced.is_empty());
+    assert!(!alone.repair_eligible());
+    assert_eq!(
+        serde_json::to_value(alone.provenance).unwrap(),
+        json!("passes_alone")
+    );
+}
+
+#[test]
+fn only_a_new_regression_is_narrowed_by_tests_that_pass_alone() {
+    let findings = vec![evidence("tests::a failed", None, None)];
+    let baseline = CheckBaseline::Failed {
+        termination: exited(101),
+        fingerprint: fingerprint(&[], &exited(101)),
+        findings: Vec::new(),
+    };
+    let worsened = classify(
+        &PostPatchResult::new(check(), exited(101), findings.clone()),
+        Some(&baseline),
+        None,
+    );
+    assert_eq!(worsened.provenance, FailureProvenance::Worsened);
+    let unchanged = without_tests_passing_alone(worsened.clone(), &["tests::a".to_string()]);
+    assert_eq!(unchanged, worsened);
+    let untouched = without_tests_passing_alone(new_regression(findings.clone()), &[]);
+    assert_eq!(untouched.provenance, FailureProvenance::NewRegression);
+    assert_eq!(untouched.introduced, findings);
+}
+
+#[test]
+fn an_isolated_rerun_is_folded_and_cleared_by_a_later_run() {
+    let rerun = VerificationEvent::IsolatedRerun {
+        task_id: "task".to_string(),
+        check: check(),
+        tests: vec!["tests::a".to_string()],
+        passed_alone: vec!["tests::a".to_string()],
+        outcome: workspace_engine::IsolatedRerunOutcome::Ran,
+    };
+    let wire = serde_json::to_value(&rerun).unwrap();
+    assert_eq!(wire["kind"], "verification_isolated_rerun");
+    assert_eq!(wire["passedAlone"], json!(["tests::a"]));
+    assert_eq!(wire["outcome"], "ran");
+    let state = fold_verification([&rerun]);
+    assert_eq!(
+        state.isolated_reruns[&check()].passed_alone,
+        vec!["tests::a".to_string()]
+    );
+    let later = VerificationEvent::Check {
+        task_id: "task".to_string(),
+        check: check(),
+        outcome: workspace_engine::CheckOutcome::Ran {
+            exit_code: Some(101),
+            marker_id: "marker".to_string(),
+            termination: Some(exited(101)),
+        },
+        file_hashes: Default::default(),
+        generation: 0,
+    };
+    let state = fold_verification([&rerun, &later]);
+    assert!(
+        state.isolated_reruns.is_empty(),
+        "a new run is not vouched for"
+    );
 }

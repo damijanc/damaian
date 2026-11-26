@@ -19,8 +19,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use workspace_engine::pre_task_tree::temporary_trees;
 use workspace_engine::{
     CancelToken, ChatTurnResult, CheckBaseline, CheckId, Config, EditProposalResult,
-    FailureProvenance, MockModelAdapter, TurnProgress, TurnSink, VerificationEvent,
-    WorkspaceEngine,
+    FailureProvenance, IsolatedRerunOutcome, MockModelAdapter, TurnProgress, TurnSink,
+    VerificationEvent, WorkspaceEngine,
 };
 
 fn temp_dir(name: &str) -> PathBuf {
@@ -80,7 +80,9 @@ fn git_fixture(name: &str, committed: &str, uncommitted: Option<&str>) -> PathBu
 /// narrowed `cargo nextest run` that matches no existing test fails as nextest
 /// 0.9.144 does (`error: no tests to run`, exit 4) unless it passes
 /// `--no-tests=pass`; a failing nextest run reports on stderr in nextest's
-/// shape, exit 100.
+/// shape, exit 100. A test named on a `// flaky <name>` line depends on the
+/// order tests run in (spec 114 D3): it fails in a whole run and passes when
+/// a command names it with `--exact`.
 fn fake_shell(data_dir: &Path) -> PathBuf {
     let script = data_dir.join("fake-shell.sh");
     let log = data_dir.join("runs.log");
@@ -93,9 +95,13 @@ fn fake_shell(data_dir: &Path) -> PathBuf {
              echo \"$cmd\" >> '{}'\n\
              if [ -f '{}' ]; then sleep 30; fi\n\
              names=$(sed -n 's|^// fail ||p' src/lib.rs 2>/dev/null)\n\
+             flaky=$(sed -n 's|^// flaky ||p' src/lib.rs 2>/dev/null)\n\
+             case \"$cmd\" in *' -- --exact '*) ;; *)\n\
+             if [ -n \"$flaky\" ]; then names=\"$names $flaky\"; fi;;\n\
+             esac\n\
              case \"$cmd\" in *' -- --exact '*)\n\
              only=${{cmd#*' -- --exact '}}; kept=''; matched=''\n\
-             existing=$(sed -n 's|^// \\(test\\|fail\\) ||p' src/lib.rs 2>/dev/null)\n\
+             existing=$(sed -n 's|^// \\(test\\|fail\\|flaky\\) ||p' src/lib.rs 2>/dev/null)\n\
              for name in $existing; do for one in $only; do\n\
              if [ \"$name\" = \"$one\" ]; then matched=yes; fi\n\
              done; done\n\
@@ -255,6 +261,29 @@ fn baselines(engine: &WorkspaceEngine, session_id: &str) -> Vec<(CheckId, CheckB
         .collect()
 }
 
+/// Every `verification_isolated_rerun` (spec 114 D3): its tests, the ones
+/// that passed alone, and its outcome.
+fn isolated_reruns(
+    engine: &WorkspaceEngine,
+    session_id: &str,
+) -> Vec<(Vec<String>, Vec<String>, IsolatedRerunOutcome)> {
+    engine
+        .session_store
+        .read_verification_events(session_id, &[])
+        .unwrap()
+        .into_iter()
+        .filter_map(|event| match event {
+            VerificationEvent::IsolatedRerun {
+                tests,
+                passed_alone,
+                outcome,
+                ..
+            } => Some((tests, passed_alone, outcome)),
+            _ => None,
+        })
+        .collect()
+}
+
 fn provenance(
     engine: &WorkspaceEngine,
     proposal: &EditProposalResult,
@@ -320,9 +349,23 @@ fn classify_fixture(
         "one baseline, for the failed check: {recorded:?}"
     );
     assert_eq!(recorded[0].0, cargo_test());
-    // The baseline ran once in a temporary tree, never in the checkout.
+    // The baseline ran once in a temporary tree, never in the checkout. A
+    // narrowed baseline that passed is followed by one rerun alone in the
+    // checkout (spec 114 D3).
     let runs = runs(&data_dir);
-    assert_eq!(runs.len(), 2, "the live check and its baseline: {runs:?}");
+    let reruns = isolated_reruns(&engine, &proposal.session.id).len();
+    assert_eq!(
+        runs.len(),
+        2 + reruns,
+        "the live check, its baseline and any rerun alone: {runs:?}"
+    );
+    assert_eq!(
+        runs.iter()
+            .filter(|run| run.contains("damaian-baseline-tree_"))
+            .count(),
+        1,
+        "{runs:?}"
+    );
     let canonical = fs::canonicalize(&root).unwrap();
     assert!(
         runs.iter()
@@ -702,8 +745,13 @@ fn two_failing_tests_rerun_alone_by_name() {
 
     assert_eq!(
         commands(&data_dir),
-        ["cargo test", "cargo test -- --exact tests::a tests::b"],
-        "the live check, then only its two failing tests in the task-start tree"
+        [
+            "cargo test",
+            "cargo test -- --exact tests::a tests::b",
+            "cargo test -- --exact tests::a tests::b"
+        ],
+        "the live check, then only its two failing tests in the task-start tree, then \
+         the same two alone on the current files (spec 114 D3), where they still fail"
     );
     let recorded = baselines(&engine, &proposal.session.id);
     assert!(
@@ -814,7 +862,20 @@ fn a_new_failing_test_is_a_new_regression_under_cargo_test() {
 
     assert_eq!(
         commands(&data_dir),
-        ["cargo test", "cargo test -- --exact tests::added"]
+        [
+            "cargo test",
+            "cargo test -- --exact tests::added",
+            // Spec 114 D3: rerun alone on the current files, where it fails.
+            "cargo test -- --exact tests::added"
+        ]
+    );
+    assert_eq!(
+        isolated_reruns(&engine, &proposal.session.id),
+        [(
+            vec!["tests::added".to_string()],
+            Vec::new(),
+            IsolatedRerunOutcome::Ran
+        )]
     );
     let recorded = baselines(&engine, &proposal.session.id);
     assert!(
@@ -922,5 +983,246 @@ fn a_new_failing_test_is_a_new_regression_under_nextest() {
     );
     assert_eq!(classification.provenance, FailureProvenance::NewRegression);
     assert_eq!(classification.introduced.len(), 1, "{classification:?}");
+    cleanup(&root, &data_dir);
+}
+
+// --- Spec 114 Task 2 (D3): failing tests that pass alone. A narrowed
+// baseline that passed is followed by one rerun of the same tests alone on
+// the current files; the tests that pass there too are not the task's. ---
+
+/// `tests::a`, `tests::b` and `tests::c` all pass at task start.
+const THREE_TESTS: &str = "pub fn a() {}\n// test tests::a\n// test tests::b\n// test tests::c\n";
+
+fn alone_engine(data_dir: &Path, shell: &Path, retry_limit: u32) -> WorkspaceEngine {
+    WorkspaceEngine::new(Config {
+        data_dir: data_dir.to_path_buf(),
+        enable_index_watcher: false,
+        shell: shell.to_string_lossy().to_string(),
+        require_approval_for_risky_commands: false,
+        agent_tool_retry_limit: retry_limit,
+        ..Config::default()
+    })
+}
+
+fn names(list: &[&str]) -> Vec<String> {
+    list.iter().map(|name| name.to_string()).collect()
+}
+
+#[test]
+fn only_the_test_that_fails_alone_is_handed_to_repair() {
+    // The 2026-11-16 shape: three tests fail in the whole run, all three pass
+    // alone at task start, and on the current files two pass alone.
+    let root = git_fixture("alone-mixed", THREE_TESTS, None);
+    let data_dir = temp_dir("alone-mixed-data");
+    let shell = fake_shell(&data_dir);
+    let engine = alone_engine(&data_dir, &shell, 0);
+    let proposal = propose_and_apply(
+        &engine,
+        &root,
+        "pub fn a() {}\n// flaky tests::a\n// flaky tests::b\n// fail tests::c\n",
+    );
+    let result = verify(&engine, &root, &proposal.session.id);
+
+    let narrowed = "cargo test -- --exact tests::a tests::b tests::c";
+    assert_eq!(commands(&data_dir), ["cargo test", narrowed, narrowed]);
+    let canonical = fs::canonicalize(&root).unwrap();
+    let last = runs(&data_dir).last().cloned().unwrap();
+    assert!(
+        Path::new(&last) == canonical || Path::new(&last) == root,
+        "the rerun runs in the checkout, on the current files: {last}"
+    );
+    assert_eq!(
+        isolated_reruns(&engine, &proposal.session.id),
+        [(
+            names(&["tests::a", "tests::b", "tests::c"]),
+            names(&["tests::a", "tests::b"]),
+            IsolatedRerunOutcome::Ran
+        )]
+    );
+    let record = provenance(&engine, &proposal)
+        .remove(&cargo_test())
+        .expect("the failure is classified");
+    assert_eq!(record.provenance, FailureProvenance::NewRegression);
+    assert_eq!(record.findings.len(), 3, "the report keeps every failure");
+    assert_eq!(record.introduced.len(), 1, "{record:?}");
+    assert!(record.introduced[0].summary().starts_with("tests::c"));
+    let report = result.verification_report.expect("a report");
+    let request = report.repair_request().expect("tests::c is repaired");
+    assert!(request.contains("tests::c"), "{request}");
+    assert!(
+        !request.contains("tests::a") && !request.contains("tests::b"),
+        "a test that passes alone is never a repair target: {request}"
+    );
+    cleanup(&root, &data_dir);
+}
+
+#[test]
+fn a_check_whose_failing_tests_all_pass_alone_is_not_repaired_and_is_accepted() {
+    let root = git_fixture("alone-all", THREE_TESTS, None);
+    let data_dir = temp_dir("alone-all-data");
+    let shell = fake_shell(&data_dir);
+    // A repair would be allowed, so its absence is the classification's.
+    let engine = alone_engine(&data_dir, &shell, 2);
+    let proposal = propose_and_apply(
+        &engine,
+        &root,
+        "pub fn a() {}\n// flaky tests::a\n// flaky tests::b\n// flaky tests::c\n",
+    );
+    let result = verify(&engine, &root, &proposal.session.id);
+
+    let narrowed = "cargo test -- --exact tests::a tests::b tests::c";
+    assert_eq!(
+        commands(&data_dir),
+        ["cargo test", narrowed, narrowed],
+        "no repair ran anything"
+    );
+    let all = names(&["tests::a", "tests::b", "tests::c"]);
+    assert_eq!(
+        isolated_reruns(&engine, &proposal.session.id),
+        [(all.clone(), all, IsolatedRerunOutcome::Ran)]
+    );
+    let record = provenance(&engine, &proposal)
+        .remove(&cargo_test())
+        .expect("the failure is classified");
+    assert_eq!(record.provenance, FailureProvenance::PassesAlone);
+    assert!(record.introduced.is_empty(), "{record:?}");
+
+    let report = result.verification_report.expect("a report");
+    assert!(report.repair_request().is_none(), "no repair starts");
+    assert!(report.repair_targets.is_empty());
+    assert_eq!(
+        report.outcome,
+        Some(workspace_engine::VerificationOutcome::OnlyPreExistingFailures)
+    );
+    assert_eq!(
+        report.verdict.as_ref().map(|verdict| verdict.kind),
+        Some(workspace_engine::VerdictKind::NotCausedByTask)
+    );
+    let partition = &report.provenance[0];
+    assert_eq!(partition.provenance, FailureProvenance::PassesAlone);
+    assert_eq!(partition.label, "Passes when run alone");
+    assert!(!partition.repair_eligible);
+    assert_eq!(
+        partition.checks[0].baseline,
+        "Before this task's changes: the 3 failing tests passed when run alone, and on the current files too"
+    );
+
+    let gate = engine
+        .session_store
+        .read_completion_report(&proposal.session.id, &result.task.id)
+        .unwrap()
+        .expect("the gate settled the task");
+    assert_eq!(gate.accepted_failures.len(), 1, "{gate:?}");
+    let accepted = &gate.accepted_failures[0];
+    assert_eq!(accepted.check, cargo_test());
+    assert_eq!(accepted.provenance, FailureProvenance::PassesAlone);
+    for name in ["tests::a", "tests::b", "tests::c"] {
+        assert!(accepted.explanation.contains(name), "{accepted:?}");
+    }
+    cleanup(&root, &data_dir);
+}
+
+#[test]
+fn a_rerun_alone_that_would_need_approval_is_skipped_without_a_card() {
+    let root = git_fixture("alone-approval", "pub fn a() {}\n// test tests::a\n", None);
+    let data_dir = temp_dir("alone-approval-data");
+    let shell = fake_shell(&data_dir);
+    let engine = engine(&data_dir, &shell, true);
+    let proposal = propose_and_apply(&engine, &root, "pub fn a() {}\n// flaky tests::a\n");
+    let first = verify(&engine, &root, &proposal.session.id);
+    let card = first.check_batch.expect("the check needs approval");
+    let decisions = card
+        .checks
+        .iter()
+        .map(|check| (check.id.clone(), true))
+        .collect::<Vec<_>>();
+    let failed = decide(&engine, &card.id, &decisions, &CancelToken::new());
+    let card = failed.check_batch.expect("the baseline card");
+    let after = decide(
+        &engine,
+        &card.id,
+        &[(card.checks[0].id.clone(), true)],
+        &CancelToken::new(),
+    );
+
+    assert!(
+        after.check_batch.is_none(),
+        "the rerun never adds a card: {:?}",
+        after.check_batch
+    );
+    assert_eq!(
+        commands(&data_dir),
+        ["cargo test", "cargo test -- --exact tests::a"],
+        "the rerun did not run"
+    );
+    assert_eq!(
+        isolated_reruns(&engine, &proposal.session.id),
+        [(
+            names(&["tests::a"]),
+            Vec::new(),
+            IsolatedRerunOutcome::Skipped
+        )]
+    );
+    let record = provenance(&engine, &proposal)
+        .remove(&cargo_test())
+        .expect("the failure is classified");
+    assert_eq!(
+        record.provenance,
+        FailureProvenance::NewRegression,
+        "classified as before"
+    );
+    cleanup(&root, &data_dir);
+}
+
+#[test]
+fn a_rerun_alone_stopped_while_it_runs_is_cancelled_and_classifies_as_before() {
+    let root = git_fixture("alone-stop", "pub fn a() {}\n// test tests::a\n", None);
+    let data_dir = temp_dir("alone-stop-data");
+    let shell = fake_shell(&data_dir);
+    let engine = alone_engine(&data_dir, &shell, 0);
+    let proposal = propose_and_apply(&engine, &root, "pub fn a() {}\n// flaky tests::a\n");
+
+    // The baseline answers at once; once it has, every later run sleeps
+    // until stopped, so the stop always lands on the running rerun.
+    let slow = slow_marker(&data_dir);
+    let cancel = CancelToken::new();
+    let mut started = false;
+    let mut adapter = MockModelAdapter::new("unused");
+    let mut on_token = |_token: &str| {};
+    let mut on_progress = |event: TurnProgress| {
+        let TurnProgress::Phase(phase) = &event else {
+            return;
+        };
+        if phase.baseline && phase.label.starts_with("Before this task's changes") {
+            fs::write(&slow, "").unwrap();
+        }
+        if !phase.baseline && phase.label.starts_with("Checking whether the failing test") {
+            started = true;
+            cancel.cancel();
+        }
+    };
+    let mut sink = TurnSink {
+        on_token: &mut on_token,
+        on_progress: &mut on_progress,
+        cancel: &cancel,
+        steering: None,
+    };
+    engine
+        .chat_orchestrator
+        .verify_due(&root, &proposal.session.id, &mut adapter, &mut sink)
+        .expect("the verification finishes");
+    assert!(started, "the rerun started");
+    assert_eq!(
+        isolated_reruns(&engine, &proposal.session.id),
+        [(
+            names(&["tests::a"]),
+            Vec::new(),
+            IsolatedRerunOutcome::Cancelled
+        )]
+    );
+    let record = provenance(&engine, &proposal)
+        .remove(&cargo_test())
+        .expect("the failure is classified");
+    assert_eq!(record.provenance, FailureProvenance::NewRegression);
     cleanup(&root, &data_dir);
 }

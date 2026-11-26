@@ -1914,6 +1914,17 @@ impl ChatOrchestrator {
             } else {
                 classify(&result, baselines.get(check), previous.get(check))
             };
+            // Spec 114 D3: tests that passed alone before the task and pass
+            // alone now are not the task's. Only a rerun that ran counts.
+            let classification = match state.isolated_reruns.get(check) {
+                Some(rerun) if rerun.outcome == crate::verification::IsolatedRerunOutcome::Ran => {
+                    crate::provenance::without_tests_passing_alone(
+                        classification,
+                        &rerun.passed_alone,
+                    )
+                }
+                _ => classification,
+            };
             self.session_store.append_verification_event(
                 &session.id,
                 &VerificationEvent::Provenance {
@@ -1981,7 +1992,26 @@ impl ChatOrchestrator {
                     batch,
                 );
             }
+            // Spec 114 D3: a failing test a narrowed baseline passed alone
+            // reruns alone on the current files, once per run of its check.
+            let unrun = failed
+                .into_iter()
+                .filter(|failed| !state.isolated_reruns.contains_key(&failed.check))
+                .collect::<Vec<_>>();
+            self.baselines.rerun_tests_alone(
+                repository_root,
+                &session.id,
+                &task.id,
+                &unrun,
+                cancel,
+                &mut |progress| on_progress(isolated_rerun_turn_progress(progress)),
+            )?;
         }
+        let state = fold_verification(
+            self.session_store
+                .read_verification_events(&session.id, &[])?
+                .iter(),
+        );
         let plan = self
             .session_store
             .read_task_plan(&session.id, &task.id)?
@@ -2696,6 +2726,17 @@ fn run_evidence(
             .collect(),
         _ => Vec::new(),
     }
+}
+
+/// An isolated rerun's progress (spec 114 D3). It runs on the current files,
+/// so it is not a baseline and carries no baseline marker.
+fn isolated_rerun_turn_progress(progress: crate::baseline::BaselineProgress) -> TurnProgress {
+    let (kind, label) = match progress {
+        crate::baseline::BaselineProgress::Started { label, .. }
+        | crate::baseline::BaselineProgress::Finished { label, .. } => (PhaseKind::Tool, label),
+        crate::baseline::BaselineProgress::Output { line } => (PhaseKind::Output, line),
+    };
+    TurnProgress::Phase(TurnPhase::new(kind, label, 0, 0, 0, 0, 0))
 }
 
 /// A baseline's progress as the turn's status line shows it: the running

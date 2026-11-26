@@ -4187,6 +4187,7 @@ impl SessionStore {
             VerificationEvent::Build { .. } => "verification_build",
             VerificationEvent::Finished { .. } => "verification_finished",
             VerificationEvent::Baseline { .. } => "verification_baseline",
+            VerificationEvent::IsolatedRerun { .. } => "verification_isolated_rerun",
             VerificationEvent::Provenance { .. } => "verification_provenance",
             VerificationEvent::RepairState { .. } => "verification_repair_state",
             VerificationEvent::RepairStalled { .. } => "verification_repair_stalled",
@@ -4421,6 +4422,7 @@ impl SessionStore {
                     | "verification_build"
                     | "verification_finished"
                     | "verification_baseline"
+                    | "verification_isolated_rerun"
                     | "verification_provenance"
                     | "verification_repair_state"
                     | "verification_repair_stalled"

@@ -641,6 +641,11 @@ pub enum FailureProvenance {
     /// silently pre-existing or automatically repaired (spec 102 D2).
     Uncertain,
     UnknownProvenance,
+    /// A narrowed Rust test baseline passed, and every introduced failing
+    /// test also passes when rerun alone on the current files (spec 114 D3):
+    /// an order-dependent failure the task did not cause. Never repaired; the
+    /// completion gate accepts it, naming the tests.
+    PassesAlone,
 }
 
 impl FailureProvenance {
@@ -653,6 +658,7 @@ impl FailureProvenance {
             Self::EnvironmentFailure => "environment_failure",
             Self::Uncertain => "uncertain",
             Self::UnknownProvenance => "unknown_provenance",
+            Self::PassesAlone => "passes_alone",
         }
     }
 }
@@ -1401,6 +1407,21 @@ pub enum VerificationEvent {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         tests: Vec<String>,
     },
+    /// The failing tests a narrowed baseline passed, rerun alone on the
+    /// current files (spec 114 D3). Written after the check's baseline and
+    /// before its provenance; absent from every earlier log, so replay must
+    /// not invent one.
+    #[serde(rename = "verification_isolated_rerun", rename_all = "camelCase")]
+    IsolatedRerun {
+        task_id: String,
+        check: CheckId,
+        /// The failing tests the rerun named.
+        tests: Vec<String>,
+        /// Those of `tests` that passed alone. Empty unless `outcome` is `ran`.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        passed_alone: Vec<String>,
+        outcome: IsolatedRerunOutcome,
+    },
     /// One post-patch provenance classification (spec 102 Task 3).
     #[serde(rename = "verification_provenance", rename_all = "camelCase")]
     Provenance {
@@ -1454,11 +1475,47 @@ impl VerificationEvent {
             | Self::Build { task_id, .. }
             | Self::Finished { task_id, .. }
             | Self::Baseline { task_id, .. }
+            | Self::IsolatedRerun { task_id, .. }
             | Self::Provenance { task_id, .. }
             | Self::RepairState { task_id, .. }
             | Self::RepairStalled { task_id, .. } => task_id,
         }
     }
+}
+
+/// What became of the rerun of a narrowed baseline's tests on the current
+/// files (spec 114 D3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IsolatedRerunOutcome {
+    /// It ran; the event's `passedAlone` names the tests that passed.
+    Ran,
+    /// Its command would need approval or is refused by policy, so it did not
+    /// run: the rerun never adds a card. Classification is as before.
+    Skipped,
+    /// The user stopped the turn before or while it ran.
+    Cancelled,
+    /// It could not run, for an environment reason.
+    Unavailable,
+}
+
+impl IsolatedRerunOutcome {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Ran => "ran",
+            Self::Skipped => "skipped",
+            Self::Cancelled => "cancelled",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
+/// The latest isolated rerun of one check's failing tests (spec 114 D3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IsolatedRerun {
+    pub tests: Vec<String>,
+    pub passed_alone: Vec<String>,
+    pub outcome: IsolatedRerunOutcome,
 }
 
 /// A due verification's origin, kept so recovery can say what is waiting.
@@ -1509,6 +1566,10 @@ pub struct VerificationState {
     /// The failing tests each baseline in `baselines` reran by name; absent
     /// when it ran the whole check (spec 109 D3).
     pub baseline_tests: BTreeMap<CheckId, Vec<String>>,
+    /// The isolated rerun of each check's failing tests after its latest run
+    /// (spec 114 D3), cleared by a later run of the same check, so a rerun
+    /// never speaks for a run it did not follow.
+    pub isolated_reruns: BTreeMap<CheckId, IsolatedRerun>,
     /// The latest post-patch classification per check (spec 102).
     pub provenance: BTreeMap<CheckId, CheckProvenanceRecord>,
     /// The bounded repair-state window, oldest first (spec 102 requirement 7).
@@ -1603,6 +1664,7 @@ impl VerificationState {
                     self.passed_before.insert(check.clone());
                 }
                 self.provenance_current.remove(check);
+                self.isolated_reruns.remove(check);
                 self.reused.remove(check);
                 self.deferred.remove(check);
                 self.deferred_to_completion.remove(check);
@@ -1674,6 +1736,22 @@ impl VerificationState {
                 } else {
                     self.baseline_tests.insert(check.clone(), tests.clone());
                 }
+            }
+            VerificationEvent::IsolatedRerun {
+                check,
+                tests,
+                passed_alone,
+                outcome,
+                ..
+            } => {
+                self.isolated_reruns.insert(
+                    check.clone(),
+                    IsolatedRerun {
+                        tests: tests.clone(),
+                        passed_alone: passed_alone.clone(),
+                        outcome: *outcome,
+                    },
+                );
             }
             VerificationEvent::Provenance { record, .. } => {
                 self.provenance.insert(record.check.clone(), record.clone());
@@ -2162,12 +2240,18 @@ impl VerificationReport {
         let not_caused = checks_in(&[
             FailureProvenance::PreExisting,
             FailureProvenance::UnchangedFailure,
+            FailureProvenance::PassesAlone,
         ]);
         if not_caused > 0 {
+            let detail = if checks_in(&[FailureProvenance::PassesAlone]) == not_caused {
+                "The failing tests pass when run alone, so they depend on the order they run in; no repair was attempted."
+            } else {
+                "They failed the same way before this task's changes, so no repair was attempted; fix them separately if you want them addressed."
+            };
             return verdict(
                 VerdictKind::NotCausedByTask,
                 "Checks fail, but not because of this task's changes".to_string(),
-                "They failed the same way before this task's changes, so no repair was attempted; fix them separately if you want them addressed.",
+                detail,
             );
         }
         // A failed check with no provenance entry has no recorded result: the
@@ -2736,6 +2820,11 @@ fn summary_count(provenance: FailureProvenance, count: usize) -> String {
         FailureProvenance::UnknownProvenance => (
             "failure of unknown provenance",
             "failures of unknown provenance",
+        ),
+        // New with spec 114 D3; no earlier summary could contain it.
+        FailureProvenance::PassesAlone => (
+            "failure that passes when run alone",
+            "failures that pass when run alone",
         ),
     };
     format!("{count} {}", if count == 1 { singular } else { plural })
