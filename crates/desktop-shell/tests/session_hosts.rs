@@ -90,11 +90,19 @@ fn answer(stream: TcpStream, arrived: &AtomicUsize, open: &AtomicBool) {
         std::thread::sleep(Duration::from_millis(20));
     }
     std::thread::sleep(Duration::from_millis(MODEL_DELAY_MS.load(Ordering::SeqCst)));
-    let (chunk, last) = if wants_command(&body) {
+    let (chunk, last) = if wants_command(&body) || wants_command_after_plan(&body) {
         let id = arrived.load(Ordering::SeqCst);
         (
             format!(
                 r#"{{"id":"c1","object":"chat.completion.chunk","created":1,"model":"fake","choices":[{{"index":0,"delta":{{"role":"assistant","tool_calls":[{{"index":0,"id":"call_{id}","type":"function","function":{{"name":"run_command","arguments":"{{\"command\":\"touch marked-{id}.txt\",\"reason\":\"Mark the tree\"}}"}}}}]}},"finish_reason":null}}]}}"#
+            ),
+            r#"{"id":"c1","object":"chat.completion.chunk","created":1,"model":"fake","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+        )
+    } else if wants_tool_call(&body, PLAN_PROMPT) {
+        let id = arrived.load(Ordering::SeqCst);
+        (
+            format!(
+                r#"{{"id":"c1","object":"chat.completion.chunk","created":1,"model":"fake","choices":[{{"index":0,"delta":{{"role":"assistant","tool_calls":[{{"index":0,"id":"call_{id}","type":"function","function":{{"name":"propose_plan","arguments":"{{\"steps\":[{{\"title\":\"Add the pause key\"}},{{\"title\":\"Test pausing\"}}]}}"}}}}]}},"finish_reason":null}}]}}"#
             ),
             r#"{"id":"c1","object":"chat.completion.chunk","created":1,"model":"fake","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
         )
@@ -129,6 +137,9 @@ static MODEL_DELAY_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU
 /// The prompt that makes the model call `mcp__tracker__ping` once per turn
 /// (spec 33 Task 7's host-level health test); every other prompt gets "Done.".
 const TRACKER_PROMPT: &str = "PING-THE-TRACKER once.";
+/// The prompt that makes the model propose a two-step plan, which pauses the
+/// turn on the user's plan review.
+const PLAN_PROMPT: &str = "PLAN-THE-PAUSE once.";
 /// The prompt that makes the model propose a `touch` command, which pauses the
 /// turn on the user's approval.
 const COMMAND_PROMPT: &str = "TOUCH-A-FILE once.";
@@ -138,6 +149,12 @@ const TWO_COMMANDS_PROMPT: &str = "TOUCH-TWO-FILES in turn.";
 
 /// Whether this request is a turn for `prompt` whose call has not been
 /// answered yet: more user prompts asking for the call than tool results so far.
+/// A plan turn's second call: once the plan is proposed, the command its
+/// first step needs, which the engine defers behind the plan review.
+fn wants_command_after_plan(body: &[u8]) -> bool {
+    tool_calls_owed(body, &[(PLAN_PROMPT, 2)]) && !wants_tool_call(body, PLAN_PROMPT)
+}
+
 fn wants_tool_call(body: &[u8], prompt: &str) -> bool {
     tool_calls_owed(body, &[(prompt, 1)])
 }
@@ -866,6 +883,81 @@ fn two_new_sessions_started_by_their_first_message_each_keep_their_card() {
     assert_eq!(card(&b, &b_task), serde_json::Value::Null);
     assert_eq!(card(&a, &a_task), serde_json::Value::Null);
     assert_eq!(live_pid(&b), b_pid, "B's host served its answer");
+}
+
+/// Owner report 2026-11-26 (v0.84.0): a new session whose first turn ended in
+/// a plan review showed the card with no way to answer it. The turn's own
+/// `done` and the reload's `/api/pending-card` both carry the plan the card
+/// is drawn from, and approving it resumes the turn through the session's
+/// host.
+#[test]
+#[ignore = "starts real host processes and binds loopback ports; see the module docs"]
+fn a_new_sessions_first_turn_paused_on_a_plan_review_is_answerable() {
+    let _turn = exclusive();
+    let (shell, model) = shell_and_model();
+    model.release();
+    let repo = temp_repo("first-plan");
+    let repo_arg = repo.to_str().unwrap();
+    let streamed = shell
+        .stream(
+            "/api/ask-stream",
+            &[("repo", repo_arg), ("prompt", PLAN_PROMPT)],
+        )
+        .join()
+        .unwrap();
+    let session = streamed_session(&streamed);
+    let done = done_payload(&streamed);
+    let decision = &done["turnPresentation"]["pendingDecision"];
+    assert_eq!(decision["kind"], "plan", "{done}");
+    let proposal = done["planProposal"]["proposalId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the turn carries its plan: {done}"))
+        .to_string();
+    assert_eq!(decision["cardId"], proposal.as_str(), "{done}");
+    let task = done["taskId"].as_str().unwrap().to_string();
+    let (status, card, _) = shell.call(
+        "/api/pending-card",
+        &[("session_id", &session), ("task_id", &task)],
+    );
+    assert_eq!(status, 200, "{card}");
+    assert_eq!(card["card"]["kind"], "plan", "{card}");
+    assert_eq!(
+        card["card"]["payload"]["proposalId"],
+        proposal.as_str(),
+        "{card}"
+    );
+    assert_eq!(
+        card["card"]["payload"]["plan"]["steps"]
+            .as_array()
+            .map(Vec::len),
+        Some(2),
+        "the reloaded card has the plan's steps: {card}"
+    );
+    let pid = live_pid(&session);
+
+    let approved = shell
+        .stream(
+            "/api/resume-plan-stream",
+            &[
+                ("repo", repo_arg),
+                ("proposal_id", &proposal),
+                ("approved", "true"),
+            ],
+        )
+        .join()
+        .unwrap();
+    assert!(approved.contains("event: done"), "{approved}");
+    assert_eq!(
+        live_pid(&session),
+        pid,
+        "answered through the session's host"
+    );
+    let (_, card, _) = shell.call(
+        "/api/pending-card",
+        &[("session_id", &session), ("task_id", &task)],
+    );
+    // The approved plan's first step runs its command, which asks first.
+    assert_eq!(card["card"]["kind"], "command", "{card}");
 }
 
 /// Spec 33 Task 7: MCP health lives in the process whose turn contacted the
