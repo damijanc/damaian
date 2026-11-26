@@ -393,6 +393,21 @@ fn route_class(route: routes::Route, request: &Request) -> routes::RouteClass {
         return routes::RouteClass::Ui;
     }
     let form = parse_form(&request.body);
+    // A paused turn belongs to one session, so answering it takes that
+    // session's lane and host whatever session the window names. A window
+    // that sent the session on screen instead put a recovered card's answer
+    // in another session's lane — refused as "already working" while that
+    // session ran — and would have resumed the turn in the other's host.
+    let paused = form
+        .get("proposal_id")
+        .filter(|id| is_plain_id(id))
+        .and_then(|id| {
+            let data_dir = effective_data_dir().ok()?;
+            PausedTurns::new(data_dir).session_id(id)
+        });
+    if paused.is_some() {
+        return routes::RouteClass::SessionWork(paused);
+    }
     let field = routes::session_field(route);
     let named = form
         .get(field)
@@ -402,15 +417,7 @@ fn route_class(route: routes::Route, request: &Request) -> routes::RouteClass {
     if named.is_some() {
         return routes::RouteClass::SessionWork(named);
     }
-    let resolved = form
-        .get("proposal_id")
-        .filter(|id| is_plain_id(id))
-        .and_then(|id| {
-            let data_dir = effective_data_dir().ok()?;
-            PausedTurns::new(data_dir).session_id(id)
-        })
-        .or_else(|| patch_session(&form))
-        .or_else(|| checkpoint_session(&form));
+    let resolved = patch_session(&form).or_else(|| checkpoint_session(&form));
     routes::RouteClass::SessionWork(resolved)
 }
 

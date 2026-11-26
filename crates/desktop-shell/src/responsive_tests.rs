@@ -539,8 +539,39 @@ fn a_resume_request_is_classified_by_its_paused_turns_session() {
             route,
             &request(format!("proposal_id={proposal}&session_id=named"))
         ),
+        routes::RouteClass::SessionWork(Some("session_from_snapshot".to_string())),
+        "the paused turn's session wins over the one the window names"
+    );
+    // Owner report 2026-11-26: a recovered command card sent the session on
+    // screen. With that session working, the answer must still go to the
+    // paused turn's own lane rather than be refused as already working.
+    let run_command = |body: String| Request {
+        path: "/api/run-command".to_string(),
+        ..request(body)
+    };
+    let busy = lanes::claim("session_on_screen", "Answering a message").unwrap();
+    let class = route_class(
+        routes::Route::RunCommand,
+        &run_command(format!(
+            "proposal_id={proposal}&session_id=session_on_screen"
+        )),
+    );
+    assert_eq!(
+        class,
+        routes::RouteClass::SessionWork(Some("session_from_snapshot".to_string()))
+    );
+    let routes::RouteClass::SessionWork(Some(owner)) = class else {
+        unreachable!()
+    };
+    assert!(lanes::claim(&owner, "Running a command").is_ok());
+    drop(busy);
+    assert_eq!(
+        route_class(
+            routes::Route::RunCommand,
+            &run_command("proposal_id=cmdprop_with_no_pause&session_id=named".to_string())
+        ),
         routes::RouteClass::SessionWork(Some("named".to_string())),
-        "a named session wins"
+        "with no paused turn behind the proposal, the named session is used"
     );
     assert_eq!(
         route_class(route, &request("proposal_id=..%2Fescape".to_string())),
