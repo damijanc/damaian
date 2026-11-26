@@ -147,7 +147,11 @@ when the turn ended. Local OBSERVATIONS 94.
   UI: everything else, including rename, settings and config writes, pins and
   context restriction. Archive and delete are UI routes that refuse a session
   whose lane is busy (requirement 3); today's running-worker refusal for
-  archive stays.
+  archive stays. The session is the paused turn's when the request's
+  `proposal_id` names one, whatever `session_id` the window sends; otherwise
+  the named session, then a patch's or checkpoint's. A paused turn belongs to
+  one session, so its answer never takes another's lane or host (owner report
+  2026-11-26: a recovered command card named the session on screen).
 - **D3 — reaching running work.** Each host reports its session id, a label
   ("Running `cargo test` in crates/workspace-engine", "Waiting for the model")
   and accepts a cancel on its control socket. A UI route can list working
