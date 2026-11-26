@@ -946,6 +946,7 @@
               <h3>Configured servers</h3>
               <button id="mcp-new-btn" type="button">New</button>
             </div>
+            <p id="mcp-context-cost" class="mcp-context-cost" data-state=""></p>
             <div id="mcp-server-list" class="provider-list-card"></div>
           </section>
 
@@ -1033,7 +1034,7 @@
               </label>
               <label class="field-checkbox">
                 <input id="mcp-approval-input" type="checkbox" checked />
-                <span>Require approval before each tool call</span>
+                <span>Require approval before each tool call (a tool's own setting outranks this)</span>
               </label>
 
               <div class="inline-actions">

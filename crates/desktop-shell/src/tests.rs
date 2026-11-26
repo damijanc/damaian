@@ -2350,6 +2350,42 @@ fn app_js_gives_every_running_action_one_state_and_a_stop() {
 /// Escape both go through it. The turn row and the composer lines build no
 /// Stop; unstoppable work leaves a disabled Stop that says why.
 #[test]
+fn app_js_mcp_tool_controls_write_only_the_users_own_config() {
+    // The controls write the editor's content, which is always the user's
+    // own file, so a repository's config can only make a tool stricter.
+    assert!(
+        app_js_function("configScope").contains("return \"user\""),
+        "the editor is the user's own config"
+    );
+    let set = app_js_function("setMcpToolSetting");
+    assert!(
+        set.contains("mcp_server.${serverId}.tool.${toolName}.${field}"),
+        "{set}"
+    );
+    assert!(set.contains("saveConfigFile()"), "{set}");
+    assert!(
+        set.contains("removeConfigValue"),
+        "unset goes back to following the server: {set}"
+    );
+    // Saving the server form must not drop the server's per-tool settings.
+    let upsert = app_js_function("upsertMcpConfig");
+    assert!(upsert.contains("keepTools: true"), "{upsert}");
+    // A tool key is not a server named `<server>.tool.<tool>`.
+    let sync = app_js_function("syncMcpServersFromConfig");
+    let tool = sync.find("mcpToolFieldPattern").expect("tool keys first");
+    let server = sync
+        .find("mcpServerFieldPattern")
+        .expect("then server keys");
+    assert!(tool < server, "{sync}");
+    // `unknown` never reads as healthy.
+    let state = app_js_function("mcpHealthState");
+    assert!(
+        state.contains("if (health === \"ready\") return \"ok\""),
+        "{state}"
+    );
+}
+
+#[test]
 fn app_js_has_one_stop_in_the_composer() {
     let target = app_js_function("composerStopTarget");
     let stream = target
@@ -9839,7 +9875,17 @@ fn mcp_health_json_tells_unknown_from_ready_and_never_shows_a_token() {
         ),
     ];
     let scanner = SecretScanner::new(Config::default().secret_patterns);
-    let payload = super::mcp_health_json(&[alpha, beta, gamma], "repo_a", &observations, &scanner);
+    let config = Config {
+        mcp_servers: vec![alpha, beta, gamma],
+        ..Config::default()
+    };
+    let payload = super::mcp_health_json(
+        &config,
+        "repo_a",
+        &observations,
+        &workspace_engine::McpToolInventory::default(),
+        &scanner,
+    );
     let text = payload.to_string();
     let servers = payload["servers"].as_array().unwrap();
     assert_eq!(servers[0]["health"], "ready");
@@ -9857,6 +9903,104 @@ fn mcp_health_json_tells_unknown_from_ready_and_never_shows_a_token() {
             .is_some_and(|reason| reason.contains("refused the credentials")),
         "{text}"
     );
+}
+
+/// The settings panel's tools and context cost (spec 33 Task 9): a listed
+/// server carries its tools with the *effective* per-tool settings — a tool
+/// with no approval setting of its own follows the server — a never-listed
+/// server's tools are `null`, not an empty list, and the cost counts only
+/// enabled tools of active servers, leaving a never-listed one as unknown.
+#[test]
+fn mcp_health_json_lists_tools_with_effective_settings_and_the_context_cost() {
+    use workspace_engine::{
+        McpInventoryTool, McpServerInventory, McpToolConfig, McpToolInventory, McpTransport,
+        SecretScanner, namespaced_tool_name,
+    };
+    let alpha = mcp_test_server("alpha", McpTransport::Stdio);
+    let beta = mcp_test_server("beta", McpTransport::Stdio);
+    let mut off = mcp_test_server("off", McpTransport::Stdio);
+    off.enabled = false;
+    let tool = |name: &str, tokens: usize, seen: u128, hint: Option<bool>| McpInventoryTool {
+        name: name.to_string(),
+        description: format!("{name} things"),
+        schema_bytes: 10,
+        input_schema_json: "{}".to_string(),
+        estimated_tokens: tokens,
+        read_only_hint: hint,
+        content_hash: String::new(),
+        first_seen_at_ms: seen,
+    };
+    let mut inventory = McpToolInventory::default();
+    for (server, tools) in [
+        (
+            "alpha",
+            vec![
+                tool("read", 100, 1, Some(true)),
+                tool("write", 200, 5, None),
+                tool("drop", 400, 9, None),
+            ],
+        ),
+        ("off", vec![tool("idle", 50, 1, None)]),
+    ] {
+        inventory.servers.insert(
+            server.to_string(),
+            McpServerInventory {
+                server_id: server.to_string(),
+                refreshed_at_ms: 11,
+                tools,
+            },
+        );
+    }
+    let mut mcp_tools = BTreeMap::new();
+    mcp_tools.insert(
+        namespaced_tool_name("alpha", "read"),
+        McpToolConfig {
+            require_approval: Some(false),
+            ..McpToolConfig::default()
+        },
+    );
+    mcp_tools.insert(
+        namespaced_tool_name("alpha", "drop"),
+        McpToolConfig {
+            enabled: false,
+            ..McpToolConfig::default()
+        },
+    );
+    let config = Config {
+        mcp_enabled: true,
+        mcp_servers: vec![alpha, beta, off],
+        mcp_tools,
+        mcp_deferral_ceiling_tokens: 250,
+        ..Config::default()
+    };
+    let scanner = SecretScanner::new(config.secret_patterns.clone());
+    let payload = super::mcp_health_json(&config, "repo_a", &[], &inventory, &scanner);
+    let text = payload.to_string();
+    let servers = payload["servers"].as_array().unwrap();
+
+    assert_eq!(servers[0]["toolCount"], 3, "{text}");
+    let tools = servers[0]["tools"].as_array().unwrap();
+    assert_eq!(tools[0]["name"], "read");
+    assert_eq!(tools[0]["requireApproval"], false);
+    assert_eq!(tools[0]["approvalSetBy"], "tool");
+    assert_eq!(tools[0]["readOnlyHint"], true);
+    assert_eq!(tools[1]["requireApproval"], true, "follows the server");
+    assert_eq!(tools[1]["approvalSetBy"], "server");
+    assert_eq!(tools[1]["firstSeenAtMs"], 5);
+    assert_eq!(tools[2]["enabled"], false);
+
+    assert_eq!(servers[1]["tools"], serde_json::Value::Null, "never listed");
+    assert_eq!(servers[1]["toolCount"], serde_json::Value::Null);
+    assert_eq!(servers[2]["active"], false);
+
+    let cost = &payload["contextCost"];
+    assert_eq!(
+        cost["knownTokens"], 300,
+        "enabled tools of active servers: {text}"
+    );
+    assert_eq!(cost["ceilingTokens"], 250);
+    assert_eq!(cost["surface"], "deferred");
+    assert_eq!(cost["unknownServers"], serde_json::json!(["beta"]));
 }
 
 /// A stdio MCP server that answers `initialize` and `tools/list` with one
@@ -9949,6 +10093,21 @@ fn the_health_route_serves_unknown_until_a_retry_contacts_the_server() {
     let after = json_of(&get_for_test(port, &token, &health_url));
     assert_eq!(health_of(&after, "alpha"), "ready");
     assert_eq!(health_of(&after, "beta"), "unknown", "never contacted");
+    // The retry's listing refreshed the inventory, so the panel can list the
+    // tools and count their cost; beta was never listed.
+    let alpha_row = after["servers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|server| server["id"] == "alpha")
+        .unwrap();
+    assert_eq!(alpha_row["toolCount"], 1, "{after}");
+    assert_eq!(alpha_row["tools"][0]["name"], "ping");
+    assert!(after["contextCost"]["knownTokens"].as_u64().unwrap() > 0);
+    assert_eq!(
+        after["contextCost"]["unknownServers"],
+        serde_json::json!(["beta"])
+    );
 
     let refused = post_fields_for_test(
         port,

@@ -201,15 +201,16 @@ gate that proves the sequence works as one system (Done, 2026-11-09).
   made visible, a Baseline tag, order-dependent tests that pass alone no
   longer read as the task's, and a failed task's card with Continue task).
   Every dependency is built. Its engine Tasks 1–3 may run alongside spec 33
-  Tasks 7–8 (no shared files). Its Task 4 edits `app.js` and `style.css` and
-  must not run at the same time as spec 33 Task 9. Its Task 5 edits the user
+  Tasks 7–8 (no shared files). Its Task 4 edits `app.js` and `style.css`;
+  spec 33 Task 9, which edits the same files, is done (2026-11-26), so it no
+  longer waits. Its Task 5 edits the user
   guide and troubleshooting, so it must not run at the same time as spec 33
   Task 10.
 - **Ready:** #33 MCP management (planned 2026-11-09 as a folder spec). It was serialised behind #30 on `chat.rs`;
   with #30 Done it is free to start, from a `main` that contains #30's turn
-  path so it does not rebase over it. Tasks 1–4 are done; Tasks 5–10 were
-  held back while #109 edited the same chat code, and with #109 Done
-  (2026-11-25) they are free, from a `main` that contains it. The
+  path so it does not rebase over it. Tasks 1–9 are done (Task 9, the
+  servers and tools UI, 2026-11-26); Task 10 (docs, §7 measurement and
+  close-out) remains. The
   single-worker sequence #101–#106 is
   Done; [#106](106_single_worker_spec_acceptance/proposal.md) finished it on
   2026-11-09, and nothing waited on it.

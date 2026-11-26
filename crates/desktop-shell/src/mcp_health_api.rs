@@ -19,9 +19,10 @@
 
 use serde_json::{Map, Value, json};
 use workspace_engine::{
-    Config, McpHealthObservation, McpRuntime, McpServerConfig, McpServerHealth, McpServerRuntime,
-    McpTimeouts, McpTransport, SecretScanner, clear_mcp_health, mcp_health_snapshot,
-    mcp_server_health, merge_mcp_health, repository_id_for_root,
+    Config, McpHealthObservation, McpInventoryTool, McpRuntime, McpServerConfig, McpServerHealth,
+    McpServerRuntime, McpTimeouts, McpToolInventory, McpTransport, SecretScanner, clear_mcp_health,
+    decide_deferral, mcp_health_snapshot, mcp_server_health, merge_mcp_health,
+    repository_id_for_root,
 };
 
 use std::collections::HashMap;
@@ -86,25 +87,91 @@ fn auth_reference(server: &McpServerConfig, scanner: &SecretScanner) -> Value {
     }
 }
 
-/// The JSON `/api/mcp-health` serves for one repository: every configured
-/// server, with the latest health any process observed, or `unknown`.
-pub(crate) fn mcp_health_json(
-    servers: &[McpServerConfig],
-    repository_id: &str,
-    observations: &[McpHealthObservation],
+/// One inventory tool as the settings panel shows it (spec 33 Task 9, §5.9):
+/// what the server says about it, and the *effective* per-tool settings —
+/// user, admin, repository and profile already merged, so a repository that
+/// turned a tool off reads off here whatever the user's own file says.
+/// `approvalSetBy` is `tool` when the tool has its own `require_approval`,
+/// `server` when it follows its server's (`McpToolConfig::require_approval ==
+/// None`).
+fn tool_json(
+    config: &Config,
+    server_id: &str,
+    tool: &McpInventoryTool,
     scanner: &SecretScanner,
 ) -> Value {
-    let rows = servers
+    let settings = config.mcp_tool_settings(server_id, &tool.name);
+    json!({
+        "name": tool.name,
+        // Redacted when listed since Task 8; again here for an inventory
+        // written before that.
+        "description": scanner.redact(&tool.description).text,
+        "estimatedTokens": tool.estimated_tokens,
+        "readOnlyHint": tool.read_only_hint,
+        "firstSeenAtMs": u64::try_from(tool.first_seen_at_ms).unwrap_or(u64::MAX),
+        "enabled": settings.enabled,
+        "pinned": settings.pinned,
+        "requireApproval": config.mcp_tool_requires_approval(server_id, &tool.name),
+        "approvalSetBy": if settings.require_approval.is_some() { "tool" } else { "server" },
+    })
+}
+
+/// The context cost of the current MCP configuration (§5.9, D4/D7), decided
+/// as a turn decides it (`decide_deferral`) from the inventory alone: every
+/// enabled tool of every active server. Mode and profile can only narrow
+/// what a turn offers, so this is the most the configuration can cost.
+fn context_cost_json(config: &Config, inventory: &McpToolInventory) -> Value {
+    let active: Vec<&str> = config
+        .active_mcp_servers()
+        .iter()
+        .map(|server| server.id.as_str())
+        .collect();
+    let decision = decide_deferral(
+        inventory,
+        &active,
+        config.mcp_deferral_ceiling_tokens,
+        |server_id, tool| config.mcp_tool_settings(server_id, &tool.name).enabled,
+    );
+    json!({
+        "ceilingTokens": decision.ceiling_tokens,
+        "knownTokens": decision.known_tokens,
+        "surface": decision.known_surface,
+        "serverTokens": decision.server_tokens,
+        "unknownServers": decision.unknown_servers,
+    })
+}
+
+/// The JSON `/api/mcp-health` serves for one repository: every configured
+/// server, with the latest health any process observed, or `unknown`; its
+/// tools from the inventory (`null` when it was never listed, so "no tools"
+/// and "not yet known" stay apart); and the configuration's context cost.
+pub(crate) fn mcp_health_json(
+    config: &Config,
+    repository_id: &str,
+    observations: &[McpHealthObservation],
+    inventory: &McpToolInventory,
+    scanner: &SecretScanner,
+) -> Value {
+    let active: Vec<&str> = config
+        .active_mcp_servers()
+        .iter()
+        .map(|server| server.id.as_str())
+        .collect();
+    let rows = config
+        .mcp_servers
         .iter()
         .map(|server| {
             let seen = observations.iter().find(|observation| {
                 observation.repository_id == repository_id && observation.server_id == server.id
             });
+            let listed = inventory.servers.get(&server.id);
             json!({
                 "id": server.id,
                 "label": server.label,
                 "transport": transport_name(server.transport),
                 "enabled": server.enabled,
+                "active": active.contains(&server.id.as_str()),
+                "requireApproval": server.require_approval,
                 "authReference": auth_reference(server, scanner),
                 "health": seen.map_or(McpServerHealth::Unknown, |seen| seen.health),
                 "observedAtMs": seen.map(|seen| seen.observed_at_ms),
@@ -114,10 +181,25 @@ pub(crate) fn mcp_health_json(
                 "lastFailure": seen.and_then(|seen| seen.last_failure),
                 "consecutiveFailures": seen.map_or(0, |seen| seen.consecutive_failures),
                 "reason": seen.and_then(McpHealthObservation::failed_reason),
+                "toolCount": listed.map(|listed| listed.tools.len()),
+                "listedAtMs": listed
+                    .map(|listed| u64::try_from(listed.refreshed_at_ms).unwrap_or(u64::MAX)),
+                "tools": listed.map(|listed| {
+                    listed
+                        .tools
+                        .iter()
+                        .map(|tool| tool_json(config, &server.id, tool, scanner))
+                        .collect::<Vec<_>>()
+                }),
             })
         })
         .collect::<Vec<_>>();
-    json!({"repositoryId": repository_id, "servers": rows})
+    json!({
+        "repositoryId": repository_id,
+        "mcpEnabled": config.mcp_enabled,
+        "servers": rows,
+        "contextCost": context_cost_json(config, inventory),
+    })
 }
 
 pub(crate) fn handle_mcp_health(stream: &mut dyn Write, request: &Request) -> Result<(), String> {
@@ -125,10 +207,18 @@ pub(crate) fn handle_mcp_health(stream: &mut dyn Write, request: &Request) -> Re
     let root = crate::validate_working_folder(&repo)?;
     let config = crate::config_for_repo(&repo)?;
     let scanner = SecretScanner::new(config.secret_patterns.clone());
+    let repository_id = repository_id_for_root(&root);
+    let ids: Vec<&str> = config
+        .mcp_servers
+        .iter()
+        .map(|server| server.id.as_str())
+        .collect();
+    let inventory = McpToolInventory::load(&config.data_dir, &repository_id, &ids);
     let body = mcp_health_json(
-        &config.mcp_servers,
-        &repository_id_for_root(&root),
+        &config,
+        &repository_id,
         &gathered_health(),
+        &inventory,
         &scanner,
     );
     write_response(stream, request, 200, "application/json", &body.to_string())
