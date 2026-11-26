@@ -3028,6 +3028,119 @@ body.terminal-resizing {
   display: none;
 }
 
+/* MCP servers and tools in Settings (spec 33 Task 9). */
+.mcp-context-cost {
+  margin: 0 0 8px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.mcp-context-cost[data-state="error"],
+.mcp-health[data-state="error"],
+.mcp-health-reason {
+  color: var(--danger);
+}
+
+.mcp-context-cost:empty {
+  display: none;
+}
+
+.mcp-health[data-state="ok"] {
+  color: var(--ok);
+}
+
+.mcp-health[data-state="warn"] {
+  color: var(--warn);
+}
+
+.mcp-tools-trigger {
+  justify-self: start;
+  margin-top: 4px;
+}
+
+.settings-row .mcp-tools-trigger {
+  min-width: 0;
+  min-height: 24px;
+}
+
+.mcp-tool-list {
+  border-top: 1px dashed var(--line);
+  background: var(--surface);
+  max-height: 420px;
+  overflow: auto;
+}
+
+.mcp-tool-list[hidden] {
+  display: none;
+}
+
+.mcp-tool-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+  border-bottom: 1px solid var(--line-soft);
+  padding: 8px 16px 8px 30px;
+}
+
+.mcp-tool-row:last-child {
+  border-bottom: 0;
+}
+
+.mcp-tool-copy {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+
+.mcp-tool-name {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+}
+
+.mcp-tool-chip[data-kind="new"] {
+  border-color: var(--warn-line);
+  background: var(--warn-soft);
+  color: var(--warn-ink);
+}
+
+.mcp-tool-tokens,
+.mcp-tool-description {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.mcp-tool-description {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mcp-tool-note {
+  margin: 0;
+  color: var(--warn);
+  font-size: 12px;
+}
+
+.mcp-tool-controls {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 10px;
+}
+
+.mcp-tool-toggle {
+  white-space: nowrap;
+}
+
+.mcp-tool-approval {
+  max-width: 220px;
+}
+
 .hook-review-label {
   margin: 0;
   color: var(--muted);

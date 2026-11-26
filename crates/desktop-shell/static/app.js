@@ -4288,7 +4288,13 @@ function setSettingsPage(page) {
   ].includes(page)
     ? page
     : "providers";
-  if (target === "mcp") renderMcpConfigSelect();
+  if (target === "mcp") {
+    // A new visit is a new look: tools that appeared since the last one are
+    // marked new until the next.
+    mcpSeenBaseline = {};
+    renderMcpConfigSelect();
+    void refreshMcpPanel();
+  }
   if (target === "checkpoints") void renderCheckpointList();
   if (target === "hooks") void renderSettingsHooks();
   if (target === "commands") void refreshCommandRules();
@@ -6023,9 +6029,30 @@ function mcpSlug(value) {
     .replace(/^-+|-+$/g, "");
 }
 
+// `mcp_server.<server>.tool.<tool>.<field>`: split on the first `.tool.`, as
+// the engine does (a server id may not contain `.tool.`).
+const mcpToolFieldPattern = /^mcp_server\.(.+?)\.tool\.(.+)\.(enabled|require_approval|pinned)$/;
+
+// The user's own per-tool settings, from the same editor content: what the
+// controls write. What applies — after repository, admin and profile config —
+// comes from /api/mcp-health and can only be stricter.
+let mcpUserToolSettings = {};
+
 function syncMcpServersFromConfig(content) {
   const servers = {};
+  const tools = {};
   configEntries(content).forEach(([key, value]) => {
+    const toolMatch = key.match(mcpToolFieldPattern);
+    if (toolMatch) {
+      const [, serverId, toolName, field] = toolMatch;
+      tools[serverId] = tools[serverId] || {};
+      tools[serverId][toolName] = tools[serverId][toolName] || {};
+      const tool = tools[serverId][toolName];
+      if (field === "enabled") tool.enabled = value === "true";
+      else if (field === "require_approval") tool.requireApproval = value === "true";
+      else if (field === "pinned") tool.pinned = value === "true";
+      return;
+    }
     const match = key.match(mcpServerFieldPattern);
     if (!match) return;
     const id = match[1];
@@ -6045,6 +6072,7 @@ function syncMcpServersFromConfig(content) {
     else if (field === "require_approval") server.requireApproval = value === "true";
   });
   mcpServers = servers;
+  mcpUserToolSettings = tools;
 }
 
 function mcpServerIds() {
@@ -6189,31 +6217,236 @@ function setMcpTestResult(message, state = "") {
   el.dataset.state = state;
 }
 
+// Spec 33 Task 9 (§5.9): the servers list with health, tools and context
+// cost. Health, tools and the effective settings come from /api/mcp-health;
+// the controls write the user's own config through the editor, as the server
+// form does, so a repository's config can only ever make a tool stricter.
+const mcpPanel = { repo: "", payload: null, error: "", requestId: 0 };
+const mcpExpandedServers = new Set();
+const mcpRetryResults = {};
+// The "last looked" baseline per repository and server, captured once per
+// visit to the page so the New marks stay put while the user is looking.
+let mcpSeenBaseline = {};
+const mcpSeenStorageKey = "damaian.mcpToolsSeen";
+
+const MCP_HEALTH_LABELS = {
+  unknown: "Not contacted yet",
+  ready: "Ready",
+  unauthenticated: "Authentication failed",
+  timeout: "Timed out",
+  unreachable: "Unreachable",
+  failed: "Failed — not retried automatically",
+};
+
+function mcpHealthState(health) {
+  if (health === "ready") return "ok";
+  if (health === "failed" || health === "unauthenticated") return "error";
+  if (health === "timeout" || health === "unreachable") return "warn";
+  return "";
+}
+
+function readMcpSeen() {
+  try {
+    return JSON.parse(localStorage.getItem(mcpSeenStorageKey) || "{}") || {};
+  } catch {
+    return {};
+  }
+}
+
+function writeMcpSeen(key, ms) {
+  const seen = readMcpSeen();
+  if ((seen[key] || 0) >= ms) return;
+  seen[key] = ms;
+  try {
+    localStorage.setItem(mcpSeenStorageKey, JSON.stringify(seen));
+  } catch {
+    // Storage full or unavailable: tools are simply not marked new.
+  }
+}
+
+// Tools that appeared since the user last looked (D4's `firstSeenAtMs`). The
+// first time a server's tools are seen there is nothing to compare against,
+// so that listing becomes the baseline and nothing is marked.
+function mcpNewToolNames(repoPath, server) {
+  const tools = server.tools || [];
+  if (!tools.length) return new Set();
+  const key = `${repoPath}\u0000${server.id}`;
+  if (!(key in mcpSeenBaseline)) {
+    const stored = readMcpSeen()[key];
+    mcpSeenBaseline[key] = stored === undefined ? null : stored;
+  }
+  const latest = Math.max(...tools.map((tool) => Number(tool.firstSeenAtMs) || 0));
+  const baseline = mcpSeenBaseline[key];
+  if (baseline === null) {
+    writeMcpSeen(key, latest);
+    // Later listings in this visit compare against this one, or a tool
+    // appearing now would be absorbed unmarked.
+    mcpSeenBaseline[key] = latest;
+    return new Set();
+  }
+  return new Set(
+    tools.filter((tool) => Number(tool.firstSeenAtMs) > baseline).map((tool) => tool.name),
+  );
+}
+
+async function refreshMcpPanel() {
+  const repoPath = repo();
+  const requestId = ++mcpPanel.requestId;
+  if (!repoPath) {
+    Object.assign(mcpPanel, { repo: "", payload: null, error: "" });
+    renderMcpServerList();
+    return;
+  }
+  try {
+    const payload = await api(`/api/mcp-health?repo=${encodeURIComponent(repoPath)}`);
+    if (requestId !== mcpPanel.requestId) return;
+    Object.assign(mcpPanel, { repo: repoPath, payload, error: "" });
+  } catch (error) {
+    if (requestId !== mcpPanel.requestId) return;
+    Object.assign(mcpPanel, { repo: repoPath, payload: null, error: errorMessage(error) });
+  }
+  renderMcpServerList();
+}
+
+function renderMcpContextCost() {
+  const el = $("mcp-context-cost");
+  if (!el) return;
+  const payload = mcpPanel.payload;
+  el.dataset.state = "";
+  if (!mcpPanel.repo) {
+    el.textContent = "Open a folder to see each server's health, its tools and their context cost.";
+    return;
+  }
+  if (mcpPanel.error) {
+    el.textContent = `Health and tools could not be loaded: ${mcpPanel.error}`;
+    el.dataset.state = "error";
+    return;
+  }
+  if (!payload) {
+    el.textContent = "Loading health and tools…";
+    return;
+  }
+  if (!payload.mcpEnabled) {
+    el.textContent =
+      "MCP is off (mcp_enabled=false), so no server's tools are offered and they cost nothing.";
+    return;
+  }
+  const cost = payload.contextCost || {};
+  const unknown = cost.unknownServers || [];
+  const known = formatTokenCount(cost.knownTokens);
+  const ceiling = formatTokenCount(cost.ceilingTokens);
+  const parts = [
+    !Object.keys(cost.serverTokens || {}).length
+      ? "Context cost: no active server has been listed yet, so no tool schemas are sent directly."
+      : cost.surface === "direct"
+        ? `Context cost: about ${known} tokens of tool schemas, under the ${ceiling}-token ceiling, so they are sent with every request.`
+        : `Context cost: about ${known} tokens of tool schemas, over the ${ceiling}-token ceiling, so tools wait behind search: a request carries the search tool and pinned tools only.`,
+  ];
+  if (unknown.length) {
+    parts.push(
+      `${unknown.length === 1 ? "1 server has" : `${unknown.length} servers have`} not been listed yet (${unknown.join(", ")}): cost unknown, reachable through search.`,
+    );
+  }
+  parts.push("Mode and permission profile can only lower this.");
+  el.textContent = parts.join(" ");
+}
+
 function renderMcpServerList() {
   const container = $("mcp-server-list");
   if (!container) return;
-  container.innerHTML = "";
-  const ids = mcpServerIds();
+  renderMcpContextCost();
+  const payload = mcpPanel.repo === repo() ? mcpPanel.payload : null;
+  const effective = new Map((payload?.servers || []).map((server) => [server.id, server]));
+  const ids = [...new Set([...mcpServerIds(), ...effective.keys()])].sort((a, b) =>
+    a.localeCompare(b),
+  );
   if (!ids.length) {
     const empty = document.createElement("div");
     empty.className = "provider-empty-row";
     empty.textContent = "No MCP servers configured.";
-    container.append(empty);
+    container.replaceChildren(empty);
     return;
   }
-  ids.forEach((id) => {
-    const server = mcpServers[id];
-    const row = document.createElement("div");
-    row.className = "settings-row";
-    const copy = document.createElement("div");
-    const title = document.createElement("strong");
-    title.textContent = server.label || id;
-    const description = document.createElement("p");
-    const transportLabel = server.transport === "http" ? "HTTP" : "stdio";
-    const state = server.enabled ? "enabled" : "disabled";
-    const detail = server.transport === "http" ? server.url || "" : server.command || "";
-    description.textContent = `${transportLabel} · ${state}${detail ? ` · ${detail}` : ""}`;
-    copy.append(title, description);
+  container.replaceChildren(
+    ...ids.map((id) => mcpServerEntry(id, mcpServers[id], effective.get(id), payload)),
+  );
+}
+
+function mcpServerEntry(id, own, server, payload) {
+  const repoPath = mcpPanel.repo;
+  const entry = document.createElement("div");
+  entry.className = "hook-entry mcp-server-entry";
+
+  const row = document.createElement("div");
+  row.className = "settings-row";
+  const copy = document.createElement("div");
+  copy.className = "hook-row-copy";
+  const title = document.createElement("strong");
+  title.textContent = server?.label || own?.label || id;
+
+  const transport = (server?.transport || own?.transport) === "http" ? "HTTP" : "stdio";
+  const enabled = server ? server.enabled : own?.enabled === true;
+  const facts = [transport, enabled ? "enabled" : "disabled"];
+  if (server && enabled && !server.active) facts.push("not offered: MCP is off or not allowlisted");
+  if (server) {
+    if (server.toolCount === null || server.toolCount === undefined) {
+      facts.push("tools not listed yet");
+    } else {
+      const tokens = payload?.contextCost?.serverTokens?.[id];
+      facts.push(
+        `${server.toolCount} tool${server.toolCount === 1 ? "" : "s"}${
+          tokens === undefined ? "" : ` · ~${formatTokenCount(tokens)} tokens`
+        }`,
+      );
+    }
+    if (server.authReference) facts.push(`auth ${server.authReference}`);
+  }
+  if (!own) facts.push("from repository or admin config");
+  const meta = document.createElement("p");
+  meta.textContent = facts.join(" · ");
+  copy.append(title, meta);
+
+  if (server) {
+    const health = document.createElement("p");
+    health.className = "mcp-health";
+    health.dataset.state = mcpHealthState(server.health);
+    const when = server.observedAtMs ? ` · ${formatRelativeTime(server.observedAtMs)}` : "";
+    health.textContent = `${MCP_HEALTH_LABELS[server.health] || server.health}${when}`;
+    copy.append(health);
+    const reason =
+      server.health === "failed"
+        ? server.reason
+        : server.health === "unauthenticated" && server.authReference
+          ? `Authentication failed for ${server.authReference}.`
+          : "";
+    if (reason) {
+      const why = document.createElement("p");
+      why.className = "mcp-health-reason";
+      why.textContent = reason;
+      copy.append(why);
+    }
+  }
+  const retryResult = mcpRetryResults[id];
+  if (retryResult) {
+    const result = document.createElement("p");
+    result.className = "key-status";
+    result.dataset.state = retryResult.state;
+    result.textContent = retryResult.message;
+    copy.append(result);
+  }
+
+  const actions = document.createElement("div");
+  actions.className = "provider-row-actions hook-row-actions";
+  if (server && repoPath) {
+    const retry = document.createElement("button");
+    retry.type = "button";
+    retry.className = "btn-quiet";
+    retry.textContent = ["ready", "unknown"].includes(server.health) ? "Check" : "Retry";
+    retry.title = "Contact the saved server now; also clears a Failed state in every session";
+    retry.addEventListener("click", () => retryMcpServer(repoPath, id, retry));
+    actions.append(retry);
+  }
+  if (own) {
     const configureButton = document.createElement("button");
     configureButton.type = "button";
     configureButton.textContent = "Configure";
@@ -6222,9 +6455,177 @@ function renderMcpServerList() {
       renderMcpConfigForm(id);
       $("mcp-label-input").focus();
     });
-    row.append(copy, configureButton);
-    container.append(row);
+    actions.append(configureButton);
+  }
+  row.append(copy, actions);
+  entry.append(row);
+
+  if (server?.tools?.length) {
+    const newTools = mcpNewToolNames(repoPath, server);
+    const panel = document.createElement("div");
+    panel.className = "mcp-tool-list";
+    panel.append(...server.tools.map((tool) => mcpToolRow(id, server, tool, newTools)));
+    const label = `${server.tools.length} tool${server.tools.length === 1 ? "" : "s"}${
+      newTools.size ? ` · ${newTools.size} new` : ""
+    }`;
+    const trigger = createDisclosure(label, panel);
+    trigger.classList.add("mcp-tools-trigger");
+    if (mcpExpandedServers.has(id)) {
+      trigger.setAttribute("aria-expanded", "true");
+      panel.hidden = false;
+    }
+    trigger.addEventListener("click", () => {
+      if (trigger.getAttribute("aria-expanded") === "true") {
+        mcpExpandedServers.add(id);
+        const latest = Math.max(...server.tools.map((tool) => Number(tool.firstSeenAtMs) || 0));
+        writeMcpSeen(`${repoPath}\u0000${id}`, latest);
+      } else {
+        mcpExpandedServers.delete(id);
+      }
+    });
+    copy.append(trigger);
+    entry.append(panel);
+  }
+  return entry;
+}
+
+function mcpToolRow(serverId, server, tool, newTools) {
+  const own = mcpUserToolSettings[serverId]?.[tool.name] || {};
+  const row = document.createElement("div");
+  row.className = "mcp-tool-row";
+
+  const copy = document.createElement("div");
+  copy.className = "mcp-tool-copy";
+  const name = document.createElement("div");
+  name.className = "mcp-tool-name";
+  const code = document.createElement("code");
+  code.textContent = tool.name;
+  name.append(code);
+  const chip = (text, kind = "") => {
+    const span = document.createElement("span");
+    span.className = "provider-badge mcp-tool-chip";
+    if (kind) span.dataset.kind = kind;
+    span.textContent = text;
+    name.append(span);
+  };
+  if (newTools.has(tool.name)) chip("New", "new");
+  // The server's claim, attributed (§5.5): it never waives approval.
+  if (tool.readOnlyHint === true) chip("server says read-only");
+  if (tool.pinned) chip("pinned");
+  const tokens = document.createElement("span");
+  tokens.className = "mcp-tool-tokens";
+  tokens.textContent = `~${formatTokenCount(tool.estimatedTokens)} tokens`;
+  name.append(tokens);
+  copy.append(name);
+  if (tool.description) {
+    const description = document.createElement("p");
+    description.className = "mcp-tool-description";
+    description.textContent = tool.description;
+    description.title = tool.description;
+    copy.append(description);
+  }
+
+  // The user's own value against what applies: a difference can only be a
+  // repository, admin or profile setting making the tool stricter.
+  const notes = [];
+  const ownEnabled = own.enabled !== false;
+  if (ownEnabled && !tool.enabled) {
+    notes.push("Turned off by repository, admin or profile config.");
+  }
+  const serverAsks = server.requireApproval !== false;
+  const ownAsks = own.requireApproval ?? serverAsks;
+  if (!ownAsks && tool.requireApproval) {
+    notes.push("Asks anyway: repository, admin or profile config requires approval.");
+  }
+  if (notes.length) {
+    const note = document.createElement("p");
+    note.className = "mcp-tool-note";
+    note.textContent = notes.join(" ");
+    copy.append(note);
+  }
+
+  const controls = document.createElement("div");
+  controls.className = "mcp-tool-controls";
+  const toggle = document.createElement("label");
+  toggle.className = "field-checkbox mcp-tool-toggle";
+  const box = document.createElement("input");
+  box.type = "checkbox";
+  box.checked = tool.enabled === true;
+  // Checking it could not turn on what another layer turned off.
+  box.disabled = ownEnabled && !tool.enabled;
+  box.setAttribute("aria-label", `Offer ${tool.name} to the assistant`);
+  box.addEventListener("change", () =>
+    setMcpToolSetting(serverId, tool.name, "enabled", box.checked ? null : "false", box),
+  );
+  const toggleLabel = document.createElement("span");
+  toggleLabel.textContent = "Offered";
+  toggle.append(box, toggleLabel);
+
+  const approval = document.createElement("select");
+  approval.className = "mode-select mcp-tool-approval";
+  approval.setAttribute("aria-label", `Approval for ${tool.name}`);
+  [
+    ["", `Follows the server (${serverAsks ? "asks" : "doesn't ask"})`],
+    ["true", "Always asks"],
+    ["false", "Doesn't ask"],
+  ].forEach(([value, text]) => {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = text;
+    approval.append(option);
   });
+  approval.value = own.requireApproval === undefined ? "" : String(own.requireApproval);
+  approval.addEventListener("change", () =>
+    setMcpToolSetting(serverId, tool.name, "require_approval", approval.value || null, approval),
+  );
+  controls.append(toggle, approval);
+
+  row.append(copy, controls);
+  return row;
+}
+
+// Writes one per-tool setting to the user's own config (the editor content,
+// saved through /api/config-file, as the server form does); `null` removes
+// the line so the tool goes back to its default — offered, and approval
+// following its server.
+async function setMcpToolSetting(serverId, toolName, field, value, control) {
+  const key = `mcp_server.${serverId}.tool.${toolName}.${field}`;
+  const before = $("config-editor").value;
+  control.disabled = true;
+  $("config-editor").value =
+    value === null ? removeConfigValue(before, key) : upsertConfigValue(before, key, value);
+  try {
+    await saveConfigFile();
+  } catch (error) {
+    $("config-editor").value = before;
+    syncMcpServersFromConfig(before);
+    toast(errorMessage(error));
+  }
+  await refreshMcpPanel();
+}
+
+async function retryMcpServer(repoPath, serverId, button) {
+  button.disabled = true;
+  mcpRetryResults[serverId] = { state: "", message: "Contacting the server…" };
+  renderMcpServerList();
+  try {
+    const payload = await api(
+      "/api/mcp-test",
+      form({ retry: "true", repo: repoPath, id: serverId }),
+    );
+    const cleared = payload.wasFailedIn
+      ? ` Cleared the Failed state in ${payload.wasFailedIn} session${payload.wasFailedIn === 1 ? "" : "s"}.`
+      : "";
+    mcpRetryResults[serverId] = payload.ok
+      ? {
+          state: "ok",
+          message: `Connected — ${payload.toolCount} tool${payload.toolCount === 1 ? "" : "s"}.${cleared}`,
+        }
+      : { state: "error", message: `${payload.error || "Connection failed"}${cleared}` };
+  } catch (error) {
+    mcpRetryResults[serverId] = { state: "error", message: errorMessage(error) };
+  }
+  await refreshMcpPanel();
 }
 
 const HOOK_ACTIVATION_LABELS = {
@@ -6410,7 +6811,8 @@ async function testHook(repoPath, hook, event, button, result) {
 }
 
 function upsertMcpConfig(content, server) {
-  let next = removeMcpConfig(content, server.id);
+  // The form owns the server's own fields; its per-tool settings stay.
+  let next = removeMcpConfig(content, server.id, { keepTools: true });
   const set = (field, value) =>
     (next = upsertConfigValue(next, `mcp_server.${server.id}.${field}`, value));
   set("label", server.label);
@@ -6428,13 +6830,32 @@ function upsertMcpConfig(content, server) {
   return next;
 }
 
-function removeMcpConfig(content, serverId) {
+function removeMcpConfig(content, serverId, { keepTools = false } = {}) {
   const prefix = `mcp_server.${serverId}.`;
+  const toolPrefix = `${prefix}tool.`;
   return String(content || "")
     .split(/\r?\n/)
-    .filter((line) => !line.trim().startsWith(prefix))
+    .filter((line) => {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith(prefix)) return true;
+      return keepTools && trimmed.startsWith(toolPrefix);
+    })
     .join("\n")
     .replace(/\n*$/, "\n");
+}
+
+// A renamed server keeps its per-tool settings under the new id.
+function renameMcpToolConfig(content, fromId, toId) {
+  const from = `mcp_server.${fromId}.tool.`;
+  return String(content || "")
+    .split(/\r?\n/)
+    .map((line) => {
+      const trimmed = line.trim();
+      return trimmed.startsWith(from)
+        ? `mcp_server.${toId}.tool.${trimmed.slice(from.length)}`
+        : line;
+    })
+    .join("\n");
 }
 
 async function saveMcpServer() {
@@ -6453,13 +6874,15 @@ async function saveMcpServer() {
   const originalId = $("mcp-id-input").dataset.originalId;
   let content = $("config-editor").value;
   if (originalId && originalId !== server.id) {
-    content = removeMcpConfig(content, originalId);
+    content = removeMcpConfig(content, originalId, { keepTools: true });
+    content = renameMcpToolConfig(content, originalId, server.id);
   }
   content = upsertMcpConfig(content, server);
   $("config-editor").value = content;
   const payload = await saveConfigFile();
   $("mcp-token-input").value = "";
   renderMcpConfigSelect(server.id);
+  void refreshMcpPanel();
   return payload;
 }
 
@@ -6469,6 +6892,7 @@ async function removeMcpServerFromSettings() {
   $("config-editor").value = removeMcpConfig($("config-editor").value, id);
   await saveConfigFile();
   renderMcpConfigSelect();
+  void refreshMcpPanel();
 }
 
 async function testMcpServer() {
