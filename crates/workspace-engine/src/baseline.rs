@@ -18,6 +18,12 @@
 //! another test takes a new baseline rather than reading this one. Any other
 //! failure reruns the whole check.
 //!
+//! When such a narrowed baseline passes, the same narrowed command runs once
+//! more, alone, on the current files in the user's checkout (spec 114 D3),
+//! and only if the policy runs it without a card. Its result is recorded as
+//! `verification_isolated_rerun`; the tests that pass there too are not the
+//! task's.
+//!
 //! It deliberately does not classify a result. It records [`CheckBaseline`]
 //! facts; spec 102 Task 3's `provenance::classify` compares them with the
 //! failed result, with the meaning it always had.
@@ -45,13 +51,16 @@ use crate::session::SessionStore;
 use crate::validation::{CommandProposal, ValidationOrchestrator};
 use crate::verification::{
     CheckBaseline, CheckId, CheckTermination, FailureFingerprint, FindingEvidence,
-    VerificationEvent, baseline_result_word, environment_termination,
+    IsolatedRerunOutcome, VerificationEvent, baseline_result_word, environment_termination,
 };
 
 /// Why a failure-time baseline is proposed. Stored with the proposal, so the
 /// command store and the audit say what the run was for.
 const FAILURE_BASELINE_REASON: &str =
     "Baseline for a failed check: run on the files as they were before this task's changes";
+
+/// Why the isolated rerun of spec 114 D3 runs, stored with its proposal.
+const ISOLATED_RERUN_REASON: &str = "Rerun alone on the current files the failing tests that passed alone before this task's changes";
 
 /// The one-line question a failure-time baseline asks (spec 109 Task 3).
 pub const FAILURE_BASELINE_PROMPT: &str = "This check failed; run it on the files as they were \
@@ -379,6 +388,201 @@ impl BaselineCoordinator {
             ],
         )?;
         Ok(BaselinePreparation::Awaiting(batch))
+    }
+
+    /// Rerun alone, on the current files, the failing tests a narrowed
+    /// baseline found passing (spec 114 D3), and record each rerun as
+    /// `verification_isolated_rerun`.
+    ///
+    /// It applies to a failed check whose failing tests can be named and
+    /// whose baseline in the task chain is a narrowed `Passed` covering all
+    /// of them. The same narrowed command runs once, at the check's own
+    /// directory in the user's checkout, and only when the policy lets it run
+    /// without a card (auto-run, a matching rule or a session approval).
+    /// Otherwise it is recorded `skipped` and nothing runs: this never adds a
+    /// card. A cancel records the rerun `cancelled`. Only a `ran` rerun can
+    /// change a classification.
+    pub fn rerun_tests_alone(
+        &self,
+        repository_root: &Path,
+        session_id: &str,
+        task_id: &str,
+        failed: &[FailedCheck],
+        cancel: &CancelToken,
+        on_progress: &mut dyn FnMut(BaselineProgress),
+    ) -> Result<()> {
+        if session_id.is_empty() || task_id.is_empty() {
+            return Ok(());
+        }
+        let scopes = self
+            .session_store
+            .task_verification_baseline_scopes(session_id, task_id)?;
+        let mut seen = BTreeSet::new();
+        let jobs = failed
+            .iter()
+            .filter(|failed| seen.insert(failed.check.clone()))
+            .filter_map(|failed| {
+                let tests = failing_tests(&failed.check, &failed.findings)?;
+                let (baseline, covered) = scopes.get(&failed.check)?;
+                (matches!(baseline, CheckBaseline::Passed)
+                    && !covered.is_empty()
+                    && tests.iter().all(|name| covered.contains(name)))
+                .then(|| (failed.check.clone(), tests))
+            })
+            .collect::<Vec<_>>();
+        let total = jobs.len();
+        for (index, (check, tests)) in jobs.into_iter().enumerate() {
+            let name = check.label();
+            let directory = if check.working_directory.is_empty() {
+                repository_root.to_path_buf()
+            } else {
+                repository_root.join(&check.working_directory)
+            };
+            let command = targeted_command(&check.command, &tests);
+            let (outcome, passed_alone) = if cancel.is_cancelled() {
+                (IsolatedRerunOutcome::Cancelled, Vec::new())
+            } else {
+                let classification =
+                    self.validation
+                        .classify_command_at(repository_root, &directory, &command);
+                if classification.blocked || classification.requires_approval {
+                    (IsolatedRerunOutcome::Skipped, Vec::new())
+                } else {
+                    on_progress(BaselineProgress::Started {
+                        check: name.clone(),
+                        label: rerun_running_label(&name, tests.len()),
+                        index: index + 1,
+                        total,
+                    });
+                    self.rerun_alone(
+                        repository_root,
+                        &directory,
+                        task_id,
+                        &check,
+                        &command,
+                        &tests,
+                        cancel,
+                        on_progress,
+                    )?
+                }
+            };
+            self.audit_log.record(
+                "verification_isolated_rerun",
+                &[
+                    ("actor", "system".to_string()),
+                    ("sessionId", session_id.to_string()),
+                    ("taskId", task_id.to_string()),
+                    ("check", name.clone()),
+                    ("outcome", outcome.as_str().to_string()),
+                    ("tests", tests.len().to_string()),
+                    ("passedAlone", passed_alone.len().to_string()),
+                ],
+            )?;
+            on_progress(BaselineProgress::Finished {
+                label: rerun_finished_label(outcome, &name, tests.len(), passed_alone.len()),
+                check: name,
+                result: outcome.as_str().to_string(),
+            });
+            self.session_store.append_verification_event(
+                session_id,
+                &VerificationEvent::IsolatedRerun {
+                    task_id: task_id.to_string(),
+                    check,
+                    tests,
+                    passed_alone,
+                    outcome,
+                },
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Run one isolated rerun through the ordinary command path, never
+    /// approved: a command that needs a card is refused by the runner, and
+    /// that refusal reads as skipped.
+    #[allow(clippy::too_many_arguments)]
+    fn rerun_alone(
+        &self,
+        repository_root: &Path,
+        directory: &Path,
+        task_id: &str,
+        check: &CheckId,
+        command: &str,
+        tests: &[String],
+        cancel: &CancelToken,
+        on_progress: &mut dyn FnMut(BaselineProgress),
+    ) -> Result<(IsolatedRerunOutcome, Vec<String>)> {
+        let proposal = self.validation.propose_command_at(
+            repository_root,
+            directory,
+            command,
+            ISOLATED_RERUN_REASON,
+        )?;
+        if proposal.blocked || proposal.requires_approval {
+            let _ = self.validation.reject_proposal(&proposal.id, "policy");
+            return Ok((IsolatedRerunOutcome::Skipped, Vec::new()));
+        }
+        let mut on_output = |line: &str| {
+            let line = line.trim_end_matches(['\n', '\r']);
+            if !line.is_empty() {
+                on_progress(BaselineProgress::Output {
+                    line: line.to_string(),
+                });
+            }
+        };
+        let record = match self.validation.run_proposal(
+            &proposal.id,
+            false,
+            "policy",
+            Some(task_id),
+            cancel,
+            &mut on_output,
+        ) {
+            Ok(record) => record,
+            Err(ClientError::Cancelled) => {
+                return Ok((IsolatedRerunOutcome::Cancelled, Vec::new()));
+            }
+            Err(ClientError::ApprovalRequired(_)) => {
+                return Ok((IsolatedRerunOutcome::Skipped, Vec::new()));
+            }
+            Err(error) => {
+                if environment_termination(&error).is_some() {
+                    return Ok((IsolatedRerunOutcome::Unavailable, Vec::new()));
+                }
+                return Err(error);
+            }
+        };
+        let execution = record.execution;
+        match execution.termination {
+            crate::command_runner::CommandTermination::Cancelled => {
+                return Ok((IsolatedRerunOutcome::Cancelled, Vec::new()));
+            }
+            crate::command_runner::CommandTermination::Exited if execution.exit_code == Some(0) => {
+                return Ok((IsolatedRerunOutcome::Ran, tests.to_vec()));
+            }
+            _ => {}
+        }
+        let termination =
+            CheckTermination::from_command(execution.termination, execution.exit_code);
+        if termination.is_environment_failure() {
+            return Ok((IsolatedRerunOutcome::Unavailable, Vec::new()));
+        }
+        // A test that failed alone too is the task's. Only when every error
+        // names a test can the others be said to have passed; anything else
+        // (a compile error, an unparsed failure) leaves none passing alone.
+        let findings = findings_from_execution(&execution, &default_parsers(), &self.scanner)
+            .iter()
+            .map(FindingEvidence::from_finding)
+            .collect::<Vec<_>>();
+        let passed_alone = match failing_tests(check, &findings) {
+            Some(failing) => tests
+                .iter()
+                .filter(|name| !failing.contains(name))
+                .cloned()
+                .collect(),
+            None => Vec::new(),
+        };
+        Ok((IsolatedRerunOutcome::Ran, passed_alone))
     }
 
     /// Apply one card's decisions and record a terminal result for each check
@@ -1084,6 +1288,35 @@ fn running_label(check: &str, tests: &[String]) -> String {
         0 => base,
         1 => format!("{base}, only the failing test"),
         count => format!("{base}, only the {count} failing tests"),
+    }
+}
+
+/// The progress line of an isolated rerun (spec 114 D3).
+fn rerun_running_label(check: &str, tests: usize) -> String {
+    match tests {
+        1 => format!("Checking whether the failing test of {check} passes when run alone"),
+        count => {
+            format!("Checking whether the {count} failing tests of {check} pass when run alone")
+        }
+    }
+}
+
+/// The finished line of an isolated rerun (spec 114 D3).
+fn rerun_finished_label(
+    outcome: IsolatedRerunOutcome,
+    check: &str,
+    tests: usize,
+    passed: usize,
+) -> String {
+    match outcome {
+        IsolatedRerunOutcome::Ran => {
+            format!("Run alone: {passed} of {tests} failing tests of {check} passed")
+        }
+        IsolatedRerunOutcome::Skipped => {
+            format!("Not run alone: running {check}'s failing tests would need your approval")
+        }
+        IsolatedRerunOutcome::Cancelled => format!("Run alone was cancelled: {check}"),
+        IsolatedRerunOutcome::Unavailable => format!("Could not run alone: {check}"),
     }
 }
 

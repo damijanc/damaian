@@ -259,7 +259,7 @@ pub use provenance::{
     REPAIR_FINDING_DETAILS_TRUNCATED, REPAIR_TOTAL_DETAILS_TRUNCATED, RepairTarget,
     VerificationAction, VerificationActionKind, baseline_line, build_partitions, classify,
     provenance_action, provenance_count, provenance_label, provenance_reason, provenance_summary,
-    render_repair_request, repair_targets,
+    render_repair_request, repair_targets, without_tests_passing_alone,
 };
 pub use recovery::{
     PendingVerification, QUESTION_WAITING_HEADLINE, ReattachedApproval, RecoveredTask, abandon,
@@ -344,13 +344,13 @@ pub use verification::{
     CheckBaseline, CheckId, CheckOutcome, CheckProvenanceRecord, CheckReuse, CheckRun,
     CheckTermination, DeclaredFloor, DeclaredSource, DeferredCheck, FAILURE_FINGERPRINT_VERSION,
     FailedCheck, FailureFingerprint, FailureProvenance, FindingEvidence,
-    GENERIC_IDENTITY_TAIL_TRUNCATED, MAX_GENERIC_IDENTITY_TAIL_BYTES, MAX_REPAIR_STATE_ENTRIES,
-    RepairStateEntry, ReportBaseline, ScopedSelection, Selection, SkipReason, SkippedCheck,
-    Verdict, VerdictKind, VerificationDue, VerificationEvent, VerificationOutcome,
-    VerificationReport, VerificationState, baseline_finished_label, baseline_result_word,
-    build_checks_for_change, detected_checks_of_roots, floor_checks_with_declared,
-    fold_verification, is_documentation, plan_floor_of_roots, propose_checks,
-    propose_scoped_checks, scoped_selection, select_roots,
+    GENERIC_IDENTITY_TAIL_TRUNCATED, IsolatedRerun, IsolatedRerunOutcome,
+    MAX_GENERIC_IDENTITY_TAIL_BYTES, MAX_REPAIR_STATE_ENTRIES, RepairStateEntry, ReportBaseline,
+    ScopedSelection, Selection, SkipReason, SkippedCheck, Verdict, VerdictKind, VerificationDue,
+    VerificationEvent, VerificationOutcome, VerificationReport, VerificationState,
+    baseline_finished_label, baseline_result_word, build_checks_for_change,
+    detected_checks_of_roots, floor_checks_with_declared, fold_verification, is_documentation,
+    plan_floor_of_roots, propose_checks, propose_scoped_checks, scoped_selection, select_roots,
 };
 pub use web_diagnostics::{
     WEB_SCENARIO_ACTIONS, WebConsoleEntry, WebDiagnosticArtifact, WebDiagnosticCall,

@@ -217,6 +217,49 @@ fn only_pre_existing_or_unchanged_failures_are_not_caused_by_the_task() {
 }
 
 #[test]
+fn a_check_whose_failing_tests_pass_alone_is_not_caused_by_the_task() {
+    let report = report(
+        vec![(
+            check(""),
+            Fixture::Classified(
+                FailureProvenance::PassesAlone,
+                Some(CheckBaseline::Passed),
+                vec!["tests::a".to_string()],
+            ),
+        )],
+        Some(VerificationOutcome::OnlyPreExistingFailures),
+    );
+    let verdict = report.verdict.clone().unwrap();
+    assert_eq!(verdict.kind, VerdictKind::NotCausedByTask);
+    assert!(
+        verdict.detail.contains("pass when run alone"),
+        "{verdict:?}"
+    );
+    assert!(report.repair_targets.is_empty());
+    assert_eq!(report.provenance[0].label, "Passes when run alone");
+    assert_eq!(
+        report.provenance[0].checks[0].baseline,
+        "Before this task's changes: the failing test passed when run alone, and on the current files too"
+    );
+    // Beside a pre-existing failure the detail is the general one.
+    let mixed = self::report(
+        vec![
+            (check(""), classified(FailureProvenance::PassesAlone)),
+            (check("a"), classified(FailureProvenance::PreExisting)),
+        ],
+        Some(VerificationOutcome::OnlyPreExistingFailures),
+    );
+    assert_eq!(kind(&mixed), VerdictKind::NotCausedByTask);
+    assert!(
+        mixed
+            .verdict
+            .unwrap()
+            .detail
+            .contains("failed the same way")
+    );
+}
+
+#[test]
 fn an_environment_or_unknown_failure_is_cause_unknown() {
     for fixture in [
         Fixture::Environment,

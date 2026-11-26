@@ -971,7 +971,8 @@ mod pre_existing {
     use workspace_engine::finding::{Finding, FindingDraft, FindingSource, Severity};
     use workspace_engine::{
         CheckBaseline, CheckTermination, FailureFingerprint, FailureProvenance, FindingEvidence,
-        PostPatchResult, SecretScanner, classify,
+        IsolatedRerunOutcome, PostPatchResult, SecretScanner, classify,
+        without_tests_passing_alone,
     };
 
     const TASK: &str = "task_1";
@@ -1223,6 +1224,99 @@ mod pre_existing {
             codes(&report).contains(&"required_check_failed"),
             "{report:?}"
         );
+    }
+
+    // --- Spec 114 D3: a check whose failing tests all pass alone. ---
+
+    fn test_failure(name: &str) -> FindingEvidence {
+        FindingEvidence::from_finding(&Finding::new(
+            FindingDraft {
+                source: FindingSource::Test,
+                severity: Severity::Error,
+                summary: format!("{name} failed"),
+                details: None,
+                range: None,
+                code: None,
+            },
+            &SecretScanner::new(Vec::new()),
+        ))
+    }
+
+    fn passes_alone_events(outcome: IsolatedRerunOutcome) -> Vec<VerificationEvent> {
+        let findings = vec![test_failure("tests::a"), test_failure("tests::b")];
+        let passed_alone = if outcome == IsolatedRerunOutcome::Ran {
+            vec!["tests::a".to_string(), "tests::b".to_string()]
+        } else {
+            Vec::new()
+        };
+        let classification = without_tests_passing_alone(
+            classify(
+                &PostPatchResult::new(root(), exited(), findings),
+                Some(&CheckBaseline::Passed),
+                None,
+            ),
+            &passed_alone,
+        );
+        vec![
+            due(TASK),
+            started(TASK, &[root()]),
+            ran(TASK, root(), Some(1), &[], 0),
+            VerificationEvent::Baseline {
+                task_id: TASK.to_string(),
+                check: root(),
+                baseline: CheckBaseline::Passed,
+                tests: vec!["tests::a".to_string(), "tests::b".to_string()],
+            },
+            VerificationEvent::IsolatedRerun {
+                task_id: TASK.to_string(),
+                check: root(),
+                tests: vec!["tests::a".to_string(), "tests::b".to_string()],
+                passed_alone,
+                outcome,
+            },
+            VerificationEvent::Provenance {
+                task_id: TASK.to_string(),
+                record: classification.record(),
+            },
+            finished(TASK, VerificationOutcome::OnlyPreExistingFailures),
+        ]
+    }
+
+    #[test]
+    fn a_check_whose_failing_tests_pass_alone_is_accepted_naming_them() {
+        let report = gate(&passes_alone_events(IsolatedRerunOutcome::Ran));
+
+        assert!(report.eligible, "{report:?}");
+        assert!(report.reasons.is_empty(), "{report:?}");
+        assert_eq!(report.accepted_failures.len(), 1, "{report:?}");
+        let accepted = &report.accepted_failures[0];
+        assert_eq!(accepted.provenance, FailureProvenance::PassesAlone);
+        assert!(
+            accepted.explanation.contains("`tests::a`, `tests::b`")
+                && accepted.explanation.contains("pass when run alone"),
+            "{accepted:?}"
+        );
+        assert!(!accepted.explanation.contains("passed."), "{accepted:?}");
+    }
+
+    #[test]
+    fn a_skipped_rerun_alone_accepts_nothing() {
+        let report = gate(&passes_alone_events(IsolatedRerunOutcome::Skipped));
+
+        assert!(!report.eligible, "{report:?}");
+        assert_eq!(codes(&report), vec!["required_check_failed"]);
+        assert!(report.accepted_failures.is_empty());
+    }
+
+    #[test]
+    fn a_later_run_of_the_check_is_not_vouched_for_by_an_earlier_rerun_alone() {
+        let mut events = passes_alone_events(IsolatedRerunOutcome::Ran);
+        events.pop();
+        events.push(ran(TASK, root(), Some(1), &[], 0));
+        let report = gate(&events);
+
+        assert!(!report.eligible, "{report:?}");
+        assert!(report.accepted_failures.is_empty());
     }
 }
 
