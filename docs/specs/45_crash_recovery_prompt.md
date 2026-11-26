@@ -258,6 +258,21 @@ answer. The patch card closes its task out the same way, once no file is left
 pending — a patch is answered per file, so one apply is not the end of the
 question.
 
+The close-out applies only while the task still waits on the proposal the card
+showed: the request names it (`proposal_id`, the command's `proposalId` or the
+patch's `patchId`), and the endpoint compares it with
+`SessionStore::pending_approval_for`, which any later status event clears. When
+they differ the turn has moved on and the endpoint writes nothing and answers
+`"continued":true`. This matters since a paused turn can be saved: a reattached
+command whose turn is still resumable is *continued* by `/api/run-command`
+rather than run on its own, and that turn then owns its task's status — a new
+pause, or an end of its own. The card also skips the close-out when the run
+answers with the turn's result. Observed 2026-11-26 with session hosts (spec
+110): approving such a card resumed the turn into a plan review, and the
+close-out landed after it and cancelled the task with "the turn did not
+continue". Covered by
+`recovery::tests::a_close_out_after_the_turn_continued_leaves_the_task_alone`.
+
 That endpoint writes a status and audits it; it authorizes nothing, which is why
 it does not go through the engine's recovery operations. None of them fit a task
 the classifier deliberately skips.

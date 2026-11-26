@@ -8955,6 +8955,9 @@ function createReattachedApprovalCard(approval) {
     wrapper.append(
       createCommandApprovalPreview(approval.payload, repo(), {
         detached: true,
+        // The card's own session, never the one on screen: it names the
+        // lane the answer runs under (owner report 2026-11-26).
+        sessionId: approval.sessionId,
         // A command is one decision, so its outcome is the decision.
         onResolved: (approved) =>
           resolveReattachedApproval(approval, approved ? "approved" : "rejected"),
@@ -8978,7 +8981,7 @@ function createReattachedApprovalCard(approval) {
   } else if (approval.kind === "fetch") {
     // Spec 51: the paused turn carries the verbatim URL, so the live dialog is
     // rebuilt and answers through the same fetch-decision route.
-    wrapper.append(createFetchApproval(approval.payload, repo()));
+    wrapper.append(createFetchApproval(approval.payload, repo(), approval.sessionId));
   } else if (approval.kind === "checks") {
     wrapper.append(
       createCheckBatchCard(approval.payload, repo(), {
@@ -9015,6 +9018,9 @@ async function resolveReattachedApproval(approval, outcome) {
       form({
         session_id: approval.sessionId,
         task_id: approval.taskId,
+        // The shell closes the task out only while it still waits on this
+        // proposal, so a turn that continued is never marked as one that died.
+        proposal_id: approval.payload?.proposalId || approval.payload?.patchId || "",
         outcome,
       }),
     );
@@ -13815,7 +13821,7 @@ function createQuestionCard(question, questionRepo, { answered = null, onAnswer 
 //
 // "Always allow" persists beyond this turn, so it goes in the overflow rather
 // than beside the one-shot action (UI_STYLE_GUIDE §4).
-function createFetchApproval(proposal, proposalRepo) {
+function createFetchApproval(proposal, proposalRepo, sessionId = currentSessionId) {
   const wrapper = document.createElement("section");
   wrapper.className = "fetch-approval";
   wrapper.dataset.fetchProposalId = proposal.proposalId || "";
@@ -13934,7 +13940,7 @@ function createFetchApproval(proposal, proposalRepo) {
           repo: proposalRepo,
           proposal_id: proposal.proposalId,
           decision,
-          session_id: currentSessionId || "",
+          session_id: sessionId || "",
         },
         {
           phase(payload) {
@@ -16539,8 +16545,11 @@ function createPatchPreview(payload, patchRepo, { onResolved = null } = {}) {
 function createCommandApprovalPreview(
   proposal,
   proposalRepo,
-  { detached = false, onResolved = null, decide = null } = {},
+  { detached = false, onResolved = null, decide = null, sessionId = null } = {},
 ) {
+  // The session this card's turn belongs to. A live card is drawn in the
+  // session on screen; a recovered one says whose it is.
+  const cardSessionId = sessionId || currentSessionId || "";
   const isBrowserDiagnostic =
     proposal.allowBrowserDiagnosticsForSession || (proposal.risk || "").startsWith("browser");
   const wrapper = document.createElement("div");
@@ -16756,7 +16765,7 @@ function createCommandApprovalPreview(
           form({
             repo: proposalRepo,
             proposal_id: proposal.proposalId,
-            session_id: currentSessionId || "",
+            session_id: cardSessionId,
             always: always ? "true" : "false",
           }),
         );
@@ -16771,7 +16780,7 @@ function createCommandApprovalPreview(
         output.textContent = payload.cancelled
           ? "Stopped by you. The turn's report is in the conversation."
           : "The resumed turn finished. Its answer is in the conversation.";
-        void loadSession(currentSessionId);
+        if (cardSessionId === currentSessionId) void loadSession(currentSessionId);
       } else if (approved && payload.termination === "cancelled") {
         output.textContent =
           "Stopped by you. The command was ended part-way, so its outcome is unknown; it was not retried.";
@@ -16780,7 +16789,9 @@ function createCommandApprovalPreview(
           ? `exit ${payload.exitCode}\n${payload.stdout || ""}${payload.stderr || ""}`.trimEnd()
           : "Command rejected. The turn that proposed it ended with the crash, so nothing continues.";
       }
-      if (onResolved) await onResolved(approved);
+      // A resumed turn owns its task's status from here — a new pause or an
+      // end of its own — so the crash close-out is only for a turn that is gone.
+      if (onResolved && !resumedTurn) await onResolved(approved);
       await loadSessions(currentSessionId, false);
       await refreshFindings();
       void refreshRepoBar();

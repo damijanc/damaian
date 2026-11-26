@@ -2470,10 +2470,7 @@ fn app_js_has_one_stop_in_the_composer() {
 #[test]
 fn app_js_makes_a_recovered_command_visible_and_stoppable() {
     let card = app_js_function("createCommandApprovalPreview");
-    assert!(
-        card.contains(r#"session_id: currentSessionId || "","#),
-        "{card}"
-    );
+    assert!(card.contains("session_id: cardSessionId,"), "{card}");
     assert!(
         card.contains("running.followsServerLabel = true;"),
         "{card}"
@@ -2854,6 +2851,36 @@ fn app_js_function(name: &str) -> &'static str {
     let rest = &app[start + 1..];
     let end = rest.find("\n}\n").map_or(rest.len(), |end| end + 3);
     &rest[..end]
+}
+
+/// Owner report 2026-11-26: a recovered card's answer named the session on
+/// screen, not the card's own. Every recovery-card request names the card's
+/// session, and the command and fetch cards send the session they were given.
+#[test]
+fn app_js_recovered_cards_answer_for_their_own_session() {
+    let card = app_js_function("createReattachedApprovalCard");
+    assert!(card.contains("sessionId: approval.sessionId,"), "{card}");
+    assert!(
+        card.contains("createFetchApproval(approval.payload, repo(), approval.sessionId)"),
+        "{card}"
+    );
+    let resolved = app_js_function("resolveReattachedApproval");
+    assert!(
+        resolved.contains("session_id: approval.sessionId,"),
+        "{resolved}"
+    );
+    let decided = app_js_function("decideRecovery");
+    assert!(decided.contains("session_id: task.sessionId,"), "{decided}");
+
+    let command = app_js_function("createCommandApprovalPreview");
+    assert!(command.contains("session_id: cardSessionId,"), "{command}");
+    assert!(
+        !command.contains("session_id: currentSessionId"),
+        "a card's request must not name the session on screen: {command}"
+    );
+    let fetch = app_js_function("createFetchApproval");
+    assert!(fetch.contains("session_id: sessionId ||"), "{fetch}");
+    assert!(!fetch.contains("session_id: currentSessionId"), "{fetch}");
 }
 
 /// Spec 112 requirement 7: a session row draws the worker dot's look for
