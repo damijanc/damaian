@@ -752,6 +752,49 @@ impl RegistrationHandle {
     pub fn none() -> Self {
         Self { path: None }
     }
+
+    /// Records that the process now works for `session_id`, in place.
+    ///
+    /// A spec 110 session host is started under a placeholder id for a new
+    /// session's first message and only learns its session from the turn.
+    /// Registering the same process a second time cannot do this: the entry's
+    /// name is the process's identity, so the second registration fails on
+    /// the first's name and the entry keeps the placeholder. The entry is
+    /// rewritten under a temporary name and renamed over itself, so a reader
+    /// still sees a whole entry or none.
+    pub fn reassign(&self, session_id: &str) -> Result<()> {
+        let Some(path) = &self.path else {
+            return Ok(());
+        };
+        let text = fs::read_to_string(path)?;
+        let mut entry: RegisteredProcess =
+            serde_json::from_str(&text).map_err(|error| ClientError::Io(error.to_string()))?;
+        entry.session_id = session_id.to_string();
+        let json =
+            serde_json::to_string(&entry).map_err(|error| ClientError::Io(error.to_string()))?;
+        let dir = path
+            .parent()
+            .ok_or_else(|| ClientError::Io("a registry entry has no directory".to_string()))?;
+        let temp = dir.join(temp_file_name(
+            entry.owner(),
+            TEMP_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        ));
+        let written = (|| -> std::io::Result<()> {
+            let mut file = fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&temp)?;
+            file.write_all(json.as_bytes())?;
+            file.sync_all()?;
+            // `rename`, unlike `register`'s `hard_link`: this entry is ours
+            // and is meant to be replaced.
+            fs::rename(&temp, path)
+        })();
+        if written.is_err() {
+            let _ = fs::remove_file(&temp);
+        }
+        Ok(written?)
+    }
 }
 
 impl Drop for RegistrationHandle {
@@ -812,6 +855,38 @@ mod tests {
         let entry = entries[0].1.as_ref().unwrap();
         assert_eq!(entry.kind, "worker");
         assert_eq!(entry.session_id, "session_w");
+    }
+
+    /// Spec 110: a session host bound from its placeholder id. Registering
+    /// the same process again fails on its existing entry, which is how the
+    /// placeholder survived (owner report 2026-11-26); `reassign` rewrites it.
+    #[test]
+    fn a_registration_reassigned_to_a_session_is_found_under_it() {
+        let data_dir = scratch("reassign");
+        let registry = ProcessRegistry::open(&data_dir).unwrap();
+        let handle = registry
+            .register(
+                ProcessKind::SessionHost,
+                "pending_0af21cfe4d738e0c",
+                std::process::id(),
+            )
+            .unwrap();
+        assert!(
+            registry
+                .register(ProcessKind::SessionHost, "session_s", std::process::id())
+                .is_err(),
+            "a second registration of one process collides with the first"
+        );
+
+        handle.reassign("session_s").unwrap();
+
+        assert!(live_session_host_registered(&data_dir, "session_s").unwrap());
+        assert!(!live_session_host_registered(&data_dir, "pending_0af21cfe4d738e0c").unwrap());
+        let entries = registry.entries().unwrap();
+        assert_eq!(entries.len(), 1, "no temporary file is left: {entries:?}");
+        assert_eq!(fs::read_dir(data_dir.join("processes")).unwrap().count(), 1);
+        drop(handle);
+        assert!(registry.entries().unwrap().is_empty());
     }
 
     #[test]

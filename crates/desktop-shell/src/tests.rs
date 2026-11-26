@@ -2812,8 +2812,9 @@ fn app_js_redraws_a_live_pending_card_on_reload() {
         "a load overtaken during the read draws nothing: {restore}"
     );
     assert!(
-        restore.contains("appendProposals(body ? { body } : {}, live, repo());"),
-        "the live builder draws it: {restore}"
+        restore.contains("appendProposals({ message: bubble || log, body }, live, repo());"),
+        "the live builder draws it, into a target it sees is shown \
+         (`app_js_a_reloaded_pending_card_is_drawn`): {restore}"
     );
     for recovery_route in [
         "resolveReattachedApproval",
@@ -2881,6 +2882,32 @@ fn app_js_recovered_cards_answer_for_their_own_session() {
     let fetch = app_js_function("createFetchApproval");
     assert!(fetch.contains("session_id: sessionId ||"), "{fetch}");
     assert!(!fetch.contains("session_id: currentSessionId"), "{fetch}");
+}
+
+/// Owner report 2026-11-26 (v0.84.0), reproduced in the real UI with two
+/// hosted sessions: a session whose turn paused while the window showed
+/// another session had no card when the user came back to it, though
+/// `/api/session` reported the decision and `/api/pending-card` returned the
+/// card. `appendProposals` returns early for a target whose `message` is not
+/// in the window (spec 110 Task 3, for a turn whose session the user left),
+/// and the reload passed `{ body }` with no `message`, so every redrawn card
+/// was dropped. The reload's target must name what is on screen.
+#[test]
+fn app_js_a_reloaded_pending_card_is_drawn() {
+    let append = app_js_function("appendProposals");
+    assert!(
+        append.contains("if (!liveTurnShown(message)) return;"),
+        "the guard this test is about: {append}"
+    );
+    let restore = app_js_function("restorePendingDecision");
+    let call = &restore[restore
+        .find("appendProposals(")
+        .unwrap_or_else(|| panic!("the reload draws its card: {restore}"))..];
+    let call = &call[..call.find(';').unwrap()];
+    assert!(
+        call.contains("{ message: bubble || log, body }"),
+        "the reload's target names the shown bubble or the log: {call}"
+    );
 }
 
 /// Spec 112 requirement 7: a session row draws the worker dot's look for
