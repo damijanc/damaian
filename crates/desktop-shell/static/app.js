@@ -12996,6 +12996,7 @@ async function startNewSession(projectPath = repo()) {
   saveProjectState();
   localStorage.removeItem(lastSessionStorageKey(normalized));
   await switchProject(normalized, { preferredSessionId: "__new__", reloadSelected: false });
+  swapComposerDraft("");
   currentSessionId = "";
   $("session-select").value = "";
   loadPinnedContextFiles("");
@@ -16991,12 +16992,35 @@ async function loadSessions(preferredSessionId = "", reloadSelected = false) {
 // appended after its awaits would be a second copy (spec 112 requirement 4).
 let sessionLoadGeneration = 0;
 
+// Unsent composer text, by the session it was typed in. The window has one
+// composer, and a draft left in it followed the user into the next session
+// they opened, where sending it — or, over a waiting plan, the plan's
+// decline-with-changes (spec 113) — answered the wrong session (owner report
+// 2026-11-26). The draft stays with its session and comes back with it.
+// `currentSessionId` moves before a session is drawn (a sidebar click selects
+// it in `loadSessions` first), so the composer's own owner is kept here.
+const composerDrafts = new Map();
+let composerDraftSession = "";
+
+function swapComposerDraft(entering) {
+  const leaving = composerDraftSession;
+  composerDraftSession = entering;
+  if (leaving === entering) return;
+  const field = $("chat-prompt");
+  if (field.value.trim()) composerDrafts.set(leaving, field.value);
+  else composerDrafts.delete(leaving);
+  field.value = composerDrafts.get(entering) || "";
+  composerDrafts.delete(entering);
+  autoGrowPrompt();
+}
+
 async function loadSession(sessionId) {
   const generation = ++sessionLoadGeneration;
   const current = () => generation === sessionLoadGeneration;
   // Opening a conversation leaves the Workers board.
   hideWorkersBoard();
   if (!sessionId) {
+    swapComposerDraft("");
     currentSessionId = "";
     localStorage.removeItem(lastSessionStorageKey());
     loadPinnedContextFiles("");
@@ -17015,6 +17039,7 @@ async function loadSession(sessionId) {
     `/api/session?repo=${encodeURIComponent(repo())}&session_id=${encodeURIComponent(sessionId)}`,
   );
   if (!current()) return;
+  swapComposerDraft(payload.session.id);
   currentSessionId = payload.session.id;
   currentSessionMode = { sessionId: payload.session.id, mode: payload.session.mode || "code" };
   localStorage.setItem(lastSessionStorageKey(), currentSessionId);
@@ -18001,6 +18026,8 @@ function followTurnSession(owner, sessionId) {
   const shown = !owner || owner.sessionId === currentSessionId;
   owner?.adoptSession(sessionId);
   if (shown) {
+    // The same view learning its session's id: what is typed stays.
+    if (composerDraftSession === currentSessionId) composerDraftSession = sessionId;
     currentSessionId = sessionId;
     localStorage.setItem(lastSessionStorageKey(), sessionId);
   }
