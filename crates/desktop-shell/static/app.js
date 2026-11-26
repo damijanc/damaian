@@ -14871,8 +14871,12 @@ async function restorePendingDecision(tasks, isCurrent = () => true) {
   if (live) {
     // A decision raised while the app runs: its paused turn is resumable, so
     // the card is the one the live turn drew and answers through the same
-    // route, never the recovery close-out a reattached card uses.
-    appendProposals(body ? { body } : {}, live, repo());
+    // route, never the recovery close-out a reattached card uses. The target
+    // names the reloaded bubble (or the log) as its `message`: this session
+    // is on screen (`isCurrent`), and `appendProposals` drops the cards of a
+    // target it cannot see is shown, as it does for a turn whose session the
+    // user left. Without it every card redrawn here was dropped.
+    appendProposals({ message: bubble || log, body }, live, repo());
   } else {
     setPendingDecision(body ? { body } : null, card || null, decision);
   }

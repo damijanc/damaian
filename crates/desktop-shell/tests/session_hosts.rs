@@ -89,6 +89,7 @@ fn answer(stream: TcpStream, arrived: &AtomicUsize, open: &AtomicBool) {
     while !open.load(Ordering::SeqCst) {
         std::thread::sleep(Duration::from_millis(20));
     }
+    std::thread::sleep(Duration::from_millis(MODEL_DELAY_MS.load(Ordering::SeqCst)));
     let (chunk, last) = if wants_command(&body) {
         let id = arrived.load(Ordering::SeqCst);
         (
@@ -120,6 +121,10 @@ fn answer(stream: TcpStream, arrived: &AtomicUsize, open: &AtomicBool) {
         .as_bytes(),
     );
 }
+
+/// How long every model answer takes once released: zero in the tests, a
+/// few seconds when the UI is served for a person to click through.
+static MODEL_DELAY_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// The prompt that makes the model call `mcp__tracker__ping` once per turn
 /// (spec 33 Task 7's host-level health test); every other prompt gets "Done.".
@@ -188,6 +193,7 @@ impl Shell {
         let method = if matches!(
             path,
             "/api/recovery"
+                | "/api/session"
                 | "/api/sessions"
                 | "/api/working-sessions"
                 | "/api/mcp-health"
@@ -713,6 +719,155 @@ fn a_new_sessions_first_turn_binds_its_host_and_the_lane_reaches_it() {
     );
 }
 
+/// The id a stream's `session` event names.
+fn streamed_session(streamed: &str) -> String {
+    let data = streamed
+        .split("event: session\ndata: ")
+        .nth(1)
+        .and_then(|rest| rest.lines().next())
+        .unwrap_or_else(|| panic!("no session event: {streamed}"));
+    serde_json::from_str::<serde_json::Value>(data).unwrap()["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+/// Owner report 2026-11-26 (v0.84.0): two NEW sessions of one project, each
+/// started by its first message, so each ran in a host started under a
+/// placeholder id. One paused on a command while the other still worked, and
+/// one of them showed no card. The registry still listed both hosts under
+/// their placeholder ids: re-registering the same pid under the session's id
+/// failed on the existing entry, silently. Once bound, a host must be found
+/// by its session, and each paused session must report its decision and
+/// read its card while the other works and after both pause.
+#[test]
+#[ignore = "starts real host processes and binds loopback ports; see the module docs"]
+fn two_new_sessions_started_by_their_first_message_each_keep_their_card() {
+    let _turn = exclusive();
+    let (shell, model) = shell_and_model();
+    model.release();
+    let repo = temp_repo("first-messages");
+    let repo_arg = repo.to_str().unwrap();
+    let store = SessionStore::new(&shell.data_dir);
+    let first_message =
+        |prompt: &str| shell.stream("/api/ask-stream", &[("repo", repo_arg), ("prompt", prompt)]);
+
+    // B: started by its first message, pauses on a command.
+    let paused_b = first_message(COMMAND_PROMPT).join().unwrap();
+    let b = streamed_session(&paused_b);
+    let b_done = done_payload(&paused_b);
+    let b_task = b_done["taskId"].as_str().unwrap().to_string();
+    let b_proposal = b_done["commandProposal"]["proposalId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("B pauses on the command: {b_done}"))
+        .to_string();
+    let b_pid = live_pid(&b);
+    assert!(
+        store.has_live_host(&b).unwrap(),
+        "B's host, bound from its placeholder, is registered under B"
+    );
+
+    // A: started by its first message while B waits, and still working.
+    model.hold();
+    let before = model.arrived.load(Ordering::SeqCst);
+    let running_a = first_message(COMMAND_PROMPT);
+    wait_until("A's turn to reach the model", || {
+        model.arrived.load(Ordering::SeqCst) > before
+    });
+    let mut a = String::new();
+    wait_until("A to be listed as working", || {
+        let (_, working, _) = shell.call("/api/working-sessions", &[]);
+        let rows = working["sessions"].as_array().cloned().unwrap_or_default();
+        a = rows
+            .iter()
+            .filter_map(|row| row["sessionId"].as_str())
+            .find(|id| *id != b && desktop_shell::session_host_pid(id).is_some())
+            .unwrap_or_default()
+            .to_string();
+        !a.is_empty()
+    });
+    assert_ne!(live_pid(&a), b_pid, "one host per session");
+    assert!(
+        store.has_live_host(&a).unwrap(),
+        "A's host is registered under A"
+    );
+    let (_, working, _) = shell.call("/api/working-sessions", &[]);
+    assert!(
+        !working.to_string().contains(&b),
+        "B waits on the user, it is not working: {working}"
+    );
+
+    let decision = |session: &str| {
+        let (status, body, _) = shell.call(
+            "/api/session",
+            &[("repo", repo_arg), ("session_id", session)],
+        );
+        assert_eq!(status, 200, "{body}");
+        body["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .rev()
+            .find_map(|task| {
+                let decision = &task["turnPresentation"]["pendingDecision"];
+                (!decision.is_null()).then(|| (task["id"].clone(), decision.clone()))
+            })
+            .unwrap_or_else(|| panic!("{session} reports a pending decision: {body}"))
+    };
+    let card = |session: &str, task: &str| {
+        let (status, body, _) = shell.call(
+            "/api/pending-card",
+            &[("session_id", session), ("task_id", task)],
+        );
+        assert_eq!(status, 200, "{body}");
+        body["card"].clone()
+    };
+    let (task, reported) = decision(&b);
+    assert_eq!(task, b_task.as_str());
+    assert_eq!(reported["cardId"], b_proposal.as_str(), "{reported}");
+    assert_eq!(
+        card(&b, &b_task)["payload"]["proposalId"],
+        b_proposal.as_str(),
+        "B's card is read while A works"
+    );
+
+    // A pauses too; both cards are there.
+    model.release();
+    let a_done = done_payload(&running_a.join().unwrap());
+    let a_task = a_done["taskId"].as_str().unwrap().to_string();
+    let a_proposal = a_done["commandProposal"]["proposalId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("A pauses on the command: {a_done}"))
+        .to_string();
+    for (session, task, proposal) in [(&a, &a_task, &a_proposal), (&b, &b_task, &b_proposal)] {
+        assert_eq!(decision(session).1["cardId"], proposal.as_str());
+        assert_eq!(
+            card(session, task)["payload"]["proposalId"],
+            proposal.as_str()
+        );
+        assert!(store.has_live_host(session).unwrap(), "{session}");
+    }
+
+    // Each answers through its own host.
+    for proposal in [&b_proposal, &a_proposal] {
+        let answered = shell
+            .stream(
+                "/api/resume-command-stream",
+                &[
+                    ("repo", repo_arg),
+                    ("proposal_id", proposal),
+                    ("approved", "false"),
+                ],
+            )
+            .join()
+            .unwrap();
+        assert!(answered.contains("event: done"), "{answered}");
+    }
+    assert_eq!(card(&b, &b_task), serde_json::Value::Null);
+    assert_eq!(card(&a, &a_task), serde_json::Value::Null);
+    assert_eq!(live_pid(&b), b_pid, "B's host served its answer");
+}
+
 /// Spec 33 Task 7: MCP health lives in the process whose turn contacted the
 /// server — here, the session's host — so `/api/mcp-health` must gather it
 /// from there; a server that fails repeatedly in that host is `Failed`, and
@@ -822,6 +977,66 @@ done
     assert_eq!(seen["sessionId"], session.as_str(), "{seen}");
 
     std::fs::write(&user_conf, shared).unwrap();
+}
+
+/// Serves the real UI with session hosts on, against this file's model with
+/// every answer slowed down, so two sessions' turns can be clicked through by
+/// hand: a first message containing `TOUCH-A-FILE once.` pauses on a command,
+/// any other answers "Done.". Serves until it is stopped. Run it with:
+///
+/// ```text
+/// DAMAIAN_HOSTS_INSPECTION_PORT=4897 DAMAIAN_HOSTS_INSPECTION_DELAY_MS=8000 \
+///   cargo nextest run -p desktop-shell --test session_hosts --run-ignored only \
+///   --no-capture serves_hosted_sessions_for_manual_inspection
+/// ```
+///
+/// then open the URL it prints and, in the console,
+/// `apiToken = "damaian-hosts-inspection-token"; setRepository("<repo>", false);`.
+#[test]
+#[ignore = "serves the UI until stopped; see the doc comment"]
+fn serves_hosted_sessions_for_manual_inspection() {
+    let (shell, model) = shell_and_model();
+    model.release();
+    let delay = std::env::var("DAMAIAN_HOSTS_INSPECTION_DELAY_MS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(8000);
+    MODEL_DELAY_MS.store(delay, Ordering::SeqCst);
+    // The window names a provider with every turn; this one is the endpoint
+    // above, so a turn never leaves the machine.
+    let user_conf = shell.data_dir.join("config").join("user.conf");
+    let shared = std::fs::read_to_string(&user_conf).unwrap();
+    std::fs::write(
+        &user_conf,
+        format!(
+            "{shared}model_provider=openai-compatible\n\
+             model_provider.openai-compatible.base_url=http://127.0.0.1:{}\n\
+             model_provider.openai-compatible.api_key_env=DAMAIAN_SESSION_HOST_TEST_KEY\n\
+             model_provider.openai-compatible.models=fake\n",
+            model.port
+        ),
+    )
+    .unwrap();
+    let port = std::env::var("DAMAIAN_HOSTS_INSPECTION_PORT")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(4897);
+    let repo = temp_repo("inspection");
+    let options = ShellOptions {
+        port,
+        default_repo: None,
+        api_token: "damaian-hosts-inspection-token".to_string(),
+    };
+    println!("Hosted UI: http://127.0.0.1:{port}/");
+    println!("  repository = {}", repo.display());
+    println!("  data_dir = {}", shell.data_dir.display());
+    desktop_shell::spawn_with_shell_stack("inspection-shell", move || {
+        desktop_shell::run_server_with_ready(options, |_| {})
+    })
+    .unwrap()
+    .join()
+    .unwrap()
+    .expect("serve the UI");
 }
 
 unsafe extern "C" {

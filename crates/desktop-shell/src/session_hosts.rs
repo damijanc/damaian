@@ -27,7 +27,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use serde_json::{Map, Value};
-use workspace_engine::{Config, PausedTurns, ProcessIdentity, ProcessKind, ProcessRegistry};
+use workspace_engine::{Config, PausedTurns, ProcessIdentity};
 
 use crate::host::{HostKind, HostLaunch, StartedHost, exchange, host_audit_log, start_host};
 use crate::http::{Request, parse_form, write_basic_response, write_sse_event};
@@ -341,21 +341,17 @@ fn placeholder_id() -> String {
 /// Binds the host started under `key` to the session its turn created: the
 /// table entry and the registry entry move to the session's id, so recovery's
 /// live-host check (C12) finds it.
+///
+/// The registry entry is rewritten in place: it is named by the process's
+/// identity, so registering the process again under the session's id failed
+/// on it and left the placeholder (owner report 2026-11-26).
 fn bind(key: &str, session_id: &str) {
     let mut hosts = hosts();
     let Some(mut host) = hosts.remove(key) else {
         return;
     };
-    if let Ok(data_dir) = crate::effective_data_dir()
-        && let Ok(registry) = ProcessRegistry::open(&data_dir)
-        && let Ok(registration) = registry.register(
-            ProcessKind::SessionHost,
-            session_id,
-            host.started.identity.pid,
-        )
-    {
-        // The old entry is removed as its handle drops.
-        host.started.registration = registration;
+    if let Err(error) = host.started.registration.reassign(session_id) {
+        eprintln!("damaian: could not record session {session_id}'s host: {error}");
     }
     host.session = Some(session_id.to_string());
     hosts.insert(session_id.to_string(), host);
