@@ -340,7 +340,7 @@ Your message is secret-scanned before it is sent, and so is every earlier messag
 | `symbols` | 10% | The symbol hints block, still capped by `symbol_context_max_tokens`. |
 | `search_results` | 10% | What search found: exact keyword hits first, then semantic-similarity hits. Each hit is the lines it matched (about 2,400 characters), not the whole file, and hits in one file are merged. Semantic hits are dropped first when this category runs short. |
 | `file_ranges` | 25% | Files you named in the prompt and files you added with **+** ([Chat](#chat)); explicit paths are ordered ahead of mentioned ones. |
-| `findings` | 2% | Reserved for the [findings](#fix-n-errors-and-the-findings-list) repair flow. The assistant still receives only the findings you select for a repair request, so nothing fills this automatically today and its share is released. |
+| `findings` | 2% | Reserved for the [findings](#the-findings-list) repair flow. The assistant still receives only the findings you select for a repair request, so nothing fills this automatically today and its share is released. |
 | `conversation_summary` | 5% | The summary shown in the inspector's **Summary** row. It travels inside `Recent conversation:` rather than as a context item, so this share is released. |
 | `external_reference` | 5% | Pages read with `fetch_url`, shown in the turn **after** the fetch. It comes after every repository-content category, so a crowded context drops a fetched page before it drops repository content. |
 | `memory` | 3% | Entries recalled from [memory](#how-memory-reaches-the-model). It is the last category declared, so memory is the first thing dropped. |
@@ -762,7 +762,7 @@ A strip directly above the prompt shows where the next turn will work:
 - **The folder button** names the working folder. It opens a menu: **Show in Finder**, **Open repository on GitHub**, **Copy path**, **Change folder…** (the same folder picker as the **+** beside **Projects**) and **Open in terminal**. **Open repository on GitHub** appears only when the folder's `origin` remote is on github.com. Damaian rebuilds the address as `https://github.com/<owner>/<repo>` from the remote rather than opening the remote's text as it stands, because a cloned repository controls that text.
 - **The branch** follows it in grey. On a detached HEAD it shows the short commit hash instead.
 - **The change count**, `+N −M` on the right, is the working tree's lines added and removed against the last commit, with new untracked text files counted as added lines. It is hidden when there is nothing to count. It is information only; clicking it does nothing yet.
-- **A contextual action** may appear at the far right. Today that is **Commit…** when an open session has changes (it reads **Preparing…** while the commit is prepared) ([Commits](#commits)), or **Fix N errors** / **Fix N warnings** ([Findings](#fix-n-errors-and-the-findings-list)); errors and warnings take priority.
+- **A contextual action** may appear at the far right. Today that is **Commit…** when an open session has changes (it reads **Preparing…** while the commit is prepared) ([Commits](#commits)). Open findings are not offered here; the [findings list](#the-findings-list) opens from the header ⋮.
 
 In a folder that is not a Git repository, the bar shows the folder button alone, and its menu still works. The bar refreshes when you open a session, after every turn, after you apply or roll back a patch, after a rewind, and when you return to the window (at most once every five seconds). It never polls on a timer.
 
@@ -2662,26 +2662,20 @@ whether a failure becomes a finding.
 - **Other** commands, including any command Damaian does not recognise,
   produce findings as a check does.
 
-### Fix N errors, and the findings list
+### The findings list
 
-When the session has open findings, the [repo bar](#the-repo-bar) above the
-prompt offers to fix them. With open errors it reads **Fix 2 errors** (in red);
-with no open errors but open warnings, **Fix 1 warning** (in amber); otherwise
-there is no button. Pressing it starts one repair turn covering every open
-finding of that severity, exactly as if you had ticked them all and pressed
-**Fix selected** below. It is disabled while a turn is running.
+The header ⋮ has a **Findings** item while the session has any findings; it
+reads **Findings (2 open)** when some are open, and is disabled when the session
+has none. It opens the findings list above the prompt, upward over the
+conversation. Escape or a click elsewhere closes it. With open warnings but no
+open error, the list opens showing errors and warnings rather than only errors,
+so it is not empty.
 
-The chevron beside it opens the findings list, upward over the conversation.
-Escape, the chevron again, or a click elsewhere closes it. Opened from **Fix N
-warnings**, the list shows errors and warnings rather than only errors, so it
-is never empty.
-
-**The list is reachable only while there are open errors or warnings.** With
-nothing open (every finding dismissed, fixed, stale, or only informational)
-there is no button and no chevron, so a dismissed finding cannot be restored
-from the app until a check reports something new. The findings are still in
-the session; [TROUBLESHOOTING.md](TROUBLESHOOTING.md#findings) shows how to
-read them from the session log.
+Nothing outside the list offers to fix findings. The repo bar used to show a
+**Fix N errors** button for as long as one finding stayed open, and a failed
+command's finding stays open until you dismiss it, so the button kept offering
+to fix a failure later work had already made moot. Repair is always a choice
+you make in the list, with **Fix selected**.
 
 The list groups findings by source (Compiler, Tests, Lint, Security, Hook,
 Browser console, Network, Browser scenario, Code review, Language server,
@@ -2701,8 +2695,7 @@ finding whose tool gave no location has none. Damaian does not guess one.
 ### Dismiss and Restore
 
 **Dismiss** hides a finding you have decided not to act on. It stays in the
-session, and **Restore** (under the *All statuses* filter) brings it back,
-as long as the list can still be opened (see above).
+session, and **Restore** (under the *All statuses* filter) brings it back.
 Dismissing is not suppression: if a later check reports the same problem, it
 is a new finding and it appears again.
 
@@ -2717,8 +2710,8 @@ Only **open** findings are sent. A stale, dismissed or fixed finding in the
 selection is left out, and a note says how many were left out and why. If
 nothing is left, nothing is sent.
 
-Both **Fix selected** and the repo bar's **Fix N errors** show the exact repair
-prompt in a confirmation before sending. **Send** starts the turn; **Cancel**
+**Fix selected** shows the exact repair prompt in a confirmation before
+sending. **Send** starts the turn; **Cancel**
 sends nothing and leaves your selection. The prompt is the whole request: the
 finding ids, their summaries and the excerpts the assistant will see. If every
 selected finding is a generic command failure with no file location, the

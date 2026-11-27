@@ -1550,9 +1550,12 @@ async function copyRepoPath(repoPath) {
 // or { key, label, tone, run, more }; `more` (optional) is { label, toggle,
 // isOpen } for the chevron. Order is priority; nothing else in the bar
 // changes when an entry is added.
+//
+// Open findings are not an entry: a "Fix N errors" button stood there for as
+// long as one finding stayed open, and a command's finding never closes on its
+// own, so it kept offering to fix a failure later work had already made moot
+// (owner report 2026-11-27). The findings list opens from the header ⋮.
 const repoActionProviders = [
-  findingsRepairAction("error"),
-  findingsRepairAction("warning"),
   // #35: uncommitted accepted changes → Commit…
   commitAction,
   // #37: branch ahead of its base → Create PR
@@ -1582,31 +1585,6 @@ let commitPreparing = false;
 // Covers the `/api/findings-repair` request before `sendChatPrompt` sets
 // `sessionSubmitting()`, so a double click cannot start two repairs.
 let findingsRepairPending = false;
-
-function openFindingIds(severity) {
-  return sessionFindings
-    .filter((finding) => finding.status === "open" && finding.severity === severity)
-    .map((finding) => finding.id);
-}
-
-function findingsRepairAction(severity) {
-  return () => {
-    const ids = openFindingIds(severity);
-    if (!ids.length) return null;
-    const noun = severity === "error" ? "error" : "warning";
-    return {
-      key: `fix-${severity}`,
-      label: `Fix ${ids.length} ${noun}${ids.length === 1 ? "" : "s"}`,
-      tone: severity === "error" ? "danger" : "warning",
-      run: () => repairFindings(ids),
-      more: {
-        label: "Show findings",
-        toggle: (anchorEl) => toggleFindingsPopover(anchorEl, severity),
-        isOpen: () => findingsPanelOpen,
-      },
-    };
-  };
-}
 
 function currentRepoAction() {
   if (!repo()) return null;
@@ -12334,21 +12312,24 @@ function groupFindings(findings, key) {
   return groups;
 }
 
-// The findings list is a popover off the repo bar's action chevron (spec 58
-// §1 req 17), so it is reachable only while that action is showing.
-function toggleFindingsPopover(anchorEl, severity) {
-  if (findingsPanelOpen) {
-    closeFindingsPopover({ restoreFocus: true });
-    return;
-  }
+function openFindingsCount() {
+  return sessionFindings.filter((finding) => finding.status === "open").length;
+}
+
+// The findings list is a popover over the repo bar, opened from the header ⋮
+// (Findings). It used to hang off a "Fix N errors" action there, which is gone.
+function openFindingsPopover() {
+  if (findingsPanelOpen || !sessionFindings.length) return;
   closeAllContextMenus();
-  // Opened from "Fix N warnings", the default Errors filter would show none of
-  // the findings the action counts.
+  // With open warnings but no open error, the default Errors filter would show
+  // none of what the menu item counts.
   const severityFilter = $("findings-severity-filter");
-  if (severity === "warning" && severityFilter.value === "error") severityFilter.value = "warning";
+  const openError = sessionFindings.some(
+    (finding) => finding.status === "open" && finding.severity === "error",
+  );
+  if (!openError && severityFilter.value === "error") severityFilter.value = "warning";
   findingsPanelOpen = true;
   renderFindingsPanel();
-  anchorEl.setAttribute("aria-expanded", "true");
   $("findings-severity-filter").focus();
 }
 
@@ -12356,16 +12337,15 @@ function closeFindingsPopover({ restoreFocus = false } = {}) {
   if (!findingsPanelOpen) return;
   findingsPanelOpen = false;
   renderFindingsPanel();
-  if (restoreFocus) $("repo-action-more").focus();
+  if (restoreFocus) $("thread-menu-btn").focus();
 }
 
 function renderFindingsPanel() {
   renderRepoAction();
   const panel = $("findings-panel");
-  // Its anchor went away (no open errors or warnings left, or no folder).
-  if (findingsPanelOpen && !repoActionCurrent?.key.startsWith("fix-")) findingsPanelOpen = false;
-  panel.hidden = !findingsPanelOpen || sessionFindings.length === 0;
-  $("repo-action-more").setAttribute("aria-expanded", String(!panel.hidden));
+  // The session's findings went away (another session, or no folder).
+  if (findingsPanelOpen && (!repo() || !sessionFindings.length)) findingsPanelOpen = false;
+  panel.hidden = !findingsPanelOpen;
   if (panel.hidden) return;
 
   const visible = sessionFindings.filter(findingVisible);
@@ -14808,13 +14788,16 @@ function setPendingDecision(message, card, decision, mount = card) {
     $("chat-log").append(frame);
   }
   const planMessage = message?.body ? message : null;
-  pendingDecision = { decision, card, frame, planMessage, since: Date.now() };
+  // The part of the card that answers it, when the card marks one; else the
+  // whole frame. The slot's Show appears while this is out of view.
+  const home = frame?.querySelector("[data-decision-controls]") || frame;
+  pendingDecision = { decision, card, frame, home, planMessage, since: Date.now() };
   // A live `plan` event is streamed before the pause is written, so it always
   // says `waiting: false`; the decision is what makes the open step wait.
   if (planMessage) markPlanWaiting(planMessage, true);
   frame?.scrollIntoView({ block: "nearest" });
   // After the scroll, so the slot starts from where the card now is.
-  if (frame) observeStatusHome(frame);
+  if (home) observeStatusHome(home);
   syncComposerStatus();
 }
 
@@ -14825,7 +14808,7 @@ function settlePendingDecision(card = null) {
   if (card && pendingDecision.card !== card) return;
   if (pendingDecision.frame) pendingDecision.frame.dataset.waiting = "false";
   if (pendingDecision.planMessage) markPlanWaiting(pendingDecision.planMessage, false);
-  if (pendingDecision.frame) unobserveStatusHome(pendingDecision.frame);
+  if (pendingDecision.home) unobserveStatusHome(pendingDecision.home);
   pendingDecision = null;
   clearWaitingIndicator();
   syncComposerStatus();
@@ -14833,7 +14816,7 @@ function settlePendingDecision(card = null) {
 
 // The DOM the state pointed into is gone (a session render or a cleared chat).
 function resetPendingDecision() {
-  if (pendingDecision?.frame) unobserveStatusHome(pendingDecision.frame);
+  if (pendingDecision?.home) unobserveStatusHome(pendingDecision.home);
   pendingDecision = null;
   clearWaitingIndicator();
   syncComposerStatus();
@@ -14908,7 +14891,9 @@ async function loadPendingCard(taskId, decision) {
 function focusPendingDecision() {
   const frame = pendingDecision?.frame;
   if (!frame?.isConnected) return;
-  frame.scrollIntoView({ block: "nearest" });
+  // The answer controls, not the frame: a long patch card nearest-scrolled as
+  // a whole stays where it is while its Apply is off screen.
+  (pendingDecision.home || frame).scrollIntoView({ block: "nearest" });
   const kind = pendingDecision.decision.kind;
   // D2: the question's own answer field, or its first option when it takes no
   // free text.
@@ -14990,7 +14975,7 @@ function clipStatusText(text, max = 60) {
 function composerStatusEntry() {
   const now = Date.now();
   const decision = pendingDecisionApplies();
-  if (decision && !statusHomeShown(decision.frame)) {
+  if (decision && !statusHomeShown(decision.home)) {
     const question = decision.decision.kind === "question";
     return {
       kind: "needs-you",
@@ -16141,6 +16126,10 @@ function createPatchPreview(payload, patchRepo, { onResolved = null } = {}) {
 
   const actions = document.createElement("div");
   actions.className = "patch-actions";
+  // Where the composer slot judges this card from: on a long diff the card is
+  // on screen long after Apply and Reject have scrolled away (owner report
+  // 2026-11-27).
+  actions.dataset.decisionControls = "";
   const applyButton = document.createElement("button");
   applyButton.type = "button";
   applyButton.className = "btn-sm btn-primary";
@@ -17720,6 +17709,14 @@ function toggleThreadMenu(anchorEl) {
       ],
       [
         {
+          label: openFindingsCount() ? `Findings (${openFindingsCount()} open)` : "Findings",
+          action: "findings",
+          disabled: noSession || noRepo || !sessionFindings.length,
+          onSelect: () => openFindingsPopover(),
+        },
+      ],
+      [
+        {
           label: "Rename session",
           action: "rename",
           disabled: noSession,
@@ -17783,7 +17780,13 @@ $("findings-close-btn").addEventListener("click", () => {
 document.addEventListener("click", (event) => {
   if (!findingsPanelOpen) return;
   const path = event.composedPath();
-  if (path.includes($("findings-panel")) || path.includes($("repo-action-more"))) return;
+  // The ⋮ menu's own click is the one that opened it.
+  if (
+    path.includes($("findings-panel")) ||
+    path.some((node) => node.classList?.contains("context-menu-popover"))
+  ) {
+    return;
+  }
   closeFindingsPopover();
 });
 document.addEventListener("keydown", (event) => {

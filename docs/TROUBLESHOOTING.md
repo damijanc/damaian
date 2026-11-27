@@ -1723,13 +1723,12 @@ with no `fileHash` is never stale. Setting `stale` through
 `/api/finding-status` is refused. Reads use the same active-event window as
 plans, so a rewind takes the findings recorded after its point with it.
 
-**The findings list cannot be opened.** The list is reached from the repo
-bar's **Fix N errors** / **Fix N warnings** chevron, which exists only while
-the session has an open error or warning. With every finding dismissed, fixed,
-stale or informational there is nothing to open, so a dismissed finding cannot
-be restored from the UI until a check records a new open one. Nothing is lost:
-the `finding_recorded` and `finding_status_changed` events above still list
-every finding and its status.
+**The findings list cannot be opened.** The list opens from **Findings** in
+the header ⋮, which is disabled while the open session has no findings at all
+(and with no session or folder open). If a check you expected to fail recorded
+nothing, the `finding_recorded` events above show whether a finding was
+recorded. There is no **Fix N errors** button in the repo bar any more: open
+findings are repaired only from the list, with **Fix selected**.
 
 **A location is missing.** A finding gets a `range` only when the tool printed
 one, it is relative and inside the repository, and the file exists when the

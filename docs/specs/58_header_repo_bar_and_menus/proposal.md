@@ -8,8 +8,13 @@ GitHub opened `https://github.com/damijanc/damaian` from the parsed `origin`.
 The full seven-check gate passed in CI on 2026-10-14; it was run there rather than locally at the user's request. Scoped checks also passed locally: `cargo fmt --all -- --check`, `node --check crates/desktop-shell/static/app.js`, `npm run lint:web`, `typos` and `npm run specs:check`. An interrupted local `cargo nextest run --workspace` had reported one failure in a `hooks` test outside spec 58; CI did not reproduce it.
 Deviations and limits are in `tasks.md` (Result
 and the progress rows). Two marks are live-only: "Stopped before finishing" and
-a failed turn's error do not survive a reload. The findings list can be opened
-only while an open error or warning exists. The resumed-turn paths draw no
+a failed turn's error do not survive a reload. **Superseded 2026-11-27 (owner
+report):** requirements 16–17, §3.5 entries 1–2 and acceptance 9–10 no longer
+hold. The repo bar offers no *Fix N errors* / *Fix N warnings*: a command's
+finding never closes on its own, so the button stayed for a failure later work
+had made moot. The findings list opens from **Findings** in the header ⋮
+(disabled while the session has no findings), still as the upward popover over
+the repo bar, with Fix selected as the only repair path. The resumed-turn paths draw no
 Stop. The plan card's ↑/↓ reorder arrows were read as out of scope for
 criterion 1.
 Order: 58 of 58
@@ -115,12 +120,12 @@ new capability (§2).
 15. The repo bar refreshes on session load, after every finished turn, after a
     patch apply or rollback, after a rewind, and on window focus. Focus
     refreshes are at least 5 s apart. There is no timer polling.
-16. The contextual-action slot shows **Fix N errors** (danger tone) when the
+16. *(Superseded 2026-11-27, see Status.)* The contextual-action slot shows **Fix N errors** (danger tone) when the
     session has open error findings. With no errors but open warnings it shows
     **Fix N warnings** (warning tone). Otherwise it is hidden. Its main button
     repairs every open finding of that severity through the existing
     `/api/findings-repair`. It is disabled while a turn runs.
-17. The action's chevron opens the existing findings list as a popover anchored
+17. *(Superseded 2026-11-27: the list opens from the header ⋮.)* The action's chevron opens the existing findings list as a popover anchored
     to the bar, opening upward, with its filters, checkboxes, Dismiss and **Fix
     selected** unchanged. The `#findings-toggle-btn` and the inline
     `#findings-panel` position are removed.

@@ -3090,11 +3090,53 @@ fn app_js_places_every_pending_decision_kind_above_the_composer() {
     assert!(set.contains("scrollIntoView({ block: \"nearest\" })"));
     // Spec 112 requirement 5: no pointer in the bubble; the slot is the
     // pointer while the card is out of view.
-    assert!(set.contains("observeStatusHome(frame)"), "{set}");
+    // The card's answer controls when it marks them (a patch's Apply and
+    // Reject): a long diff keeps the frame in view after they have scrolled
+    // away (owner report 2026-11-27).
+    assert!(
+        set.contains("frame?.querySelector(\"[data-decision-controls]\") || frame"),
+        "{set}"
+    );
+    assert!(set.contains("observeStatusHome(home)"), "{set}");
+    let patch = app_js_function("createPatchPreview");
+    assert!(
+        patch.contains("actions.dataset.decisionControls"),
+        "the patch card marks Apply and Reject as its controls"
+    );
+    let focus = app_js_function("focusPendingDecision");
+    assert!(
+        focus.contains("(pendingDecision.home || frame).scrollIntoView("),
+        "Show scrolls to the controls: {focus}"
+    );
     // The one-shot patch route has no turn, but its card follows the rule.
     let one_shot = app_js_function("proposePatchFromChat");
     assert!(one_shot.contains("setPendingDecision("));
     assert!(!one_shot.contains("body.append(createPatchPreview"));
+}
+
+/// Owner report 2026-11-27: the repo bar offered "Fix N errors" for as long as
+/// one finding stayed open, and a command's finding never closes on its own.
+/// Open findings are no repo-bar action; the list opens from the header ⋮.
+#[test]
+fn app_js_findings_are_no_repo_bar_action_and_open_from_the_header_menu() {
+    let source = super::APP_JS;
+    let providers = source
+        .split("const repoActionProviders = [")
+        .nth(1)
+        .and_then(|rest| rest.split("];").next())
+        .expect("the provider list");
+    assert!(!providers.contains("finding"), "{providers}");
+    assert!(!source.contains("function findingsRepairAction"));
+
+    let menu = app_js_function("toggleThreadMenu");
+    assert!(menu.contains("action: \"findings\""), "{menu}");
+    assert!(
+        menu.contains("onSelect: () => openFindingsPopover()"),
+        "{menu}"
+    );
+    // Fix selected in the list still sends the repair.
+    let fix = app_js_function("fixSelectedFindings");
+    assert!(fix.contains("repairFindings("), "{fix}");
 }
 
 /// Spec 107 Task 2: after a reload the decision comes from `/api/session`
@@ -3312,10 +3354,7 @@ fn app_js_has_one_composer_status_slot() {
     let working = entry.find("kind: \"working\"").expect("Working");
     let busy = entry.find("kind: \"busy\"").expect("Busy elsewhere");
     assert!(needs < working && working < busy, "priority: {entry}");
-    assert!(
-        entry.contains("!statusHomeShown(decision.frame)"),
-        "{entry}"
-    );
+    assert!(entry.contains("!statusHomeShown(decision.home)"), "{entry}");
     assert!(
         entry.contains("[...action.homes].some(statusHomeShown)"),
         "{entry}"
@@ -4677,7 +4716,7 @@ fn serves_the_ui_for_manual_inspection() {
     println!("    card header should read: {expected_card_header}");
     println!("  legacy web diagnostic session (regex thumbnails) = {legacy_session}");
     println!(
-        "  findings session (the composer's repo bar should offer \"Fix 2 errors\") = {findings_session}"
+        "  findings session (the header ⋮ should offer \"Findings (3 open)\") = {findings_session}"
     );
     println!(
         "  activity + plan session (collapsed Activity and Steps disclosures) = {activity_session}"

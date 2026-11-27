@@ -31,7 +31,7 @@ API keys under your control.
   see each step end **Confirmed**, **Completed, unverified**, **Blocked** or
   **Skipped**, with the evidence behind it.
 - **Fix what a check found.** Errors from compilers, tests, lint and the browser
-  become findings: **Fix N errors** repairs them all, **Fix selected** some.
+  become findings; tick the ones to repair and **Fix selected** sends them.
 - **Repair only what the change broke.** Checks are baselined before a patch
   applies, so a failure that was already there stays separate and starts no
   repair. Repair stops when it stalls instead of spending attempts that repeat

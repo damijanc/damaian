@@ -270,9 +270,10 @@ session* and ⋮ both hide this way) hides it with `opacity`, never `display` or
 - **A folder that is not a repository** shows the folder button alone.
 - **The contextual action is one slot with a priority list**, not a row of
   buttons. The first applicable entry wins and the slot is hidden when none
-  applies: open error findings (*Fix N errors*), then open warnings (*Fix N
-  warnings*), then uncommitted changes (*Commit…*, spec 35), then a
-  branch ahead of its base (*Create PR*, spec 37). New entries join the list in
+  applies: uncommitted changes (*Commit…*, spec 35), then a branch ahead of
+  its base (*Create PR*, spec 37). Open findings are deliberately not an entry
+  (owner report 2026-11-27: a finding that never closed kept *Fix N errors*
+  on screen); the findings list opens from the header ⋮. New entries join the list in
   `repoActionProviders`; they never add a second control to the bar.
 - **The action is a split button**: `.repo-action-main` runs it,
   `.repo-action-more` (a chevron) opens its detail as a `.model-popover`
